@@ -1,0 +1,158 @@
+2026.7.03 ~ 2026.7.04 -- 大致构想
+AutoOrderAudit -- 电商订单自动化审单
+目的：对于商家后台的订单，有的买家会备注，原是人工对照备注要求一个个修改订单信息，效率低下，还会出现数量不匹配等错误。
+    现开发一个能够自动化审查订单备注信息并同步修改到订单信息里，省去人工手动修改提交，减少错误率。
+想要实现的效果（用户画像 -- 运营人员 / 客服）
+
+一、PyInstaller打包成双击可执行文件
+    1.运行打开config.ini填上Token和Cookie（第一次运行）
+        PS：Token 和 Cookie 会过期（通常是几个小时到一天），过期后需要重新从 F12 抓取更新 config.py。建议：
+            * 第一次用 DRY_RUN = True 跑一轮，看看哪些订单能自动处理、哪些会跳过
+            * 确认没问题后关掉 DRY_RUN
+            * 可以写个定时任务（Windows 计划任务 / Linux crontab）每天自动跑
+    2.双击运行XX.exe
+    3.看窗口输出结果
+    4.结束
+    （优点：不需要用户装Python环境使用；双击运行；更新Token只需要更改config.ini；可以放桌面快捷方式）
+
+二、创建简单的GUI.exe
+    用tkinter或Gooey加个界面
+    ┌─────────────────────────────────────┐
+    │  方果ERP 自动审单工具  v1.0            │
+    ├─────────────────────────────────────┤
+    │  Token: [_____________________]     │
+    │  Cookie: [____________________]     │
+    │  时间范围: 最近7天                     │
+    │                                     │
+    │  [▶ 开始自动审单]  [☰ 查看日志]        │
+    │                                     │
+    │  处理进度: ████████░░ 80%            │
+    │  成功: 45  跳过: 3  失败: 0           │
+    └─────────────────────────────────────┘
+    使用Gooey库，加一行装饰器把命令行变成界面
+    使用Gooey库最简单，需要加一行装饰器把命令行转为界面
+        from gooey import Gooey
+        @Gooey(program_name="方果ERP自动审单")
+        def main():
+            #  main.py 逻辑不变
+            ...
+    用户只需要填个表单点击按钮就行
+
+三、做成定时服务（最终形态）
+    完全自动化 -- 注册成Windows计划任务（每 30 分钟自动跑一次 → 处理新订单 → 推送到企业微信通知 / 钉钉通知）
+    用户只需要： 1.第一次配置好Token 2.以后直接运行
+
+
+四、可迁移与可复用性
+    1.迁移架构 -- 适配器模式
+
+    AutoOrderAudit/
+    │
+    ├── core/                    ← 🟢 通用核心（换个ERP也不用改）
+    │   ├── parser.py            ← 备注解析引擎（参数化，无外部依赖）
+    │   ├── material_matcher.py  ← 材质匹配（不再调具体API，而是用接口）
+    │   └── engine.py            ← 审单流程（查询→解析→提交，抽象流程）
+    │
+    ├── adapters/                ← 🔴 ERP特定（换系统就换这个文件夹） -- ERP适配器
+    │   ├── fangguo/             ← 方果适配器
+    │   │   ├── config.py        ← 方果的API地址、鉴权
+    │   │   ├── api.py           ← 方果的接口调用
+    │   │   └── material_source.py ← 从方果拉材质列表
+    │   │
+    │   └── erp_x/               ← 以后换系统，加个新适配器
+    │       ├── config.py
+    │       ├── api.py
+    │       └── material_source.py
+    │
+    ├── main.py                  ← 入口（选择用哪个适配器）
+    └── requirements.txt         ← 依赖
+
+    2.迁移成本
+        2.1 具体迁移操作
+              要换的部分	              |      工作量	      |          说明
+            API 接口（地址、参数、鉴权）  |      2~4 小时	  |      对新 ERP 抓包，写新的 adapter
+            数据字段映射（字段名不同）	  |      1~2 小时	  |      比如方果叫 shopMappingSku，别的系统可能叫 merchantCode
+            备注格式（如果完全不一样）	  |      1~2 小时	  |      调整 parser.py 的正则规则
+        ✅ 核心逻辑不用改	          |        0	      |      解析引擎、审单流程、编码生成全部复用
+        2.2 实际案例对比：
+            模块	        方果ERP → 旺店通	        方果ERP → 聚水潭	            方果ERP → 自研系统
+            API 调用	 |   重写 adapter	     |   重写 adapter	        |    重写 adapter
+            鉴权方式	 |   Bearer Token → 签名	 |   Bearer Token → AppKey	|    自定
+            备注解析	 |   可能微调	         |   可能微调	            |    基本不变
+            审单流程	 |   不变	             |   不变	                |    不变
+            材质匹配	 |   换个数据源	         |   换个数据源	            |    换个数据源
+            总工作量	 |   1~2天	             |   1~2天	                |    0~1天
+        2.3 重构说明
+            1.把core/ 和 adapters/ 拆开
+            2.main.py只做一件事：选择适配器 + 启动引擎
+            3.以后换系统只要安装新的适配器就行（pip install new-adapter ）
+总结： 解析备注的脑子（core）不用换，只换跟 ERP 握手的那只手（adapter）。现在代码 60% 已经是通用的，再花时间拆分层就能做到 90% 跨系统复用。
+
+五、重构方案
+1.基于适配器模式的跨ERP自动审单系统。核心通用，适配器可插拔
+    AutoOrderAudit/
+    │
+    ├── core/                       ← 🟢 通用核心（换ERP也不用改）
+    │   ├── adapter_base.py         ← ERP适配器抽象接口
+    │   ├── parser.py               ← 备注解析引擎（参数化，无外部依赖）
+    │   └── engine.py               ← 自动审单引擎（通过接口调用适配器）
+    │
+    ├── adapters/                   ← 🔴 ERP适配器（换系统就换这个文件夹）
+    │   └── fangguo/                ← 方果ERP适配器
+    │       ├── config.py           ← 方果的API地址、鉴权信息
+    │       ├── material_source.py  ← 从方果拉取材质列表做自动匹配
+    │       └── adapter.py          ← ErpAdapter 接口实现
+    │
+    ├── main.py                     ← 入口（选择适配器 + 启动引擎）
+    ├── test.py                     ← 连通性测试
+    ├── requirements.txt
+    └── README.md
+2.核心理念
+    core/  = 大脑（通用，跨ERP复用）
+         ↓ 通过 ErpAdapter 接口调用
+    adapters/ = 手脚（ERP特定，可替换）
+3.使用前准备
+    3.1 安装依赖 -- pip install -r requirements.txt
+    3.2 鉴权配置 （打开adapters/fangguo/config.py，填入从F12抓取的信息）-- AUTHORIZATION = "Bearer 你的token"
+                                                                 -- COOKIE_STR = "JSESSIONID=你的session"
+                                                                 -- TENANT_ID = "你的租户ID"
+    3.3 配置材质映射（可选 - 静态 / 动态） -- 如果备注里有新的材质的写法，加到MATERIAL_MAP中
+        MATERIAL_MAP = {
+            "双面格": "双面格",
+            "吸水皮革": "吸水皮革",
+            "防辣椒油": "防辣椒油",
+            # 遇到新材质加上就行
+        }
+    3.4 运行
+        # 测试连通性 -- python test.py
+        # 执行自动审单（默认 DRY_RUN=True） -- python main.py
+        # 确认无误后，修改 config.py 中 DRY_RUN = False
+4. 若换其他ERP系统
+    4.1 创建新的适配器 -- mkdir -p adapters/erp_x/
+    4.2 实现ErpAdapter接口 --
+        # adapters/erp_x/adapter.py
+        from core import ErpAdapter, Order, OrderItem
+
+        class ErpXAdapter(ErpAdapter):
+            def query_orders(self, **kwargs) -> list[Order]:
+                # 调新ERP的订单查询接口
+                ...
+
+            def update_merchant_code(self, order, parsed) -> bool:
+                # 调新ERP的修改编码接口
+                ...
+    4.3 修改main.py
+        # main.py  改动这一行
+        # from adapters.fangguo import FangguoAdapter   ← 旧
+        from adapters.erp_x import ErpXAdapter           # ← 新
+
+        adapter = ErpXAdapter()
+        engine = AutoAuditEngine(adapter=adapter, ...)
+        engine.run(...)
+    核心的core/ 一个字母都不用改
+
+六、技术栈
+    - 语言: Python 3.8+
+    - 核心依赖: requests（HTTP调用）
+    - 架构模式: 适配器模式（Adapter Pattern）
+    - 部署方式: 脚本（不推荐） / 打包成 exe / 定时任务
