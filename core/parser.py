@@ -134,11 +134,15 @@ def parse_remark(
     actual_size = f"{first_size[0]}x{first_size[1]}"
 
     # 提取裁剪类型（裁剪有图/裁剪无图）
+    # ERP系统没有"裁剪无图"选项，所以将其映射为"定制尺寸"
     cut_type = ""
+    cut_type_text = ""
     if "裁剪有图" in text:
         cut_type = "裁剪有图"
+        cut_type_text = "裁剪有图"
     elif "裁剪无图" in text:
-        cut_type = "裁剪无图"
+        cut_type = "定制尺寸"
+        cut_type_text = "裁剪无图"
 
     # 提取cm后面的备注内容（包含裁剪类型和额外备注，但去掉数量标记如-1张）
     remark_after_size = ""
@@ -233,11 +237,15 @@ def extract_multiple_remarks(
     is_custom = text.startswith("定制")
 
     # 提取裁剪类型（裁剪有图/裁剪无图）
+    # ERP系统没有"裁剪无图"选项，所以将其映射为"定制尺寸"
     cut_type = ""
+    cut_type_text = ""
     if "裁剪有图" in text:
         cut_type = "裁剪有图"
+        cut_type_text = "裁剪有图"
     elif "裁剪无图" in text:
-        cut_type = "裁剪无图"
+        cut_type = "定制尺寸"
+        cut_type_text = "裁剪无图"
 
     # 提取花型名称（去掉材质和数量后的文本）
     pattern_name = _extract_common_pattern(text, material_code, material_map)
@@ -246,10 +254,10 @@ def extract_multiple_remarks(
     for w, h in all_sizes:
         actual_size = f"{w}x{h}"
 
-        # 提取该尺寸对应的cm后面的备注内容
+        # 提取该尺寸对应的cm后面的备注内容（使用cut_type_text保留原始裁剪类型）
         size_remark = ""
-        if cut_type:
-            size_remark = cut_type
+        if cut_type_text:
+            size_remark = cut_type_text
 
         if is_custom:
             model_code = cut_type if cut_type else "定制尺寸"
@@ -365,11 +373,15 @@ def _parse_multi_size_direct(
     is_custom = text.startswith("定制")
 
     # 提取裁剪类型（裁剪有图/裁剪无图）
+    # ERP系统没有"裁剪无图"选项，所以将其映射为"定制尺寸"
     cut_type = ""
+    cut_type_text = ""
     if "裁剪有图" in text:
         cut_type = "裁剪有图"
+        cut_type_text = "裁剪有图"
     elif "裁剪无图" in text:
-        cut_type = "裁剪无图"
+        cut_type = "定制尺寸"
+        cut_type_text = "裁剪无图"
 
     # 提取cm后面的备注内容（包含裁剪类型和额外备注，但去掉数量标记如-1张）
     remark_after_size = ""
