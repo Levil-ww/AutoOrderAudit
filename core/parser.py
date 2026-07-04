@@ -73,7 +73,8 @@ _RE_SIZE = re.compile(
 )
 
 # 数量匹配：不限于末尾，匹配所有 "-1张", "*2个" 等
-_RE_QTY = re.compile(r"[-*×](\d+)\s*(?:张|个|件|套|米)?")
+# 使用负向前瞻确保不匹配尺寸中的数字（如60x150中的60不应被匹配）
+_RE_QTY = re.compile(r"[-*×](\d+)\s*(?:张|个|件|套|米)(?!\s*x|X|×|\*)")
 
 # 花型关键词
 _PATTERN_KEYWORDS = ["花幔", "印花", "烫画", "刺绣", "烫金", "激光", "压花", "裁剪有图", "裁剪无图"]
@@ -130,37 +131,6 @@ def parse_remark(
 
     # 取第一个尺寸作为主尺寸（用于构建编码）
     first_size = all_sizes[0]
-
-    # 移除尺寸和数量信息，得到干净的文本
-    clean_body = _remove_sizes_and_qty(body, all_sizes)
-
-    # 分号分隔解析
-    pattern_name = ""
-    material_text = clean_body
-
-    if ";" in clean_body:
-        before, after = clean_body.split(";", 1)
-        material_text = before.strip()
-        after_clean = after.strip().strip("-;,")
-        if after_clean and not all(c in after_clean for c in "0123456789xX×*cmCM厘米"):
-            pattern_name = after_clean
-
-    # 提取材质
-    _parse_material(material_text, result, material_map, material_matcher)
-
-    # 提取花型名称：优先使用pattern_name，如果没有则从material_text中提取（去掉材质后）
-    if not pattern_name:
-        if result.picture_code:
-            pattern_name = result.picture_code
-        else:
-            pattern_name = _extract_pattern(material_text, material_map)
-
-    # 清除picture_code中的裁剪类型（裁剪有图/裁剪无图应该在model_code中，不在picture_code中）
-    for kw in ["裁剪有图", "裁剪无图"]:
-        if kw in pattern_name:
-            pattern_name = pattern_name.replace(kw, "").strip().strip("-;,")
-
-    # 构建编码（使用第一个尺寸）
     actual_size = f"{first_size[0]}x{first_size[1]}"
 
     # 提取裁剪类型（裁剪有图/裁剪无图）
@@ -170,11 +140,33 @@ def parse_remark(
     elif "裁剪无图" in text:
         cut_type = "裁剪无图"
 
-    # 提取cm后面的备注内容（在-1张等数量标记之前）
+    # 提取cm后面的备注内容（包含裁剪类型和额外备注，但去掉数量标记如-1张）
     remark_after_size = ""
-    cm_match = re.search(r"cm([^-]*?)", text)
+    cm_match = re.search(r"cm(.*)", text)
     if cm_match:
-        remark_after_size = cm_match.group(1).strip().strip(";，,、")
+        after_cm = cm_match.group(1)
+        # 去掉数量标记（如-1张），但保留其他内容
+        after_cm = re.sub(r"-\d+[张个件套米]", "", after_cm).strip()
+        remark_after_size = after_cm.strip().strip(";，,、")
+
+    # 提取花型名称：从分号前的文本中提取（去掉材质和定制前缀后）
+    pattern_name = ""
+    if ";" in body:
+        before_semicolon = body.split(";", 1)[0].strip()
+        # 去掉材质名
+        for key in sorted(material_map.keys(), key=len, reverse=True):
+            if key in before_semicolon:
+                pattern_name = before_semicolon.replace(key, "").strip().strip("-;,")
+                break
+        else:
+            pattern_name = before_semicolon.strip().strip("-;,")
+
+    # 如果没有分号，从整个body中提取（去掉材质和尺寸）
+    if not pattern_name:
+        pattern_name = _extract_pattern(body, material_map)
+
+    # 提取材质
+    _parse_material(body, result, material_map, material_matcher)
 
     if is_custom:
         result.color_code = "定制"
@@ -247,12 +239,6 @@ def extract_multiple_remarks(
     elif "裁剪无图" in text:
         cut_type = "裁剪无图"
 
-    # 提取cm后面的备注内容（在-1张等数量标记之前）
-    remark_after_size = ""
-    cm_match = re.search(r"cm([^-]*?)", text)
-    if cm_match:
-        remark_after_size = cm_match.group(1).strip().strip(";，,、")
-
     # 提取花型名称（去掉材质和数量后的文本）
     pattern_name = _extract_common_pattern(text, material_code, material_map)
 
@@ -260,9 +246,14 @@ def extract_multiple_remarks(
     for w, h in all_sizes:
         actual_size = f"{w}x{h}"
 
+        # 提取该尺寸对应的cm后面的备注内容
+        size_remark = ""
+        if cut_type:
+            size_remark = cut_type
+
         if is_custom:
             model_code = cut_type if cut_type else "定制尺寸"
-            pic_size_part = f"{actual_size}{remark_after_size}" if remark_after_size else actual_size
+            pic_size_part = f"{actual_size}{size_remark}" if size_remark else actual_size
             picture_code = f"{pattern_name};{pic_size_part}"
             parsed = ParsedRemark(
                 material_code=material_code,
@@ -275,8 +266,7 @@ def extract_multiple_remarks(
                 material_source=material_source,
             )
         else:
-            pic_size_part = f"{actual_size}{remark_after_size}" if remark_after_size else actual_size
-            picture_code = f"{pattern_name};{pic_size_part}"
+            picture_code = f"{pattern_name};{actual_size}"
             parsed = ParsedRemark(
                 material_code=material_code,
                 color_code="标准",
@@ -381,11 +371,13 @@ def _parse_multi_size_direct(
     elif "裁剪无图" in text:
         cut_type = "裁剪无图"
 
-    # 提取cm后面的备注内容（在-1张等数量标记之前）
+    # 提取cm后面的备注内容（包含裁剪类型和额外备注，但去掉数量标记如-1张）
     remark_after_size = ""
-    cm_match = re.search(r"cm([^-]*?)", text)
+    cm_match = re.search(r"cm(.*)", text)
     if cm_match:
-        remark_after_size = cm_match.group(1).strip().strip(";，,、")
+        after_cm = cm_match.group(1)
+        after_cm = re.sub(r"-\d+[张个件套米]", "", after_cm).strip()
+        remark_after_size = after_cm.strip().strip(";，,、")
 
     # 尝试提取材质
     body = text[2:] if is_custom else text
