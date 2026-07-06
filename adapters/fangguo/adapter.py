@@ -261,11 +261,50 @@ class FangguoAdapter(ErpAdapter):
             return d[0] if d else {}
         return {}
 
+    # def _enrich_order_with_detail(self, order: Order) -> Order:
+    #     """如果订单没有备注/商品行，从详情接口补充"""
+    #     if order.shop_remark and order.items:
+    #         return order
+    #
+    #     detail = self.fetch_order_detail(
+    #         order_id=order.trade_id or order.id,
+    #         sys_tid=order.sys_tid,
+    #     )
+    #     if not detail:
+    #         return order
+    #
+    #     # 补充卖家备注
+    #     shop_remark = self._extract_field(detail, [
+    #         "shopRemark", "sellerRemark", "remark",
+    #         "备注", "卖家备注", "shop_remark",
+    #     ])
+    #     if shop_remark:
+    #         order.shop_remark = shop_remark
+    #
+    #     # 补充商品行
+    #     items = detail.get("orderItems") or detail.get("items") or []
+    #     if items and not order.items:
+    #         for it in items:
+    #             order.items.append(OrderItem(
+    #                 id=str(it.get("id") or ""),
+    #                 order_id=str(it.get("orderId") or order.trade_id),
+    #                 sys_oid=str(it.get("sysOid") or ""),
+    #                 oid=str(it.get("oid") or order.tid),
+    #                 title=str(it.get("title") or ""),
+    #                 sku_properties_name=str(it.get("skuPropertiesName") or ""),
+    #                 shop_mapping_sku=str(it.get("shopMappingSku") or ""),
+    #                 original_sku_id=str(it.get("originalSkuId") or ""),
+    #                 original_goods_id=str(it.get("originalGoodsId") or ""),
+    #                 merchandise_pic_path=str(it.get("merchandisePicPath") or ""),
+    #                 num=int(it.get("num") or 1),
+    #                 price=float(it.get("price") or 0),
+    #                 raw=it,
+    #             ))
+    #     return order
+
     def _enrich_order_with_detail(self, order: Order) -> Order:
-        """如果订单没有备注/商品行，从详情接口补充"""
         if order.shop_remark and order.items:
             return order
-
         detail = self.fetch_order_detail(
             order_id=order.trade_id or order.id,
             sys_tid=order.sys_tid,
@@ -273,39 +312,37 @@ class FangguoAdapter(ErpAdapter):
         if not detail:
             return order
 
-        # 补充卖家备注
-        shop_remark = self._extract_field(detail, [
-            "shopRemark", "sellerRemark", "remark",
-            "备注", "卖家备注", "shop_remark",
-        ])
-        if shop_remark:
-            order.shop_remark = shop_remark
+        # 补充卖家备注（如果缺失）
+        if not order.shop_remark:
+            order.shop_remark = self._extract_field(detail, [
+                "shopRemark", "sellerRemark", "remark",
+                "备注", "卖家备注", "shop_remark",
+            ])
 
-        # 补充商品行
-        items = detail.get("orderItems") or detail.get("items") or []
-        if items and not order.items:
+        # 补充商品行（如果缺失）
+        if not order.items:
+            items = detail.get("orderItems") or detail.get("items") or []
             for it in items:
-                order.items.append(OrderItem(
-                    id=str(it.get("id") or ""),
-                    order_id=str(it.get("orderId") or order.trade_id),
-                    sys_oid=str(it.get("sysOid") or ""),
-                    oid=str(it.get("oid") or order.tid),
-                    title=str(it.get("title") or ""),
-                    sku_properties_name=str(it.get("skuPropertiesName") or ""),
-                    shop_mapping_sku=str(it.get("shopMappingSku") or ""),
-                    original_sku_id=str(it.get("originalSkuId") or ""),
-                    original_goods_id=str(it.get("originalGoodsId") or ""),
-                    merchandise_pic_path=str(it.get("merchandisePicPath") or ""),
-                    num=int(it.get("num") or 1),
-                    price=float(it.get("price") or 0),
-                    raw=it,
-                ))
+                    order.items.append(OrderItem(
+                        id=str(it.get("id") or ""),
+                        order_id=str(it.get("orderId") or order.trade_id),
+                        sys_oid=str(it.get("sysOid") or ""),
+                        oid=str(it.get("oid") or order.tid),
+                        title=str(it.get("title") or ""),
+                        sku_properties_name=str(it.get("skuPropertiesName") or ""),
+                        shop_mapping_sku=str(it.get("shopMappingSku") or ""),
+                        original_sku_id=str(it.get("originalSkuId") or ""),
+                        original_goods_id=str(it.get("originalGoodsId") or ""),
+                        merchandise_pic_path=str(it.get("merchandisePicPath") or ""),
+                        num=int(it.get("num") or 1),
+                        price=float(it.get("price") or 0),
+                        raw=it,
+                    ))
         return order
 
     # -------------------------------------------------------------------
     # 3. 修改商家编码
     # -------------------------------------------------------------------
-
     def update_merchant_code(self, order: Order, parsed: ParsedRemark, parsed_list: list = None) -> bool:
         """
         调用 saveProduct 接口更新商家编码

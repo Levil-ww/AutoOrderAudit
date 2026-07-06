@@ -33,3 +33,15 @@
     -> 将"裁剪无图"映射为"定制尺寸"（ERP系统支持的选项），但在 picture_code 中保留原始的"裁剪无图"信息
 
 
+2026.7.06 -- 修复输出新编码的提取方式
+1.添加圆形尺寸正则：新增 _RE_ROUND_SIZE 支持 圆直径80cm 格式
+2.修复定制前缀检测：将 text.startswith("定制") 改为在整个文本中搜索"定制"关键字，处理"等通知发 定制..."这种情况
+3.更新尺寸提取函数：- _extract_all_sizes 支持圆形尺寸
+                - 新增 _extract_all_sizes_with_position 保留尺寸位置信息
+4.新增材质提取函数： _extract_material_info 提取材质信息
+5.重构extract_multiple_remarks：按尺寸位置分段解析，每个尺寸独立提取前后描述
+6.新增辅助函数：- _extract_size_specific_remark ：提取单个尺寸的前后描述
+            - _extract_global_remark_after_sizes ：提取逗号后的全局备注
+7. 修复花型提取：去掉残留的"定制"前缀
+8.修复尺寸格式：圆形尺寸显示为"圆直径80cm"
+9.修复数量标记去除：增强正则表达式匹配不同类型的连字符

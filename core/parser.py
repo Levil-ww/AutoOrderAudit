@@ -72,6 +72,11 @@ _RE_SIZE = re.compile(
     r"(\d+(?:\.\d+)?)\s*[xX×*]\s*(\d+(?:\.\d+)?)\s*(?:cm|CM|厘米)?"
 )
 
+# 圆形尺寸：圆直径80cm, 圆80cm
+_RE_ROUND_SIZE = re.compile(
+    r"圆(?:直径)?\s*(\d+(?:\.\d+)?)\s*(?:cm|CM|厘米)?"
+)
+
 # 数量匹配：不限于末尾，匹配所有 "-1张", "*2个" 等
 # 使用负向前瞻确保不匹配尺寸中的数字（如60x150中的60不应被匹配）
 _RE_QTY = re.compile(r"[-*×](\d+)\s*(?:张|个|件|套|米)(?!\s*x|X|×|\*)")
@@ -116,8 +121,10 @@ def parse_remark(
             return result
 
     # 情况2：解析备注
-    is_custom = text.startswith("定制")
-    body = text[2:] if is_custom else text
+    # 在整个文本中搜索"定制"关键字（处理"等通知发 定制..."这种情况）
+    custom_pos = text.find("定制")
+    is_custom = custom_pos != -1
+    body = text[custom_pos:] if is_custom else text
 
     # 提取数量（取所有匹配中的最大值）
     result.num = _extract_qty(body)
@@ -131,7 +138,7 @@ def parse_remark(
 
     # 取第一个尺寸作为主尺寸（用于构建编码）
     first_size = all_sizes[0]
-    actual_size = f"{first_size[0]}x{first_size[1]}"
+    actual_size = f"{first_size[0]}x{first_size[1]}" if first_size[1] != "圆" else f"圆直径{first_size[0]}cm"
 
     # 提取裁剪类型（裁剪有图/裁剪无图）
     # ERP系统没有"裁剪无图"选项，所以将其映射为"定制尺寸"
@@ -164,6 +171,10 @@ def parse_remark(
                 break
         else:
             pattern_name = before_semicolon.strip().strip("-;,")
+    
+    # 去掉可能残留的"定制"前缀
+    if pattern_name.startswith("定制"):
+        pattern_name = pattern_name[2:].strip()
 
     # 如果没有分号，从整个body中提取（去掉材质和尺寸）
     if not pattern_name:
@@ -205,6 +216,13 @@ def extract_multiple_remarks(
         ParsedRemark(...picture='楼梯垫浅灰3;100x4000'),
         ParsedRemark(...picture='楼梯垫浅灰3;100x1000')
       ]
+    
+    支持每个尺寸有独立描述：
+        "等通知发 定制双面革无尽夏;44.5x60cm四个角都是半径5cm的圆角-1张，竖版53x60cm-1张"
+    → [
+        ParsedRemark(...picture='无尽夏;44.5x60四个角都是半径5cm的圆角'),
+        ParsedRemark(...picture='无尽夏;竖版53x60')
+      ]
     """
     results = []
     material_map = material_map or {}
@@ -214,85 +232,159 @@ def extract_multiple_remarks(
 
     text = remark_text.strip()
 
-    # 提取所有尺寸
-    all_sizes = _extract_all_sizes(text)
+    # 在整个文本中搜索"定制"关键字（处理"等通知发 定制..."这种情况）
+    custom_pos = text.find("定制")
+    is_custom = custom_pos != -1
+    body = text[custom_pos:] if is_custom else text
 
-    if len(all_sizes) <= 1:
+    # 提取所有尺寸（包括位置信息）
+    all_sizes_with_pos = _extract_all_sizes_with_position(text)
+
+    if len(all_sizes_with_pos) <= 1:
         # 只有一个尺寸或没有尺寸，正常解析
         parsed = parse_remark(text, material_map, material_matcher)
         if parsed.success:
             results.append(parsed)
         return results
 
-    # 先解析一次得到基础解析结果（不含尺寸）
-    base_parsed = parse_remark(text, material_map, material_matcher)
-
-    if not base_parsed.success:
-        # 尝试直接解析每个尺寸对应的部分
-        return _parse_multi_size_direct(text, all_sizes, material_map, material_matcher)
-
     # 提取共同的材质和花型
-    material_code = base_parsed.material_code
-    material_source = base_parsed.material_source
-    is_custom = text.startswith("定制")
+    material_code, material_source = _extract_material_info(body, material_map, material_matcher)
+    pattern_name = _extract_common_pattern(body, material_code, material_map)
 
     # 提取裁剪类型（裁剪有图/裁剪无图）
-    # ERP系统没有"裁剪无图"选项，所以将其映射为"定制尺寸"
     cut_type = ""
-    cut_type_text = ""
     if "裁剪有图" in text:
         cut_type = "裁剪有图"
-        cut_type_text = "裁剪有图"
     elif "裁剪无图" in text:
         cut_type = "定制尺寸"
-        cut_type_text = "裁剪无图"
 
-    # 提取花型名称（去掉材质和数量后的文本）
-    pattern_name = _extract_common_pattern(text, material_code, material_map)
+    # 提取cm后面的全局备注（去掉数量标记后）
+    global_remark = _extract_global_remark_after_sizes(text)
 
-    # 为每个尺寸生成一个解析结果
-    for w, h in all_sizes:
-        actual_size = f"{w}x{h}"
+    # 为每个尺寸生成一个解析结果（包含该尺寸的特定描述）
+    for idx, (w, h, start_pos, end_pos) in enumerate(all_sizes_with_pos):
+        # 获取原始尺寸文本（保留cm单位）
+        original_size_text = text[start_pos:end_pos]
+        actual_size = f"{w}x{h}" if h != "圆" else f"圆直径{w}cm"
 
-        # 提取该尺寸对应的cm后面的备注内容（使用cut_type_text保留原始裁剪类型）
-        size_remark = ""
-        if cut_type_text:
-            size_remark = cut_type_text
-
-        if is_custom:
-            model_code = cut_type if cut_type else "定制尺寸"
-            pic_size_part = f"{actual_size}{size_remark}" if size_remark else actual_size
-            picture_code = f"{pattern_name};{pic_size_part}"
-            parsed = ParsedRemark(
-                material_code=material_code,
-                color_code="定制",
-                model_code=model_code,
-                picture_code=picture_code,
-                num=1,
-                raw_text=remark_text,
-                success=True,
-                material_source=material_source,
-            )
+        # 提取该尺寸前后的特定描述
+        # 获取所有尺寸位置
+        all_sizes_pos = []
+        for match in _RE_SIZE.finditer(text):
+            all_sizes_pos.append((match.start(), match.end()))
+        for match in _RE_ROUND_SIZE.finditer(text):
+            all_sizes_pos.append((match.start(), match.end()))
+        all_sizes_pos.sort(key=lambda x: x[0])
+        
+        before_text = ""
+        after_text = ""
+        
+        # 提取尺寸前面的描述（如"竖版53x60"中的"竖版"）
+        if idx > 0 and idx <= len(all_sizes_pos):
+            prev_end = all_sizes_pos[idx - 1][1]
+            
+            # 从逗号之后开始提取
+            comma_after_prev = text.find("，", prev_end)
+            if comma_after_prev == -1:
+                comma_after_prev = text.find(",", prev_end)
+            
+            if comma_after_prev != -1 and comma_after_prev < start_pos:
+                # 逗号后面到当前尺寸之间的文本
+                between_text = text[comma_after_prev + 1:start_pos].strip().strip("-;,、")
+                # 去掉数量标记（如"1张"）
+                between_text = re.sub(r"-\d+[张个件套米]", "", between_text).strip()
+                between_text = re.sub(r"\d+[张个件套米]", "", between_text).strip()
+                before_text = between_text
+        
+        # 提取尺寸后面的描述（到下一个尺寸或逗号/句号为止）
+        next_size_pos = len(text)
+        for i, (s_start, s_end) in enumerate(all_sizes_pos):
+            if i > idx:
+                next_size_pos = s_start
+                break
+        
+        # 找逗号或句号
+        comma_pos = text.find("，", end_pos)
+        if comma_pos == -1:
+            comma_pos = text.find(",", end_pos)
+        if comma_pos == -1:
+            comma_pos = text.find("。", end_pos)
+        
+        if comma_pos != -1 and comma_pos < next_size_pos:
+            after_text = text[end_pos:comma_pos].strip().strip("-;,、")
         else:
-            picture_code = f"{pattern_name};{actual_size}"
-            parsed = ParsedRemark(
-                material_code=material_code,
-                color_code="标准",
-                model_code=actual_size,
-                picture_code=picture_code,
-                num=1,
-                raw_text=remark_text,
-                success=True,
-                material_source=material_source,
-            )
+            after_text = text[end_pos:next_size_pos].strip().strip("-;,、")
+        
+        # 去掉数量标记（如"-1张"）
+        after_text = re.sub(r"[-–—]\d+[张个件套米]", "", after_text).strip().strip("-;,")
+        after_text = re.sub(r"\d+[张个件套米]", "", after_text).strip().strip("-;,")
+        
+        # 合并全局备注到after_text
+        if global_remark:
+            if after_text:
+                after_text += global_remark
+            else:
+                after_text = global_remark
+
+        model_code = cut_type if cut_type else "定制尺寸"
+        pic_size_part = f"{before_text}{actual_size}{after_text}" if (before_text or after_text) else actual_size
+        picture_code = f"{pattern_name};{pic_size_part}"
+
+        parsed = ParsedRemark(
+            material_code=material_code,
+            color_code="定制" if is_custom else "标准",
+            model_code=model_code if is_custom else actual_size,
+            picture_code=picture_code,
+            num=1,
+            raw_text=remark_text,
+            success=True,
+            material_source=material_source,
+        )
         results.append(parsed)
 
     return results
 
 
 def _extract_all_sizes(text: str) -> list[tuple[str, str]]:
-    """提取文本中所有尺寸对"""
-    return _RE_SIZE.findall(text)
+    """提取文本中所有尺寸对，包括矩形尺寸和圆形尺寸"""
+    sizes = []
+    
+    # 提取矩形尺寸
+    for w, h in _RE_SIZE.findall(text):
+        sizes.append((w, h))
+    
+    # 提取圆形尺寸（作为特殊的尺寸表示）
+    for diameter in _RE_ROUND_SIZE.findall(text):
+        sizes.append((diameter, "圆"))
+    
+    return sizes
+
+
+def _extract_all_sizes_with_position(text: str) -> list[tuple[str, str, int, int]]:
+    """提取文本中所有尺寸对，包括位置信息 (w, h, start_pos, end_pos)"""
+    sizes_with_pos = []
+    
+    # 提取矩形尺寸（带位置）
+    for match in _RE_SIZE.finditer(text):
+        w, h = match.groups()
+        sizes_with_pos.append((w, h, match.start(), match.end()))
+    
+    # 提取圆形尺寸（带位置）
+    for match in _RE_ROUND_SIZE.finditer(text):
+        diameter = match.group(1)
+        sizes_with_pos.append((diameter, "圆", match.start(), match.end()))
+    
+    # 按位置排序
+    sizes_with_pos.sort(key=lambda x: x[2])
+    
+    return sizes_with_pos
+
+
+def _extract_material_info(body: str, material_map: dict, material_matcher: Callable) -> tuple[str, str]:
+    """提取材质信息，返回 (material_code, material_source)"""
+    result = ParsedRemark()
+    _parse_material(body, result, material_map, material_matcher)
+    return result.material_code, result.material_source
 
 
 def _remove_sizes_and_qty(text: str, sizes: list[tuple[str, str]]) -> str:
@@ -337,6 +429,7 @@ def _extract_common_pattern(text: str, material_code: str, material_map: dict) -
 
     # 去掉尺寸和数量
     body = _RE_SIZE.sub("", body)
+    body = _RE_ROUND_SIZE.sub("", body)
     body = _RE_QTY.sub("", body)
     body = re.sub(r"共计\d+张", "", body)
     body = re.sub(r"\d+张", "", body)
@@ -355,6 +448,10 @@ def _extract_common_pattern(text: str, material_code: str, material_map: dict) -
     if "," in body:
         body = body.split(",")[0].strip()
 
+    # 去掉可能残留的"定制"前缀
+    if body.startswith("定制"):
+        body = body[2:].strip()
+
     return body or "定制"
 
 
@@ -370,7 +467,9 @@ def _parse_multi_size_direct(
     # 简化处理：只提取材质和花型，然后为每个尺寸生成编码
     material_code = ""
     material_source = ""
-    is_custom = text.startswith("定制")
+    # 在整个文本中搜索"定制"关键字（处理"等通知发 定制..."这种情况）
+    custom_pos = text.find("定制")
+    is_custom = custom_pos != -1
 
     # 提取裁剪类型（裁剪有图/裁剪无图）
     # ERP系统没有"裁剪无图"选项，所以将其映射为"定制尺寸"
@@ -392,7 +491,7 @@ def _parse_multi_size_direct(
         remark_after_size = after_cm.strip().strip(";，,、")
 
     # 尝试提取材质
-    body = text[2:] if is_custom else text
+    body = text[custom_pos:] if is_custom else text
     _parse_material(body, ParsedRemark(), material_map, material_matcher)
 
     # 提取花型（取第一个尺寸前的文本作为基础花型）
@@ -591,3 +690,134 @@ def _extract_pattern(text: str, material_map: dict = None) -> str:
                 return ""
 
     return result
+
+
+def _extract_size_specific_remark(text: str, start_pos: int, end_pos: int, idx: int, total: int) -> str:
+    """
+    提取单个尺寸前后的特定描述
+    
+    对于第一个尺寸：提取尺寸前（上一个尺寸之后）到尺寸之间的文本
+    对于其他尺寸：提取上一个尺寸之后到当前尺寸开始之间的文本
+    
+    同时提取尺寸后面到下一个尺寸或逗号/句号之间的文本（去掉数量标记）
+    """
+    before_text = ""
+    after_text = ""
+    
+    # 提取尺寸前面的描述（如"竖版53x60"中的"竖版"）
+    if idx == 0:
+        # 第一个尺寸：从分号或"定制"后开始提取
+        before_start = text.rfind(";", 0, start_pos)
+        if before_start == -1:
+            before_start = text.rfind("定制", 0, start_pos)
+            if before_start != -1:
+                before_start += 2
+        if before_start == -1:
+            before_start = 0
+        before_text = text[before_start:start_pos].strip().strip("-;,、")
+    else:
+        # 后续尺寸：从上一个尺寸结束后到当前尺寸开始之间的文本
+        # 先找到上一个尺寸的结束位置
+        prev_size_end = 0
+        size_count = 0
+        for match in _RE_SIZE.finditer(text):
+            if match.start() >= start_pos:
+                break
+            prev_size_end = match.end()
+            size_count += 1
+        if size_count == 0:
+            for match in _RE_ROUND_SIZE.finditer(text):
+                if match.start() >= start_pos:
+                    break
+                prev_size_end = match.end()
+        
+        # 从逗号或数量标记之后开始提取
+        comma_after_prev = text.find("，", prev_size_end)
+        if comma_after_prev == -1:
+            comma_after_prev = text.find(",", prev_size_end)
+        
+        if comma_after_prev != -1 and comma_after_prev < start_pos:
+            # 逗号后面到当前尺寸之间的文本
+            between_text = text[comma_after_prev + 1:start_pos].strip().strip("-;,、")
+            # 去掉数量标记（如"1张"）
+            between_text = re.sub(r"-\d+[张个件套米]", "", between_text).strip()
+            between_text = re.sub(r"\d+[张个件套米]", "", between_text).strip()
+            before_text = between_text
+        else:
+            before_text = text[prev_size_end:start_pos].strip().strip("-;,、")
+    
+    # 提取尺寸后面的描述（到下一个尺寸或逗号/句号为止）
+    next_size_pos = len(text)
+    for match in _RE_SIZE.finditer(text):
+        if match.start() > end_pos:
+            next_size_pos = match.start()
+            break
+    for match in _RE_ROUND_SIZE.finditer(text):
+        if match.start() > end_pos and match.start() < next_size_pos:
+            next_size_pos = match.start()
+    
+    # 找逗号或句号
+    comma_pos = text.find("，", end_pos)
+    if comma_pos == -1:
+        comma_pos = text.find(",", end_pos)
+    if comma_pos == -1:
+        comma_pos = text.find("。", end_pos)
+    
+    if comma_pos != -1 and comma_pos < next_size_pos:
+        after_text = text[end_pos:comma_pos].strip().strip("-;,、")
+    else:
+        after_text = text[end_pos:next_size_pos].strip().strip("-;,、")
+    
+    # 去掉数量标记（如"-1张"）
+    after_text = re.sub(r"-\d+[张个件套米]", "", after_text).strip().strip("-;,")
+    
+    # 去掉before_text中的数量标记
+    before_text = re.sub(r"-\d+[张个件套米]", "", before_text).strip().strip("-;,")
+    before_text = re.sub(r"\d+[张个件套米]", "", before_text).strip().strip("-;,")
+    
+    # 合并前后描述：对于后续尺寸，before_text（如"竖版"）应该在尺寸前面
+    combined = ""
+    if before_text:
+        combined = before_text
+    if after_text:
+        if combined:
+            combined += after_text
+        else:
+            combined = after_text
+    
+    return combined
+
+
+def _extract_global_remark_after_sizes(text: str) -> str:
+    """
+    提取所有尺寸之后的全局备注（逗号后面的内容，去掉数量标记）
+    
+    例如："定制双面革纯黑色;圆直径80cm-1张，需要做效果图后再定制"
+    → "需要做效果图后再定制"
+    """
+    # 找到最后一个尺寸的位置
+    last_size_end = 0
+    
+    for match in _RE_SIZE.finditer(text):
+        if match.end() > last_size_end:
+            last_size_end = match.end()
+    
+    for match in _RE_ROUND_SIZE.finditer(text):
+        if match.end() > last_size_end:
+            last_size_end = match.end()
+    
+    # 从最后一个尺寸之后找逗号
+    comma_pos = text.find("，", last_size_end)
+    if comma_pos == -1:
+        comma_pos = text.find(",", last_size_end)
+    
+    if comma_pos == -1:
+        return ""
+    
+    # 提取逗号后面的内容
+    after_comma = text[comma_pos + 1:].strip().strip("-;,、")
+    
+    # 去掉数量标记
+    after_comma = re.sub(r"-\d+[张个件套米]", "", after_comma).strip().strip("-;,")
+    
+    return after_comma
