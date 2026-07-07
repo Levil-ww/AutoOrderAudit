@@ -491,7 +491,7 @@ class FangguoAdapter(ErpAdapter):
             "workUrl": None,
             "effectUrl": None,
             "productionPicPath": None,
-            "num": item.num,
+            "num": parsed.num,
             "price": item.price,
             "skuPropertiesName": item.sku_properties_name,
             "outerIid": "",
