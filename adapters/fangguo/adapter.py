@@ -357,10 +357,10 @@ class FangguoAdapter(ErpAdapter):
         order_items = []
         for p in effective_list:
             if order.items:
-                # 为每个解析结果创建一个商品行
-                for item in order.items:
-                    new_item = self._build_order_item(item, order, p)
-                    order_items.append(new_item)
+                # 使用第一个商品行作为模板，为每个解析结果创建一个商品行（1:1映射）
+                template_item = order.items[0]
+                new_item = self._build_order_item(template_item, order, p)
+                order_items.append(new_item)
             else:
                 # 如果没有商品行，创建一个默认的商品行
                 new_item = self._build_default_item(order, p)

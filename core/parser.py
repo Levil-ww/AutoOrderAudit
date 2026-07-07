@@ -182,6 +182,8 @@ def parse_remark(
         after_cm = cm_match.group(1)
         # 去掉数量标记（如-1张），但保留其他内容
         after_cm = re.sub(r"-\d+[张个件套米]", "", after_cm).strip()
+        # 去掉数量汇总信息（如"共计2张"、"共三张"）
+        after_cm = re.sub(r"共(?:计)?\d+[张个件套米]", "", after_cm).strip()
         remark_after_size = after_cm.strip().strip(";，,、")
 
     # 提取花型名称：从分号前的文本中提取（去掉材质和定制前缀后）
@@ -302,12 +304,15 @@ def extract_multiple_remarks(
         if parsed.success or (parsed.material_code and parsed.picture_code):
             # 如果有共享尾部备注，追加到picture_code
             if trailing_remark:
-                # 将尾部备注追加到picture_code中的尺寸部分
-                if ";" in parsed.picture_code:
-                    pattern_part, size_part = parsed.picture_code.split(";", 1)
-                    parsed.picture_code = f"{pattern_part};{size_part}{trailing_remark}"
-                else:
-                    parsed.picture_code = f"{parsed.picture_code};{trailing_remark}"
+                # 过滤掉数量汇总信息（如"共计2张"）
+                clean_remark = re.sub(r"共计\d+[张个件套米]", "", trailing_remark).strip().strip("-;,、")
+                if clean_remark:
+                    # 将尾部备注追加到picture_code中的尺寸部分
+                    if ";" in parsed.picture_code:
+                        pattern_part, size_part = parsed.picture_code.split(";", 1)
+                        parsed.picture_code = f"{pattern_part};{size_part}{clean_remark}"
+                    else:
+                        parsed.picture_code = f"{parsed.picture_code};{clean_remark}"
             
             results.append(parsed)
 
@@ -879,10 +884,13 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
                     after_comma = after_comma[:gift_pos].strip().strip("-;,、")
                 
                 if after_comma and not _RE_SIZE.search(after_comma) and not _RE_ROUND_SIZE.search(after_comma):
-                    if trailing_remark:
-                        trailing_remark = f"{trailing_remark}，{after_comma}"
-                    else:
-                        trailing_remark = after_comma
+                    # 过滤掉"共计N张"这种数量汇总信息
+                    after_comma = re.sub(r"共计\d+[张个件套米]", "", after_comma).strip().strip("-;,、")
+                    if after_comma:
+                        if trailing_remark:
+                            trailing_remark = f"{trailing_remark}，{after_comma}"
+                        else:
+                            trailing_remark = after_comma
         
         # 为后续段补充花型名（如果没有分号）
         first_pattern = ""
@@ -1136,6 +1144,9 @@ def _clean_segment(segment: str) -> str:
     # 去掉数量标记（如"-1张"）
     segment = re.sub(r"-\d+[张个件套米]", "", segment).strip()
     segment = re.sub(r"\d+[张个件套米]", "", segment).strip()
+    
+    # 去掉数量汇总信息（如"共计2张"、"共三张"）
+    segment = re.sub(r"共(?:计)?\d+[张个件套米]", "", segment).strip()
     
     # 清理结尾符号
     segment = segment.strip().strip("-;,、")
