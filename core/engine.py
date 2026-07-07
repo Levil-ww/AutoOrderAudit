@@ -10,6 +10,20 @@ from .adapter_base import ErpAdapter
 from .parser import parse_remark, extract_multiple_remarks
 
 
+_SKIP_KEYWORDS = [
+    "待定",
+    "待确定",
+    "等通知发",
+    "需要效果图",
+    "效果图",
+    "确认再生产",
+    "号发货",
+    "号安排发货",
+    "号在安排发货",
+    "已代益",
+]
+
+
 class AutoAuditEngine:
     """自动审单引擎"""
 
@@ -79,6 +93,12 @@ class AutoAuditEngine:
             print("  ⏭️  跳过：卖家备注为空")
             self.stats["skipped"] += 1
             return
+
+        for keyword in _SKIP_KEYWORDS:
+            if keyword in remark:
+                print(f"  ⏭️  跳过：备注包含关键字 '{keyword}'")
+                self.stats["skipped"] += 1
+                return
 
         material_map = getattr(self.adapter, 'material_map', None)
         material_matcher = getattr(self.adapter, 'get_material_matcher', lambda: None)()
