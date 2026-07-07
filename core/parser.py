@@ -208,7 +208,7 @@ def extract_multiple_remarks(
         material_matcher: Optional[Callable[[str], tuple[Optional[str], str]]] = None,
 ) -> list[ParsedRemark]:
     """
-    从一条备注中提取多个商品信息（多尺寸场景）
+    从一条备注中提取多个商品信息（多尺寸/多花型场景）
 
     例如：
         "定制吸水皮革楼梯垫浅灰3,100x4000cm一张，浅灰，100x1000cm一张，共计2张"
@@ -222,6 +222,13 @@ def extract_multiple_remarks(
     → [
         ParsedRemark(...picture='无尽夏;44.5x60四个角都是半径5cm的圆角'),
         ParsedRemark(...picture='无尽夏;竖版53x60')
+      ]
+    
+    支持不同花型：
+        "定制双面革克罗印花;30x50cm-1张，莫比之窗;25x35cm-1张,格子多些..."
+    → [
+        ParsedRemark(...picture='克罗印花;30x50格子多些...'),
+        ParsedRemark(...picture='莫比之窗;25x35格子多些...')
       ]
     """
     results = []
@@ -237,110 +244,45 @@ def extract_multiple_remarks(
     is_custom = custom_pos != -1
     body = text[custom_pos:] if is_custom else text
 
-    # 提取所有尺寸（包括位置信息）
-    all_sizes_with_pos = _extract_all_sizes_with_position(text)
+    # 将备注分割为独立商品段
+    segments, trailing_remark = _split_into_segments(text)
 
-    if len(all_sizes_with_pos) <= 1:
-        # 只有一个尺寸或没有尺寸，正常解析
+    if not segments:
+        # 无法分割，尝试正常解析
         parsed = parse_remark(text, material_map, material_matcher)
         if parsed.success:
             results.append(parsed)
         return results
 
-    # 提取共同的材质和花型
+    # 提取共同的材质信息（从原始文本）
     material_code, material_source = _extract_material_info(body, material_map, material_matcher)
-    pattern_name = _extract_common_pattern(body, material_code, material_map)
-
-    # 提取裁剪类型（裁剪有图/裁剪无图）
-    cut_type = ""
-    if "裁剪有图" in text:
-        cut_type = "裁剪有图"
-    elif "裁剪无图" in text:
-        cut_type = "定制尺寸"
-
-    # 提取cm后面的全局备注（去掉数量标记后）
-    global_remark = _extract_global_remark_after_sizes(text)
-
-    # 为每个尺寸生成一个解析结果（包含该尺寸的特定描述）
-    for idx, (w, h, start_pos, end_pos) in enumerate(all_sizes_with_pos):
-        # 获取原始尺寸文本（保留cm单位）
-        original_size_text = text[start_pos:end_pos]
-        actual_size = f"{w}x{h}" if h != "圆" else f"圆直径{w}cm"
-
-        # 提取该尺寸前后的特定描述
-        # 获取所有尺寸位置
-        all_sizes_pos = []
-        for match in _RE_SIZE.finditer(text):
-            all_sizes_pos.append((match.start(), match.end()))
-        for match in _RE_ROUND_SIZE.finditer(text):
-            all_sizes_pos.append((match.start(), match.end()))
-        all_sizes_pos.sort(key=lambda x: x[0])
-        
-        before_text = ""
-        after_text = ""
-        
-        # 提取尺寸前面的描述（如"竖版53x60"中的"竖版"）
-        if idx > 0 and idx <= len(all_sizes_pos):
-            prev_end = all_sizes_pos[idx - 1][1]
-            
-            # 从逗号之后开始提取
-            comma_after_prev = text.find("，", prev_end)
-            if comma_after_prev == -1:
-                comma_after_prev = text.find(",", prev_end)
-            
-            if comma_after_prev != -1 and comma_after_prev < start_pos:
-                # 逗号后面到当前尺寸之间的文本
-                between_text = text[comma_after_prev + 1:start_pos].strip().strip("-;,、")
-                # 去掉数量标记（如"1张"）
-                between_text = re.sub(r"-\d+[张个件套米]", "", between_text).strip()
-                between_text = re.sub(r"\d+[张个件套米]", "", between_text).strip()
-                before_text = between_text
-        
-        # 提取尺寸后面的描述（到下一个尺寸或逗号/句号为止）
-        next_size_pos = len(text)
-        for i, (s_start, s_end) in enumerate(all_sizes_pos):
-            if i > idx:
-                next_size_pos = s_start
-                break
-        
-        # 找逗号或句号
-        comma_pos = text.find("，", end_pos)
-        if comma_pos == -1:
-            comma_pos = text.find(",", end_pos)
-        if comma_pos == -1:
-            comma_pos = text.find("。", end_pos)
-        
-        if comma_pos != -1 and comma_pos < next_size_pos:
-            after_text = text[end_pos:comma_pos].strip().strip("-;,、")
+    
+    # 为每个商品段独立解析
+    for segment in segments:
+        # 如果段中没有"定制"关键字，添加前缀以便识别
+        if "定制" not in segment and is_custom:
+            segment_with_prefix = f"定制{segment}"
         else:
-            after_text = text[end_pos:next_size_pos].strip().strip("-;,、")
+            segment_with_prefix = segment
         
-        # 去掉数量标记（如"-1张"）
-        after_text = re.sub(r"[-–—]\d+[张个件套米]", "", after_text).strip().strip("-;,")
-        after_text = re.sub(r"\d+[张个件套米]", "", after_text).strip().strip("-;,")
+        parsed = parse_remark(segment_with_prefix, material_map, material_matcher)
         
-        # 合并全局备注到after_text
-        if global_remark:
-            if after_text:
-                after_text += global_remark
-            else:
-                after_text = global_remark
-
-        model_code = cut_type if cut_type else "定制尺寸"
-        pic_size_part = f"{before_text}{actual_size}{after_text}" if (before_text or after_text) else actual_size
-        picture_code = f"{pattern_name};{pic_size_part}"
-
-        parsed = ParsedRemark(
-            material_code=material_code,
-            color_code="定制" if is_custom else "标准",
-            model_code=model_code if is_custom else actual_size,
-            picture_code=picture_code,
-            num=1,
-            raw_text=remark_text,
-            success=True,
-            material_source=material_source,
-        )
-        results.append(parsed)
+        if parsed.success:
+            # 强制使用正确的材质
+            if material_code:
+                parsed.material_code = material_code
+                parsed.material_source = material_source
+            
+            # 如果有共享尾部备注，追加到picture_code
+            if trailing_remark:
+                # 将尾部备注追加到picture_code中的尺寸部分
+                if ";" in parsed.picture_code:
+                    pattern_part, size_part = parsed.picture_code.split(";", 1)
+                    parsed.picture_code = f"{pattern_part};{size_part}{trailing_remark}"
+                else:
+                    parsed.picture_code = f"{parsed.picture_code};{trailing_remark}"
+            
+            results.append(parsed)
 
     return results
 
@@ -821,3 +763,206 @@ def _extract_global_remark_after_sizes(text: str) -> str:
     after_comma = re.sub(r"-\d+[张个件套米]", "", after_comma).strip().strip("-;,")
     
     return after_comma
+
+
+def _split_into_segments(text: str) -> tuple[list[dict], str]:
+    """
+    将备注文本分割为独立的商品段
+    
+    分割规则：
+    1. 按"定制"关键字分割，每个"定制..."开头的部分是一个商品段
+    2. 如果只有一个"定制"但有多个尺寸，检查每个尺寸前面是否有花型名
+       - 如果尺寸前面有分号和花型名，且花型名不同，说明是不同花型的商品
+       - 如果花型名相同或没有花型名，说明是同花型的不同尺寸
+    3. 跳过以"送"开头的赠品段
+    
+    返回：(segments, trailing_remark)
+    - segments: 商品段列表，每个元素是dict{"pattern": str, "size_desc": str}
+    - trailing_remark: 所有商品段之后的共享备注
+    """
+    segments = []
+    trailing_remark = ""
+    
+    text = text.strip()
+    
+    custom_positions = []
+    start = 0
+    while True:
+        pos = text.find("定制", start)
+        if pos == -1:
+            break
+        custom_positions.append(pos)
+        start = pos + 2
+    
+    if len(custom_positions) >= 2:
+        for i in range(len(custom_positions)):
+            start_pos = custom_positions[i]
+            end_pos = custom_positions[i + 1] if i < len(custom_positions) - 1 else len(text)
+            segment_text = text[start_pos:end_pos].strip()
+            
+            if segment_text.startswith("送"):
+                continue
+            
+            segment_text = _clean_segment(segment_text)
+            
+            if segment_text:
+                segments.append({"pattern": "", "size_desc": segment_text})
+    else:
+        all_sizes_pos = []
+        for match in _RE_SIZE.finditer(text):
+            all_sizes_pos.append((match.start(), match.end()))
+        for match in _RE_ROUND_SIZE.finditer(text):
+            all_sizes_pos.append((match.start(), match.end()))
+        all_sizes_pos.sort(key=lambda x: x[0])
+        
+        if len(all_sizes_pos) <= 1:
+            cleaned = _clean_segment(text)
+            if cleaned:
+                segments.append({"pattern": "", "size_desc": cleaned})
+            return segments, trailing_remark
+        
+        semi_positions = []
+        for match in re.finditer(r";", text):
+            semi_positions.append(match.start())
+        
+        patterns_before_sizes = []
+        for i, (size_start, size_end) in enumerate(all_sizes_pos):
+            prev_semi = -1
+            for pos in reversed(semi_positions):
+                if pos < size_start:
+                    prev_semi = pos
+                    break
+            
+            if prev_semi != -1:
+                upper_bound = -1
+                for pos in reversed(semi_positions):
+                    if pos < prev_semi:
+                        upper_bound = pos
+                        break
+                
+                if upper_bound == -1:
+                    comma_pos = text.rfind("，", 0, prev_semi)
+                    if comma_pos == -1:
+                        comma_pos = text.rfind(",", 0, prev_semi)
+                    upper_bound = comma_pos
+                
+                if upper_bound != -1:
+                    pattern_text = text[upper_bound + 1:prev_semi].strip()
+                else:
+                    pattern_text = text[:prev_semi].strip()
+                    if pattern_text.startswith("定制"):
+                        for key in ["双面革", "吸水皮革", "双面格", "镜面皮革", "丝圈", "软玻璃"]:
+                            if key in pattern_text:
+                                pattern_text = pattern_text.replace("定制", "").replace(key, "").strip()
+                                break
+                patterns_before_sizes.append(pattern_text)
+            else:
+                patterns_before_sizes.append("")
+        
+        unique_patterns = set(p for p in patterns_before_sizes if p)
+        
+        if len(unique_patterns) >= 2:
+            for i, (size_start, size_end) in enumerate(all_sizes_pos):
+                prev_semi = -1
+                for pos in reversed(semi_positions):
+                    if pos < size_start:
+                        prev_semi = pos
+                        break
+                
+                next_size_start = all_sizes_pos[i + 1][0] if i < len(all_sizes_pos) - 1 else len(text)
+                
+                segment_start = 0
+                if prev_semi != -1:
+                    upper_semi = -1
+                    for pos in reversed(semi_positions):
+                        if pos < prev_semi:
+                            upper_semi = pos
+                            break
+                    if upper_semi != -1:
+                        segment_start = upper_semi + 1
+                
+                segment_text = text[segment_start:next_size_start].strip()
+                
+                if segment_text.startswith("送"):
+                    continue
+                
+                segment_text = _clean_segment(segment_text)
+                
+                if segment_text:
+                    pattern = patterns_before_sizes[i] if i < len(patterns_before_sizes) else ""
+                    size_desc = segment_text
+                    if pattern and ";" in segment_text:
+                        size_desc = segment_text.split(";", 1)[1].strip()
+                    segments.append({"pattern": pattern, "size_desc": size_desc})
+        else:
+            common_pattern = ""
+            if semi_positions:
+                first_semi = semi_positions[0]
+                pattern_text = text[:first_semi].strip()
+                custom_pos = pattern_text.find("定制")
+                if custom_pos != -1:
+                    pattern_text = pattern_text[custom_pos:]
+                if pattern_text.startswith("定制"):
+                    for key in ["双面革", "吸水皮革", "双面格", "镜面皮革", "丝圈", "软玻璃"]:
+                        if key in pattern_text:
+                            common_pattern = pattern_text.replace("定制", "").replace(key, "").strip()
+                            break
+            
+            for i, (size_start, size_end) in enumerate(all_sizes_pos):
+                prev_end = all_sizes_pos[i - 1][1] if i > 0 else 0
+                
+                comma_pos = text.find("，", prev_end)
+                if comma_pos == -1:
+                    comma_pos = text.find(",", prev_end)
+                
+                desc_start = comma_pos + 1 if comma_pos != -1 else prev_end
+                
+                next_size_start = all_sizes_pos[i + 1][0] if i < len(all_sizes_pos) - 1 else len(text)
+                
+                size_desc = text[desc_start:next_size_start].strip()
+                
+                size_desc = re.sub(r"-\d+[张个件套米]", "", size_desc).strip()
+                size_desc = re.sub(r"\d+[张个件套米]", "", size_desc).strip()
+                
+                if common_pattern:
+                    segments.append({"pattern": common_pattern, "size_desc": size_desc})
+                else:
+                    segments.append({"pattern": "", "size_desc": size_desc})
+    
+    # 提取尾部备注
+    if segments:
+        last_size_end = 0
+        for match in _RE_SIZE.finditer(text):
+            if match.end() > last_size_end:
+                last_size_end = match.end()
+        for match in _RE_ROUND_SIZE.finditer(text):
+            if match.end() > last_size_end:
+                last_size_end = match.end()
+        
+        after_last_size = text[last_size_end:].strip()
+        after_last_size = re.sub(r"-\d+[张个件套米]", "", after_last_size).strip()
+        
+        gift_pos = after_last_size.find("送")
+        if gift_pos != -1:
+            trailing_remark = after_last_size[:gift_pos].strip().strip("，,、")
+        else:
+            trailing_remark = after_last_size.strip().strip("，,、")
+    
+    return segments, trailing_remark
+
+
+def _clean_segment(segment: str) -> str:
+    """清理商品段，去掉赠品和数量标记"""
+    # 去掉"送..."部分
+    gift_pos = segment.find("送")
+    if gift_pos != -1:
+        segment = segment[:gift_pos].strip()
+    
+    # 去掉数量标记（如"-1张"）
+    segment = re.sub(r"-\d+[张个件套米]", "", segment).strip()
+    segment = re.sub(r"\d+[张个件套米]", "", segment).strip()
+    
+    # 清理结尾符号
+    segment = segment.strip().strip("-;,、")
+    
+    return segment
