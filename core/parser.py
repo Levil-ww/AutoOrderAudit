@@ -81,6 +81,12 @@ _RE_ROUND_SIZE = re.compile(
 # 使用负向前瞻确保不匹配尺寸中的数字（如60x150中的60不应被匹配）
 _RE_QTY = re.compile(r"[-*×](\d+)\s*(?:张|个|件|套|米)(?!\s*x|X|×|\*)")
 
+# 中文数字匹配（支持一到十及常用数量词）
+_CHINESE_NUMBERS = r"(?:[一二两三四五六七八九十]|\d+)"
+
+# 数量汇总信息匹配（如"共计两张"、"共三张"、"共计5张"）
+_RE_QTY_SUMMARY = re.compile(rf"共(?:计)?{_CHINESE_NUMBERS}[张个件套米]")
+
 # 花型关键词
 _PATTERN_KEYWORDS = ["花幔", "卢浮梦境", "安妮森林", "暗夜缪斯", "萃园", 
 "玫瑰骑士", "花园秘境", "复古大花", "中古大花","凯特玫瑰","中古花园",
@@ -89,7 +95,8 @@ _PATTERN_KEYWORDS = ["花幔", "卢浮梦境", "安妮森林", "暗夜缪斯", "
 "莫比之窗","梦里兰香","莫奈花园","素华牡丹","佩斯","夏洛赫本","星辰漫步",
 "馨香","虚拟繁星","烟雨","夜兰图尔","夜眠花影","樱花粉兔","悠米","月夜花影",
 "绽蔓","织光造物","庄园秘境","巴洛克之星","白色大理石","柏川","摩登空间",
-"圈杏棕熊","柔漪","相伴","线条格纹","欧克","静好","蝴蝶契约","奥斯汀","无尽夏"]
+"圈杏棕熊","柔漪","相伴","线条格纹","欧克","静好","蝴蝶契约","奥斯汀","无尽夏",
+"堇色素颜","青禾手记","风华格调","巴黎左岸","塞纳时光","旧枝漫语"]
 
 
 def parse_remark(
@@ -183,7 +190,7 @@ def parse_remark(
         # 去掉数量标记（如-1张），但保留其他内容
         after_cm = re.sub(r"-\d+[张个件套米]", "", after_cm).strip()
         # 去掉数量汇总信息（如"共计2张"、"共三张"）
-        after_cm = re.sub(r"共(?:计)?\d+[张个件套米]", "", after_cm).strip()
+        after_cm = _RE_QTY_SUMMARY.sub("", after_cm).strip()
         remark_after_size = after_cm.strip().strip(";，,、")
 
     # 提取花型名称：从分号前的文本中提取（去掉材质和定制前缀后）
@@ -301,13 +308,15 @@ def extract_multiple_remarks(
         # 使用从分割段中提取的数量
         parsed.num = qty
         
-        if parsed.success or (parsed.material_code and parsed.picture_code):
-            # 如果有共享尾部备注，追加到picture_code
+        has_real_size = False
+        if parsed.picture_code and ";" in parsed.picture_code:
+            _, size_part = parsed.picture_code.split(";", 1)
+            has_real_size = _RE_SIZE.search(size_part) or _RE_ROUND_SIZE.search(size_part)
+        
+        if parsed.success or (parsed.material_code and parsed.picture_code and has_real_size):
             if trailing_remark:
-                # 过滤掉数量汇总信息（如"共计2张"）
-                clean_remark = re.sub(r"共计\d+[张个件套米]", "", trailing_remark).strip().strip("-;,、")
+                clean_remark = _RE_QTY_SUMMARY.sub("", trailing_remark).strip().strip("-;,、，")
                 if clean_remark:
-                    # 将尾部备注追加到picture_code中的尺寸部分
                     if ";" in parsed.picture_code:
                         pattern_part, size_part = parsed.picture_code.split(";", 1)
                         parsed.picture_code = f"{pattern_part};{size_part}{clean_remark}"
@@ -375,7 +384,7 @@ def _remove_sizes_and_qty(text: str, sizes: list[tuple[str, str]]) -> str:
     result = _RE_QTY.sub("", result)
 
     # 移除"共计"、"一张"等残留
-    result = re.sub(r"共计\d+张?", "", result)
+    result = _RE_QTY_SUMMARY.sub("", result)
     result = re.sub(r"\d+张?", "", result)
     result = re.sub(r"一张", "", result)
 
@@ -405,7 +414,7 @@ def _extract_common_pattern(text: str, material_code: str, material_map: dict) -
     body = _RE_SIZE.sub("", body)
     body = _RE_ROUND_SIZE.sub("", body)
     body = _RE_QTY.sub("", body)
-    body = re.sub(r"共计\d+张", "", body)
+    body = _RE_QTY_SUMMARY.sub("", body)
     body = re.sub(r"\d+张", "", body)
     body = re.sub(r"一张", "", body)
 
@@ -462,6 +471,7 @@ def _parse_multi_size_direct(
     if cm_match:
         after_cm = cm_match.group(1)
         after_cm = re.sub(r"-\d+[张个件套米]", "", after_cm).strip()
+        after_cm = _RE_QTY_SUMMARY.sub("", after_cm).strip()
         remark_after_size = after_cm.strip().strip(";，,、")
 
     # 尝试提取材质
@@ -536,9 +546,6 @@ def _parse_simple(body: str, result: ParsedRemark, is_custom: bool,
         result.model_code = "标准"
         pic_base = result.picture_code or "标准"
         result.picture_code = f"{pic_base};标准"
-
-    if result.material_code:
-        result.success = True
 
     return result
 
@@ -884,8 +891,8 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
                     after_comma = after_comma[:gift_pos].strip().strip("-;,、")
                 
                 if after_comma and not _RE_SIZE.search(after_comma) and not _RE_ROUND_SIZE.search(after_comma):
-                    # 过滤掉"共计N张"这种数量汇总信息
-                    after_comma = re.sub(r"共计\d+[张个件套米]", "", after_comma).strip().strip("-;,、")
+                    # 过滤掉"共计N张"、"共三张"这种数量汇总信息
+                    after_comma = _RE_QTY_SUMMARY.sub("", after_comma).strip().strip("-;,、，")
                     if after_comma:
                         if trailing_remark:
                             trailing_remark = f"{trailing_remark}，{after_comma}"
@@ -1129,7 +1136,9 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
                     after_comma = after_comma[:gift_pos].strip().strip("-;,、")
                 
                 if not _RE_SIZE.search(after_comma) and not _RE_ROUND_SIZE.search(after_comma) and after_comma:
-                    trailing_remark = after_comma
+                    after_comma = _RE_QTY_SUMMARY.sub("", after_comma).strip().strip("-;,、，")
+                    if after_comma:
+                        trailing_remark = after_comma
     
     return segments, trailing_remark
 
@@ -1146,7 +1155,7 @@ def _clean_segment(segment: str) -> str:
     segment = re.sub(r"\d+[张个件套米]", "", segment).strip()
     
     # 去掉数量汇总信息（如"共计2张"、"共三张"）
-    segment = re.sub(r"共(?:计)?\d+[张个件套米]", "", segment).strip()
+    segment = _RE_QTY_SUMMARY.sub("", segment).strip()
     
     # 清理结尾符号
     segment = segment.strip().strip("-;,、")
