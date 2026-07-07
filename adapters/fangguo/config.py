@@ -25,8 +25,8 @@ API_MATERIAL_LIST = f"{BASE_URL}/fgapp/order/shop/trade/order/materialColorsNew"
 # ========== 查询配置 ==========
 QUERY_STATUS = 1       # 1=待整理
 PAGE_SIZE = 500
-TIME_BEGIN = "2026-07-01 00:00:00"
-TIME_END   = "2026-07-06 23:59:59"
+TIME_BEGIN = "2026-07-03 00:00:00"
+TIME_END   = "2026-07-07 23:59:59"
 
 # ========== 材质同义词映射 ==========
 MATERIAL_MAP = {

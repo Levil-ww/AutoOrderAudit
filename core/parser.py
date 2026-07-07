@@ -82,7 +82,14 @@ _RE_ROUND_SIZE = re.compile(
 _RE_QTY = re.compile(r"[-*×](\d+)\s*(?:张|个|件|套|米)(?!\s*x|X|×|\*)")
 
 # 花型关键词
-_PATTERN_KEYWORDS = ["花幔", "印花", "烫画", "刺绣", "烫金", "激光", "压花", "裁剪有图", "裁剪无图"]
+_PATTERN_KEYWORDS = ["花幔", "卢浮梦境", "安妮森林", "暗夜缪斯", "萃园", 
+"玫瑰骑士", "花园秘境", "复古大花", "中古大花","凯特玫瑰","中古花园",
+"中古雨林","复古花丛","森夜私语","莫兰迪","戴安娜","花满金陵","花漾之约",
+"花野","简织","克罗印花","路易花坊","流年","曼珠莎华","洛特蔷薇","蔓生花",
+"莫比之窗","梦里兰香","莫奈花园","素华牡丹","佩斯","夏洛赫本","星辰漫步",
+"馨香","虚拟繁星","烟雨","夜兰图尔","夜眠花影","樱花粉兔","悠米","月夜花影",
+"绽蔓","织光造物","庄园秘境","巴洛克之星","白色大理石","柏川","摩登空间",
+"圈杏棕熊","柔漪","相伴","线条格纹","欧克","静好","蝴蝶契约","奥斯汀","无尽夏"]
 
 
 def parse_remark(
@@ -922,7 +929,7 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
             # 只有一个尺寸，整个文本作为一个段
             cleaned = _clean_segment(text)
             if cleaned:
-                qty_match = re.search(r"-\d+[张个件套米]", text)
+                qty_match = re.search(r"-(\d+)[张个件套米]", text)
                 qty = int(qty_match.group(1)) if qty_match else 1
                 segments.append((cleaned, qty))
             return segments, trailing_remark
@@ -1018,7 +1025,9 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
                 segment = _clean_segment(segment)
                 
                 if segment:
-                    segments.append((segment, 1))
+                    original_segment = text[segment_start:next_size_start].strip()
+                    qty = _extract_qty(original_segment)
+                    segments.append((segment, qty))
         else:
             # 花型名相同或没有花型名，是同花型的不同尺寸
             # 为每个尺寸创建独立段，但保留完整的花型信息
@@ -1085,7 +1094,9 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
                 segment = _clean_segment(segment)
                 
                 if segment:
-                    segments.append((segment, 1))
+                    size_desc_with_qty = text[size_start:next_size_start].strip()
+                    qty = _extract_qty(size_desc_with_qty)
+                    segments.append((segment, qty))
         
         # 提取共享尾部备注（原有逻辑）
         if segments:
