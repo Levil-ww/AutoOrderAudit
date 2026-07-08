@@ -26,6 +26,8 @@ class ParsedRemark:
             raw_text: str = "",
             success: bool = False,
             material_source: str = "",
+            gift_name: str = "",
+            gift_num: int = 0,
     ):
         self.material_code = material_code
         self.color_code = color_code
@@ -35,6 +37,8 @@ class ParsedRemark:
         self.raw_text = raw_text
         self.success = success
         self.material_source = material_source
+        self.gift_name = gift_name
+        self.gift_num = gift_num
 
     @property
     def shop_mapping_sku(self) -> str:
@@ -48,7 +52,8 @@ class ParsedRemark:
             f"material='{self.material_code}'[{self.material_source}], "
             f"color='{self.color_code}', model='{self.model_code}', "
             f"picture='{self.picture_code}', num={self.num}, "
-            f"sku='{self.shop_mapping_sku}', raw='{self.raw_text}')"
+            f"sku='{self.shop_mapping_sku}', raw='{self.raw_text}', "
+            f"gift='{self.gift_name}'x{self.gift_num})"
         )
 
     def to_dict(self) -> dict:
@@ -62,6 +67,8 @@ class ParsedRemark:
             "raw_text": self.raw_text,
             "success": self.success,
             "material_source": self.material_source,
+            "gift_name": self.gift_name,
+            "gift_num": self.gift_num,
         }
 
 
@@ -97,6 +104,9 @@ _PATTERN_KEYWORDS = ["花幔", "卢浮梦境", "安妮森林", "暗夜缪斯", "
 "绽蔓","织光造物","庄园秘境","巴洛克之星","白色大理石","柏川","摩登空间",
 "圈杏棕熊","柔漪","相伴","线条格纹","欧克","静好","蝴蝶契约","奥斯汀","无尽夏",
 "堇色素颜","青禾手记","风华格调","巴黎左岸","塞纳时光","旧枝漫语"]
+
+# 赠品关键词
+_GIFT_KEYWORDS = ["送", "赠品", "附赠", "加送"]
 
 
 def parse_remark(
@@ -232,6 +242,10 @@ def parse_remark(
     if result.material_code and actual_size:
         result.success = True
 
+    gift_name, gift_num = _extract_gift(text)
+    result.gift_name = gift_name
+    result.gift_num = gift_num
+
     return result
 
 
@@ -324,6 +338,13 @@ def extract_multiple_remarks(
                         parsed.picture_code = f"{parsed.picture_code};{clean_remark}"
             
             results.append(parsed)
+
+    if results:
+        gift_name, gift_num = _extract_gift(remark_text)
+        for r in results:
+            if not r.gift_name:
+                r.gift_name = gift_name
+                r.gift_num = gift_num
 
     return results
 
@@ -625,9 +646,72 @@ def _map_material(raw: str, material_map: dict) -> str:
 def _extract_qty(text: str) -> int:
     matches = _RE_QTY.findall(text)
     if matches:
-        # 取所有数量中的最大值
         return max(int(m) for m in matches)
     return 1
+
+
+def _extract_gift(text: str) -> tuple[str, int]:
+    """
+    从文本中提取赠品信息，返回 (gift_name, gift_num)
+    
+    支持的格式：
+    - "送防滑垫一张" → ("防滑垫", 1)
+    - "送沥水垫25cm-1张" → ("沥水垫25cm", 1)
+    - "送防滑垫一张，送抹布一块" → ("防滑垫", 1) 只提取第一个赠品
+    - "赠品：防滑垫" → ("防滑垫", 1)
+    - "附赠收纳袋" → ("收纳袋", 1)
+    """
+    gift_name = ""
+    gift_num = 0
+    
+    gift_start_pos = -1
+    for kw in _GIFT_KEYWORDS:
+        pos = text.find(kw)
+        if pos != -1 and (gift_start_pos == -1 or pos < gift_start_pos):
+            gift_start_pos = pos
+    
+    if gift_start_pos == -1:
+        return gift_name, gift_num
+    
+    gift_start_pos += len(text[gift_start_pos])
+    
+    gift_text = text[gift_start_pos:].strip().strip("-;,、，")
+    
+    comma_pos = gift_text.find("，")
+    if comma_pos == -1:
+        comma_pos = gift_text.find(",")
+    if comma_pos == -1:
+        comma_pos = gift_text.find("；")
+    if comma_pos == -1:
+        comma_pos = gift_text.find(";")
+    
+    if comma_pos != -1:
+        gift_text = gift_text[:comma_pos].strip()
+    
+    qty_match = re.search(r"-(\d+)[张个件套米]", gift_text)
+    if qty_match:
+        gift_num = int(qty_match.group(1))
+        gift_text = re.sub(r"-\d+[张个件套米]", "", gift_text).strip()
+    else:
+        qty_match2 = re.search(r"(\d+)[张个件套米]", gift_text)
+        if qty_match2:
+            gift_num = int(qty_match2.group(1))
+            gift_text = re.sub(r"\d+[张个件套米]", "", gift_text).strip()
+        else:
+            gift_num = 1
+    
+    gift_text = gift_text.strip().strip("-;,、，")
+    
+    size_match = _RE_SIZE.search(gift_text)
+    if size_match:
+        gift_name = gift_text.strip()
+    else:
+        gift_name = gift_text.strip()
+    
+    if gift_name:
+        gift_name = gift_name[:30]
+    
+    return gift_name, gift_num
 
 
 def _extract_pattern(text: str, material_map: dict = None) -> str:

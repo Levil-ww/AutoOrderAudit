@@ -1,18 +1,21 @@
 """
-方果ERP适配器 - 配置
-=====================
-使用前请修改：
-  1. authorization: 从浏览器F12抓取的Bearer Token
-  2. tenant_id: 租户ID
-  3. cookie_str: JSESSIONID
+方果ERP适配器 - 配置（增强版）
+=============================
+相较于原 config.py 的改进：
+  1. Token 从外置 token.json 读取，客服无需改代码
+  2. 时间范围自动计算为「最近7天」
+  3. 技术人员只需更新 token.json 即可
 """
 
+from datetime import datetime, timedelta
 
-# 鉴权账号的Token是不定时更新的，需要每天重置
-# ========== 账号鉴权 ==========
-AUTHORIZATION = "Bearer e3528ed7ea544b1f811a5e227b4d864d"
-COOKIE_STR = "JSESSIONID=B24BFB2F112398FACD5C8EC60E497187"
-TENANT_ID = "5068663"
+from auth_manager import get_authorization, get_cookie_str, get_tenant_id
+
+
+# ========== 账号鉴权（自动从 token.json 读取） ==========
+AUTHORIZATION = get_authorization()
+COOKIE_STR = get_cookie_str()
+TENANT_ID = get_tenant_id()
 
 # ========== 接口地址 ==========
 BASE_URL = "https://fangguo.com"
@@ -21,12 +24,16 @@ API_SAVE_PRODUCT = f"{BASE_URL}/fgapp/order/shop/trade/order/saveProduct"
 API_ORDER_DETAIL = f"{BASE_URL}/fgapp/order/shop/trade/getDetailsByPage"
 API_MATERIAL_LIST = f"{BASE_URL}/fgapp/order/shop/trade/order/materialColorsNew"
 
-# 查询配置也需要更新，不然拉取到的订单信息不会改变
 # ========== 查询配置 ==========
 QUERY_STATUS = 1       # 1=待整理
 PAGE_SIZE = 500
-TIME_BEGIN = "2026-07-03 00:00:00"
-TIME_END   = "2026-07-07 23:59:59"
+
+# ========== ✨ 7天滚动时间范围 ==========
+# 自动计算：往前推6天 ~ 今天
+# 客服无需手动改任何日期
+_SEVEN_DAYS_AGO = datetime.now() - timedelta(days=6)
+TIME_BEGIN = _SEVEN_DAYS_AGO.strftime("%Y-%m-%d 00:00:00")
+TIME_END   = datetime.now().strftime("%Y-%m-%d 23:59:59")
 
 # ========== 材质同义词映射 ==========
 MATERIAL_MAP = {
@@ -50,9 +57,13 @@ MATERIAL_MAP = {
     "浴室吸水植绒": "浴室吸水植绒",
     "珍珠纱": "珍珠纱",
     "珍珠纱小地垫": "珍珠纱小地垫",
-
 }
 
 # ========== 运行模式 ==========
-DRY_RUN = True       # True=仅打印不提交
+DRY_RUN = True       # True=仅打印不提交（初次使用建议True测试）
 MAX_ORDERS = 0       # 0=不限制
+
+
+def get_time_range_display() -> str:
+    """返回当前时间范围的人类可读文本，供GUI显示"""
+    return f"{TIME_BEGIN[:10]} ~ {TIME_END[:10]} (最近7天)"

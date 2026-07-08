@@ -13,6 +13,7 @@ from .parser import parse_remark, extract_multiple_remarks
 _SKIP_KEYWORDS = [
     "待定",
     "待确定",
+    # "待确认",
     "等通知发",
     "需要效果图",
     "效果图",
@@ -21,6 +22,10 @@ _SKIP_KEYWORDS = [
     "号安排发货",
     "号在安排发货",
     "已代益",
+    "已代森",
+    "仓库发",
+    "工厂发",
+    "补发"
 ]
 
 
@@ -71,7 +76,6 @@ class AutoAuditEngine:
                 break
 
             self.stats["total"] += 1
-            print(f"\n{'─' * 50}")
             print(f"[{idx+1}/{len(orders)}] 处理订单 {order.id or order.trade_id}")
 
             try:
@@ -114,9 +118,17 @@ class AutoAuditEngine:
             self.stats["skipped"] += 1
             return
 
-        print(f"  ✅ 解析结果: {parsed_list[0]}")
+        parsed = parsed_list[0]
+        summary = (
+            f"  ✅ 材质: {parsed.material_code}  "
+            f"|  颜色: {parsed.color_code}  "
+            f"|  尺寸: {parsed.model_code}  "
+            f"|  花型: {parsed.picture_code}"
+        )
+        print(summary)
 
         if self.dry_run:
+            print()
             for parsed in parsed_list:
                 print(f"  🔶 DRY RUN: 新编码 = {parsed.shop_mapping_sku}")
             self.stats["success"] += 1
