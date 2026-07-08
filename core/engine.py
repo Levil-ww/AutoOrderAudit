@@ -11,7 +11,7 @@ from .parser import parse_remark, extract_multiple_remarks
 
 
 _SKIP_KEYWORDS = [
-    "待定",
+    # "待定",
     "待确定",
     # "待确认",
     "等通知发",
@@ -19,8 +19,8 @@ _SKIP_KEYWORDS = [
     "效果图",
     "确认再生产",
     "号发货",
-    "号安排发货",
-    "号在安排发货",
+    "安排发货",
+    "在安排发货",
     "已代益",
     "已代森",
     "仓库发",
@@ -126,11 +126,24 @@ class AutoAuditEngine:
             f"|  花型: {parsed.picture_code}"
         )
         print(summary)
+        
+        # 检查赠品信息
+        gift_name = ""
+        gift_num = 0
+        for p in parsed_list:
+            if p.gift_name:
+                gift_name = p.gift_name
+                gift_num = p.gift_num
+                break
+        if gift_name:
+            print(f"  🎁 赠品: {gift_name} x {gift_num}")
 
         if self.dry_run:
             print()
             for parsed in parsed_list:
                 print(f"  🔶 DRY RUN: 新编码 = {parsed.shop_mapping_sku}")
+            if gift_name:
+                print(f"  🔶 DRY RUN: 将添加赠品商品行 = {gift_name} x {gift_num}")
             self.stats["success"] += 1
             return
 

@@ -347,24 +347,64 @@ class FangguoAdapter(ErpAdapter):
         """
         调用 saveProduct 接口更新商家编码
         支持多尺寸：如果备注中有多个尺寸，会拆分成多个商品行
+        支持赠品：检测已有赠品行并更新数量，或创建新的赠品行
         """
         if parsed_list and len(parsed_list) > 1:
             effective_list = parsed_list
         else:
             effective_list = self._split_parsed_by_sizes(order, parsed)
 
-        # 构建 orderItems
+        # 构建 orderItems，保留未被替换的现有商品行
         order_items = []
-        for p in effective_list:
-            if order.items:
-                # 使用第一个商品行作为模板，为每个解析结果创建一个商品行（1:1映射）
-                template_item = order.items[0]
-                new_item = self._build_order_item(template_item, order, p)
-                order_items.append(new_item)
+        template_item = order.items[0] if order.items else None
+        
+        # 标记哪些原始商品行已被使用（用于替换）
+        used_item_indices = set()
+        
+        for idx, p in enumerate(effective_list):
+            if template_item:
+                if idx < len(order.items) and not self._is_gift_item(order.items[idx]):
+                    new_item = self._build_order_item(order.items[idx], order, p)
+                    used_item_indices.add(idx)
+                else:
+                    new_item = self._build_order_item(template_item, order, p)
             else:
-                # 如果没有商品行，创建一个默认的商品行
                 new_item = self._build_default_item(order, p)
-                order_items.append(new_item)
+            order_items.append(new_item)
+        
+        # 检查是否有赠品，处理赠品行（更新已有或创建新的）
+        gift_name = ""
+        gift_num = 0
+        material_code = ""
+        for p in effective_list:
+            if p.gift_name:
+                gift_name = p.gift_name
+                gift_num = p.gift_num
+            if p.material_code:
+                material_code = p.material_code
+        
+        if gift_name and gift_num > 0 and material_code:
+            gift_idx = self._handle_gift_item(order_items, order, material_code, gift_name, gift_num, template_item, used_item_indices)
+            if gift_idx is not None:
+                used_item_indices.add(gift_idx)
+        
+        # 保留未被使用的现有商品行
+        for idx, item in enumerate(order.items):
+            if idx not in used_item_indices:
+                if item.raw:
+                    cloned = item.raw.copy()
+                    cloned["shopRemark"] = order.shop_remark or ""
+                    cloned["buyerRemark"] = order.buyer_remark or ""
+                    order_items.append(cloned)
+                else:
+                    new_item = self._build_order_item(item, order, ParsedRemark(
+                        material_code=item.shop_mapping_sku.split("-")[0] if "-" in item.shop_mapping_sku else "",
+                        color_code="标准",
+                        model_code=item.shop_mapping_sku.split("-")[2] if "-" in item.shop_mapping_sku and len(item.shop_mapping_sku.split("-")) > 2 else "",
+                        picture_code=item.shop_mapping_sku.split("-")[-1] if "-" in item.shop_mapping_sku else "",
+                        num=item.num,
+                    ))
+                    order_items.append(new_item)
 
         payload = {
             "orderType": 0,
@@ -542,6 +582,224 @@ class FangguoAdapter(ErpAdapter):
                       oid=order.tid, num=1),
             order, parsed,
         )
+
+    def _build_gift_item(self, item: OrderItem, order: Order, material_code: str, gift_name: str, gift_num: int) -> dict:
+        """
+        构建赠品商品行
+        
+        赠品编码格式：材质-标准-赠品名称-赠品名称
+        例如：吸水皮革-标准-赠品沥水垫小圆或小方-赠品沥水垫小圆或小方
+        
+        参数：
+            item: 模板商品行
+            order: 订单对象
+            material_code: 材质编码（如"吸水皮革"）
+            gift_name: 赠品名称（不含"赠品"前缀）
+            gift_num: 赠品数量
+        """
+        if gift_name.startswith("赠品"):
+            gift_code = gift_name
+        else:
+            gift_code = f"赠品{gift_name}"
+        
+        return {
+            "materialId": None,
+            "materialCode": material_code,
+            "materialCodeName": None,
+            "technology": None,
+            "printWayId": None,
+            "multiImageUrlExists": None,
+            "multiHolePic": None,
+            "multiImageExists": None,
+            "modelId": None,
+            "modelCode": gift_code,
+            "modelCodeName": None,
+            "brand": None,
+            "customSize": False,
+            "isCompactModel": None,
+            "compactFactoryModelCode": None,
+            "compactFactoryModelName": None,
+            "compactFactoryModelId": None,
+            "colorId": None,
+            "colorCode": "标准",
+            "colorCodeName": None,
+            "customPicture": False,
+            "pictureId": None,
+            "pictureType": None,
+            "pictureCode": gift_code,
+            "picTypeId": None,
+            "pictureCodePath": None,
+            "pictureEffectPicPath": None,
+            "familyNamePic": None,
+            "folderId": None,
+            "mustUrlPictureCheckSuccess": False,
+            "designerPicCheck": None,
+            "sizeMap": None,
+            "designPicList": None,
+            "effectPicList": None,
+            "factorySkuId": None,
+            "putSale": None,
+            "stockOut": None,
+            "combinationGoods": False,
+            "factorySkuShopIdS": None,
+            "holeSitePic": None,
+            "picTechnology": None,
+            "map4decodeGift": None,
+            "map4FactoryDecodeGift": None,
+            "multiplePicList": None,
+            "giftBOList": [],
+            "giftList": None,
+            "giftMaterialList": None,
+            "giftCodeName": None,
+            "filmGiftCodeId": None,
+            "filmGiftCode": "",
+            "filmGiftNum": 0,
+            "filmGiftPicCode": None,
+            "decorationGiftCodeId": None,
+            "decorationGiftCode": "",
+            "decorationGiftNum": 0,
+            "decorationGiftPicCode": None,
+            "giftsWithOrder": [],
+            "picChange": 0,
+            "orderId": item.order_id,
+            "originalSkuId": "",
+            "originalGoodsId": "",
+            "id": "",
+            "sysOid": "",
+            "oid": item.oid,
+            "title": f"赠品{gift_name}",
+            "merchandisePicPath": "",
+            "workUrl": None,
+            "effectUrl": None,
+            "productionPicPath": None,
+            "num": gift_num,
+            "price": 0,
+            "skuPropertiesName": "",
+            "outerIid": "",
+            "shopMappingSku": f"{material_code}-标准-{gift_code}-{gift_code}",
+            "diyList": [{
+                "bg": "", "mask": "", "picName": "",
+                "isPicMove": 1, "sort": 1,
+                "effectUrl": "", "workUrl": "",
+                "mobileIdentityNo": None, "picSourceType": 0,
+                "layerList": [], "mobileLayerList": None, "lastImgUrl": None,
+            }],
+            "productType": 0,
+            "productSn": None,
+            "boxGiftCode": None,
+            "shopRemark": order.shop_remark or "",
+            "buyerRemark": order.buyer_remark or "",
+            "tid": order.tid,
+            "originTradeId": order.trade_id,
+            "oldSysTid": None,
+            "magnifyingSelectPic": False,
+            "copySortFlag": 1,
+            "logisticsOrderNum": None,
+            "logisticsCompanyCode": "ZTO",
+            "picType": 0,
+            "oldPicWatermarkFlag": 0,
+            "maxSendNum": None,
+            "isCombinationGoods": False,
+            "deriveSysOid": None,
+            "inventoryNum": None,
+            "picCode": gift_code,
+            "lockStatusDesc": "",
+            "lockStatus": False,
+            "packageQuantity": None,
+            "refundStatusDesc": "",
+            "cancelStatus": False,
+            "realModelCode": gift_code,
+            "realModelId": None,
+            "type": 0,
+            "showRemarkInfo": True,
+            "check": True,
+            "loaded": True,
+        }
+
+    def _handle_gift_item(self, order_items: list, order: Order, material_code: str, gift_name: str, gift_num: int, template_item: OrderItem = None, used_indices: set = None) -> int:
+        """
+        处理赠品行：检测已有赠品行并更新数量，或创建新的赠品行
+        
+        参数：
+            order_items: 当前构建的商品行列表
+            order: 订单对象
+            material_code: 材质编码
+            gift_name: 赠品名称
+            gift_num: 赠品数量
+            template_item: 模板商品行（用于创建新赠品行）
+            used_indices: 已使用的原始商品行索引集合
+        
+        返回：被使用的原始商品行索引（如果找到了并更新了），否则返回None
+        """
+        if gift_name.startswith("赠品"):
+            gift_code = gift_name
+        else:
+            gift_code = f"赠品{gift_name}"
+        
+        target_sku = f"{material_code}-标准-{gift_code}-{gift_code}"
+        
+        for item in order_items:
+            existing_sku = item.get("shopMappingSku", "")
+            if self._is_gift_match(existing_sku, target_sku, gift_name):
+                item["num"] = gift_num
+                return None
+        
+        if order.items:
+            for idx, existing_item in enumerate(order.items):
+                if used_indices and idx in used_indices:
+                    continue
+                if self._is_gift_match(existing_item.shop_mapping_sku, target_sku, gift_name):
+                    if existing_item.raw:
+                        cloned = existing_item.raw.copy()
+                        cloned["num"] = gift_num
+                        cloned["shopMappingSku"] = target_sku
+                        cloned["materialCode"] = material_code
+                        cloned["modelCode"] = gift_code
+                        cloned["pictureCode"] = gift_code
+                        cloned["picCode"] = gift_code
+                        cloned["realModelCode"] = gift_code
+                        cloned["colorCode"] = "标准"
+                        cloned["title"] = f"赠品{gift_name}"
+                        cloned["price"] = 0
+                        cloned["shopRemark"] = order.shop_remark or ""
+                        cloned["buyerRemark"] = order.buyer_remark or ""
+                        order_items.append(cloned)
+                    else:
+                        new_item = self._build_order_item(existing_item, order, ParsedRemark(
+                            material_code=material_code,
+                            color_code="标准",
+                            model_code=gift_code,
+                            picture_code=gift_code,
+                            num=gift_num,
+                            gift_name=gift_name,
+                            gift_num=gift_num,
+                        ))
+                        new_item["title"] = f"赠品{gift_name}"
+                        new_item["price"] = 0
+                        order_items.append(new_item)
+                    return idx
+        
+        if template_item:
+            gift_item = self._build_gift_item(template_item, order, material_code, gift_name, gift_num)
+            order_items.append(gift_item)
+        
+        return None
+    
+    def _is_gift_item(self, item: OrderItem) -> bool:
+        """检测商品行是否为赠品"""
+        if item.shop_mapping_sku and "赠品" in item.shop_mapping_sku:
+            return True
+        if item.title and "赠品" in item.title:
+            return True
+        return False
+    
+    def _is_gift_match(self, existing_sku: str, target_sku: str, gift_name: str) -> bool:
+        """模糊匹配赠品SKU"""
+        if existing_sku == target_sku:
+            return True
+        if existing_sku and "赠品" in existing_sku and gift_name in existing_sku:
+            return True
+        return False
 
     # -------------------------------------------------------------------
     # 3. 材质列表（可选，增强解析器）

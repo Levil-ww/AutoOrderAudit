@@ -201,6 +201,14 @@ def parse_remark(
         after_cm = re.sub(r"-\d+[张个件套米]", "", after_cm).strip()
         # 去掉数量汇总信息（如"共计2张"、"共三张"）
         after_cm = _RE_QTY_SUMMARY.sub("", after_cm).strip()
+        
+        # 去掉赠品信息
+        for kw in _GIFT_KEYWORDS:
+            pos = after_cm.find(kw)
+            if pos != -1:
+                after_cm = after_cm[:pos].strip()
+                break
+        
         remark_after_size = after_cm.strip().strip(";，,、")
 
     # 提取花型名称：从分号前的文本中提取（去掉材质和定制前缀后）
@@ -660,22 +668,63 @@ def _extract_gift(text: str) -> tuple[str, int]:
     - "送防滑垫一张，送抹布一块" → ("防滑垫", 1) 只提取第一个赠品
     - "赠品：防滑垫" → ("防滑垫", 1)
     - "附赠收纳袋" → ("收纳袋", 1)
+    - "小垫子总共送2个" → ("小垫子", 2)
+    - "总共送2个小垫子" → ("小垫子", 2)
     """
     gift_name = ""
     gift_num = 0
     
     gift_start_pos = -1
+    matched_keyword = ""
     for kw in _GIFT_KEYWORDS:
         pos = text.find(kw)
         if pos != -1 and (gift_start_pos == -1 or pos < gift_start_pos):
             gift_start_pos = pos
+            matched_keyword = kw
     
     if gift_start_pos == -1:
         return gift_name, gift_num
     
-    gift_start_pos += len(text[gift_start_pos])
+    if matched_keyword == "送":
+        prev_char = text[gift_start_pos - 1] if gift_start_pos > 0 else ""
+        if prev_char in "发送达放":
+            return gift_name, gift_num
+        
+        next_pos = gift_start_pos + 1
+        if next_pos < len(text):
+            next_char = text[next_pos]
+            if next_char in "达发":
+                return gift_name, gift_num
     
-    gift_text = text[gift_start_pos:].strip().strip("-;,、，")
+    keyword_len = len(matched_keyword)
+    after_keyword = text[gift_start_pos + keyword_len:].strip()
+    
+    qty_match = re.search(r"^(\d+)[张个件套米]", after_keyword)
+    if qty_match and matched_keyword == "送":
+        gift_num = int(qty_match.group(1))
+        
+        before_gift = text[:gift_start_pos].strip()
+        
+        last_separator = -1
+        for sep in ["，", ",", ";", "；", " "]:
+            pos = before_gift.rfind(sep)
+            if pos > last_separator:
+                last_separator = pos
+        
+        if last_separator != -1:
+            gift_name_candidate = before_gift[last_separator + 1:].strip()
+            if gift_name_candidate and not _RE_SIZE.search(gift_name_candidate) and not _RE_ROUND_SIZE.search(gift_name_candidate):
+                gift_name_candidate = re.sub(r"\d+[张个件套米]", "", gift_name_candidate).strip()
+                gift_name_candidate = re.sub(r"[一二两三四五六七八九十]+[张个件套米]", "", gift_name_candidate).strip()
+                gift_name_candidate = gift_name_candidate.replace("总共", "").strip()
+                gift_name_candidate = gift_name_candidate.strip("-;,、，")
+                if gift_name_candidate:
+                    gift_name = gift_name_candidate[:30]
+                    return gift_name, gift_num
+        
+        return gift_name, gift_num
+    
+    gift_text = after_keyword.strip("-;,、，：")
     
     comma_pos = gift_text.find("，")
     if comma_pos == -1:
@@ -702,6 +751,9 @@ def _extract_gift(text: str) -> tuple[str, int]:
     
     gift_text = gift_text.strip().strip("-;,、，")
     
+    gift_text = re.sub(r"[一二两三四五六七八九十]+[张个件套米]", "", gift_text).strip()
+    gift_text = gift_text.strip().strip("-;,、，")
+    
     size_match = _RE_SIZE.search(gift_text)
     if size_match:
         gift_name = gift_text.strip()
@@ -710,6 +762,8 @@ def _extract_gift(text: str) -> tuple[str, int]:
     
     if gift_name:
         gift_name = gift_name[:30]
+        if gift_name.startswith("赠品"):
+            gift_name = gift_name[2:].strip()
     
     return gift_name, gift_num
 
@@ -948,9 +1002,18 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
         
         segments = valid_segments
         
-        # 将潜在的尾部备注合并
+        # 将潜在的尾部备注合并，过滤掉赠品信息
         if potential_trailing:
-            trailing_remark = "，".join(potential_trailing).strip().strip("-;,、")
+            filtered_trailing = []
+            for seg in potential_trailing:
+                has_gift = False
+                for kw in _GIFT_KEYWORDS:
+                    if kw in seg:
+                        has_gift = True
+                        break
+                if not has_gift:
+                    filtered_trailing.append(seg)
+            trailing_remark = "，".join(filtered_trailing).strip().strip("-;,、")
         
         # 如果没有找到尾部备注，尝试从最后一个尺寸之后提取
         if not trailing_remark and segments:
@@ -970,9 +1033,22 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
                 after_comma = text[comma_pos + 1:].strip().strip("-;,、")
                 after_comma = re.sub(r"-\d+[张个件套米]", "", after_comma).strip().strip("-;,")
                 
-                if "送" in after_comma:
-                    gift_pos = after_comma.find("送")
+                gift_pos = -1
+                for kw in _GIFT_KEYWORDS:
+                    pos = after_comma.find(kw)
+                    if pos != -1 and (gift_pos == -1 or pos < gift_pos):
+                        gift_pos = pos
+                
+                if gift_pos != -1:
+                    matched_kw = ""
+                    for kw in _GIFT_KEYWORDS:
+                        pos = after_comma.find(kw)
+                        if pos == gift_pos:
+                            matched_kw = kw
+                            break
                     after_comma = after_comma[:gift_pos].strip().strip("-;,、")
+                    if after_comma and matched_kw and after_comma.endswith(matched_kw[:-1]):
+                        after_comma = after_comma[:-len(matched_kw[:-1])].strip().strip("-;,、")
                 
                 if after_comma and not _RE_SIZE.search(after_comma) and not _RE_ROUND_SIZE.search(after_comma):
                     # 过滤掉"共计N张"、"共三张"这种数量汇总信息
@@ -1215,8 +1291,13 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
                 after_comma = text[comma_pos + 1:].strip().strip("-;,、")
                 after_comma = re.sub(r"-\d+[张个件套米]", "", after_comma).strip().strip("-;,")
                 
-                if "送" in after_comma:
-                    gift_pos = after_comma.find("送")
+                gift_pos = -1
+                for kw in _GIFT_KEYWORDS:
+                    pos = after_comma.find(kw)
+                    if pos != -1 and (gift_pos == -1 or pos < gift_pos):
+                        gift_pos = pos
+                
+                if gift_pos != -1:
                     after_comma = after_comma[:gift_pos].strip().strip("-;,、")
                 
                 if not _RE_SIZE.search(after_comma) and not _RE_ROUND_SIZE.search(after_comma) and after_comma:
@@ -1229,8 +1310,13 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
 
 def _clean_segment(segment: str) -> str:
     """清理商品段，去掉赠品和数量标记"""
-    # 去掉"送..."部分
-    gift_pos = segment.find("送")
+    # 去掉赠品关键词及其后面的内容
+    gift_pos = -1
+    for kw in _GIFT_KEYWORDS:
+        pos = segment.find(kw)
+        if pos != -1 and (gift_pos == -1 or pos < gift_pos):
+            gift_pos = pos
+    
     if gift_pos != -1:
         segment = segment[:gift_pos].strip()
     
@@ -1241,7 +1327,7 @@ def _clean_segment(segment: str) -> str:
     # 去掉数量汇总信息（如"共计2张"、"共三张"）
     segment = _RE_QTY_SUMMARY.sub("", segment).strip()
     
-    # 清理结尾符号
-    segment = segment.strip().strip("-;,、")
+    # 清理结尾符号（包括逗号）
+    segment = segment.strip().strip("-;,、，")
     
     return segment
