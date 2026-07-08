@@ -5,19 +5,27 @@
 ## 架构
 
 ```
-fangguo-auto/
+AutoOrderAudit/
 │
 ├── core/                       ← 🟢 通用核心（换ERP也不用改）
+│   ├── __init__.py                  
 │   ├── adapter_base.py         ← ERP适配器抽象接口
 │   ├── parser.py               ← 备注解析引擎（参数化，无外部依赖）
 │   └── engine.py               ← 自动审单引擎（通过接口调用适配器）
 │
 ├── adapters/                   ← 🔴 ERP适配器（换系统就换这个文件夹）
 │   └── fangguo/                ← 方果ERP适配器
-│       ├── config.py           ← 方果的API地址、鉴权信息
+│       ├── __init__.py       
+│       ├── config.py           ← 方果的API地址、鉴权信息 - (新增：7天滚动时间范围 + 动态Token)
 │       ├── material_source.py  ← 从方果拉取材质列表做自动匹配
 │       └── adapter.py          ← ErpAdapter 接口实现
 │
+├── auth_manager.py             ← 新增：Token管理（从外置JSON读）
+├── gui.py                      ← 新增：图形界面（客服使用）
+├── run_gui.py                  ← 新增：GUI启动入口
+├── token.json                  ← 新增：外置Token配置文件
+├── build.bat                   ← 新增：打包exe脚本
+│ 
 ├── main.py                     ← 入口（选择适配器 + 启动引擎）
 ├── test.py                     ← 连通性测试
 ├── requirements.txt
