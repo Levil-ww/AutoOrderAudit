@@ -100,6 +100,8 @@ class AutoAuditGUI:
         self.root.resizable(True, True)
         self.root.configure(bg=COLORS["bg"])
         self._running = False
+        # 批量确认决策缓存：None=未决定，True=全部确定，False=全部取消
+        self._batch_confirm_decision = None
 
         self._center_window()
         self._configure_tags()
@@ -171,7 +173,7 @@ class AutoAuditGUI:
         mode_fg = COLORS["warning"] if DRY_RUN else COLORS["success"]
         self._make_badge(badge_frame, mode_text, mode_bg, mode_fg).pack(side=tk.RIGHT, padx=(6, 0))
 
-        self._make_badge(badge_frame, "v1.0", COLORS["info_bg"], COLORS["info"]).pack(side=tk.RIGHT)
+        self._make_badge(badge_frame, "v1.1", COLORS["info_bg"], COLORS["info"]).pack(side=tk.RIGHT)
 
     def _make_badge(self, parent, text, bg, fg):
         return tk.Label(
@@ -364,6 +366,45 @@ class AutoAuditGUI:
         self.stat_label.config(text=text)
 
     # ------------------------------------------------------------
+    #  🔥 确认弹窗（线程安全）
+    # ------------------------------------------------------------
+    def _confirm_update(self, order, parsed_list, changes):
+        """
+        由引擎线程调用，通过 root.after() 在主线程弹窗。
+        第一次弹出时询问用户，之后自动沿用相同选择（批量操作）。
+        """
+        # 如果已经有批量决策，直接返回缓存值
+        if self._batch_confirm_decision is not None:
+            return self._batch_confirm_decision
+
+        order_id = getattr(order, 'trade_id', '') or getattr(order, 'id', '')
+        change_text = "\n".join(f"  • {c}" for c in changes)
+
+        msg = (
+            f"订单 {order_id} 备注解析成功，可生成新编码：\n"
+            f"{change_text}\n\n"
+            f"是否一键自动审单？\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"「确定」→ 自动更新所有可处理订单\n"
+            f"「取消」→ 仅日志记录，不修改"
+        )
+
+        result = [None]
+        event = threading.Event()
+
+        def _show():
+            result[0] = messagebox.askyesno("是否一键自动审单", msg)
+            event.set()
+
+        # 调度到主线程显示
+        self.root.after(0, _show)
+        event.wait()
+
+        # 缓存本次批量决策，后续订单自动沿用
+        self._batch_confirm_decision = result[0]
+        return result[0]
+
+    # ------------------------------------------------------------
     #  开始审单
     # ------------------------------------------------------------
     def _start_audit(self):
@@ -384,6 +425,7 @@ class AutoAuditGUI:
                 return
 
         self._running = True
+        self._batch_confirm_decision = None  # 重置批量确认决策
         self.start_btn.config(state=tk.DISABLED, text="⏳ 审单中...", bg="#9ca3af")
         self.progress.start()
 
@@ -398,15 +440,20 @@ class AutoAuditGUI:
         try:
             from core import AutoAuditEngine
             from adapters.fangguo import FangguoAdapter
-            from adapters.fangguo.config import  (
+            from adapters.fangguo.config import (
                 QUERY_STATUS, PAGE_SIZE, TIME_BEGIN, TIME_END,
                 DRY_RUN, MAX_ORDERS,
             )
 
             adapter = FangguoAdapter()
+
+            # 只在非 DRY_RUN 模式下才传入确认回调
+            confirm_cb = self._confirm_update if not DRY_RUN else None
+
             engine = AutoAuditEngine(
                 adapter=adapter, dry_run=DRY_RUN,
                 max_orders=MAX_ORDERS, interval=0.5,
+                confirm_callback=confirm_cb,
             )
             engine.run(
                 page_no=1, page_size=PAGE_SIZE,
@@ -422,6 +469,7 @@ class AutoAuditGUI:
 
     def _finish_audit(self):
         self._running = False
+        self._batch_confirm_decision = None  # 清理批量决策缓存
         self.start_btn.config(state=tk.NORMAL, text="▶ 开始审单", bg=COLORS["success"])
         self.progress.stop()
         print("\n" + "━" * 60)

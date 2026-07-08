@@ -5,15 +5,16 @@
 
 import time
 from datetime import datetime
+from typing import Callable, Optional
 
 from .adapter_base import ErpAdapter
 from .parser import parse_remark, extract_multiple_remarks
 
 
 _SKIP_KEYWORDS = [
-    # "待定",
+    "待定",
     "待确定",
-    # "待确认",
+    "待确认",
     "等通知发",
     "需要效果图",
     "效果图",
@@ -25,7 +26,8 @@ _SKIP_KEYWORDS = [
     "已代森",
     "仓库发",
     "工厂发",
-    "补发"
+    "补发",
+    "差价",
 ]
 
 
@@ -38,12 +40,20 @@ class AutoAuditEngine:
         dry_run: bool = False,
         max_orders: int = 0,
         interval: float = 0.5,
+        confirm_callback: Optional[Callable] = None,
     ):
+        """
+        :param confirm_callback: 确认回调，签名 (order, parsed_list, changes: list[str]) -> bool
+                                返回 True 表示确认修改，False 表示仅记录不修改。
+                                仅在非 dry_run 模式下生效。
+        """
         self.adapter = adapter
         self.dry_run = dry_run
         self.max_orders = max_orders
         self.interval = interval
-        self.stats = {"total": 0, "success": 0, "skipped": 0, "failed": 0, "errors": []}
+        self.confirm_callback = confirm_callback
+        self.stats = {"total": 0, "success": 0, "skipped": 0, "failed": 0, "errors": [],
+                      "cancelled": 0}  # cancelled 统计用户取消的数量
 
     def run(self, page_no=1, page_size=500, query_status=1, time_begin="", time_end=""):
         print("=" * 60)
@@ -51,6 +61,8 @@ class AutoAuditEngine:
         print(f"适配器: {self.adapter.get_adapter_name()}")
         if self.dry_run:
             print("🔶 DRY RUN 模式：仅模拟，不会真实提交")
+        if self.confirm_callback and not self.dry_run:
+            print("💬 确认模式：修改前会弹窗确认")
         print("=" * 60)
 
         print("\n📦 正在查询待处理订单...")
@@ -126,7 +138,7 @@ class AutoAuditEngine:
             f"|  花型: {parsed.picture_code}"
         )
         print(summary)
-        
+
         # 检查赠品信息
         gift_name = ""
         gift_num = 0
@@ -147,6 +159,21 @@ class AutoAuditEngine:
             self.stats["success"] += 1
             return
 
+        # ===== 确认弹窗：在调用 API 之前征求用户意见 =====
+        if self.confirm_callback:
+            changes = []
+            for p in parsed_list:
+                changes.append(f"新编码: {p.shop_mapping_sku}")
+            if gift_name:
+                changes.append(f"赠品: {gift_name} x {gift_num}")
+
+            should_update = self.confirm_callback(order, parsed_list, changes)
+            if not should_update:
+                print(f"  ⏭️  用户取消：新编码 {parsed_list[0].shop_mapping_sku}（未修改）")
+                self.stats["cancelled"] += 1
+                return
+
+        # ===== 执行实际的 API 修改 =====
         try:
             ok = self.adapter.update_merchant_code(order, parsed_list[0], parsed_list)
             if ok:
@@ -170,8 +197,13 @@ class AutoAuditEngine:
         print(f"  总处理:  {self.stats['total']}")
         print(f"  ✅ 成功:  {self.stats['success']}")
         print(f"  ⏭️  跳过:  {self.stats['skipped']}")
+        if self.stats.get("cancelled", 0):
+            print(f"  🔶 用户取消: {self.stats['cancelled']}")
         print(f"  ❌ 失败:  {self.stats['failed']}")
         if self.stats["errors"]:
-            print(f"  ⚠️  错误详情:")
-            for err in self.stats["errors"][:5]:
-                print(f"    - {err}")
+            print(f"\n  ⚠️  错误明细 ({len(self.stats['errors'])}):")
+            for err in self.stats["errors"][:10]:
+                print(f"    • {err}")
+            if len(self.stats["errors"]) > 10:
+                print(f"    ... 还有 {len(self.stats['errors']) - 10} 个错误")
+        print("=" * 60)

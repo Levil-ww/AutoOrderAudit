@@ -79,9 +79,9 @@ _RE_SIZE = re.compile(
     r"(\d+(?:\.\d+)?)\s*[xX×*]\s*(\d+(?:\.\d+)?)\s*(?:cm|CM|厘米)?"
 )
 
-# 圆形尺寸：圆直径80cm, 圆80cm
+# 圆形尺寸：圆直径80cm, 圆80cm, 直径80cm，
 _RE_ROUND_SIZE = re.compile(
-    r"圆(?:直径)?\s*(\d+(?:\.\d+)?)\s*(?:cm|CM|厘米)?"
+    r"(圆(?:直径)?|直径)\s*(\d+(?:\.\d+)?)\s*(?:cm|CM|厘米)?"
 )
 
 # 数量匹配：不限于末尾，匹配所有 "-1张", "*2个" 等
@@ -103,7 +103,7 @@ _PATTERN_KEYWORDS = ["花幔", "卢浮梦境", "安妮森林", "暗夜缪斯", "
 "馨香","虚拟繁星","烟雨","夜兰图尔","夜眠花影","樱花粉兔","悠米","月夜花影",
 "绽蔓","织光造物","庄园秘境","巴洛克之星","白色大理石","柏川","摩登空间",
 "圈杏棕熊","柔漪","相伴","线条格纹","欧克","静好","蝴蝶契约","奥斯汀","无尽夏",
-"堇色素颜","青禾手记","风华格调","巴黎左岸","塞纳时光","旧枝漫语"]
+"堇色素颜","青禾手记","风华格调","巴黎左岸","塞纳时光","旧枝漫语","哥特玫瑰"]
 
 # 赠品关键词
 _GIFT_KEYWORDS = ["送", "赠品", "附赠", "加送"]
@@ -176,7 +176,7 @@ def parse_remark(
             if last_semi != -1:
                 size_prefix = before_size[last_semi + 1:].strip().strip("-;,、")
     
-    actual_size = f"{first_size[0]}x{first_size[1]}CM" if first_size[1] != "圆" else f"圆直径{first_size[0]}CM"
+    actual_size = f"{first_size[0]}x{first_size[1]}CM" if first_size[1] not in ["圆", "圆直径", "直径"] else f"{first_size[1]}{first_size[0]}CM"
     # 如果有尺寸前缀，添加到实际尺寸前面
     if size_prefix:
         actual_size = f"{size_prefix}{actual_size}"
@@ -215,13 +215,18 @@ def parse_remark(
     pattern_name = ""
     if ";" in body:
         before_semicolon = body.split(";", 1)[0].strip()
-        # 去掉材质名
+        # 去掉材质名（先从静态映射表，再从启发式列表）
         for key in sorted(material_map.keys(), key=len, reverse=True):
             if key in before_semicolon:
                 pattern_name = before_semicolon.replace(key, "").strip().strip("-;,")
                 break
         else:
-            pattern_name = before_semicolon.strip().strip("-;,")
+            for mat in _HEURISTIC_MATERIALS:
+                if mat in before_semicolon:
+                    pattern_name = before_semicolon.replace(mat, "").strip().strip("-;,")
+                    break
+            else:
+                pattern_name = before_semicolon.strip().strip("-;,")
     
     # 去掉可能残留的"定制"前缀
     if pattern_name.startswith("定制"):
@@ -335,6 +340,10 @@ def extract_multiple_remarks(
             _, size_part = parsed.picture_code.split(";", 1)
             has_real_size = _RE_SIZE.search(size_part) or _RE_ROUND_SIZE.search(size_part)
         
+        # 更新success标志：如果材质和尺寸都有，视为成功
+        if parsed.material_code and has_real_size:
+            parsed.success = True
+        
         if parsed.success or (parsed.material_code and parsed.picture_code and has_real_size):
             if trailing_remark:
                 clean_remark = _RE_QTY_SUMMARY.sub("", trailing_remark).strip().strip("-;,、，")
@@ -365,9 +374,9 @@ def _extract_all_sizes(text: str) -> list[tuple[str, str]]:
     for w, h in _RE_SIZE.findall(text):
         sizes.append((w, h))
     
-    # 提取圆形尺寸（作为特殊的尺寸表示）
-    for diameter in _RE_ROUND_SIZE.findall(text):
-        sizes.append((diameter, "圆"))
+    # 提取圆形尺寸（保留原始前缀格式）
+    for prefix, diameter in _RE_ROUND_SIZE.findall(text):
+        sizes.append((diameter, prefix))
     
     return sizes
 
@@ -381,10 +390,10 @@ def _extract_all_sizes_with_position(text: str) -> list[tuple[str, str, int, int
         w, h = match.groups()
         sizes_with_pos.append((w, h, match.start(), match.end()))
     
-    # 提取圆形尺寸（带位置）
+    # 提取圆形尺寸（带位置，保留原始前缀格式）
     for match in _RE_ROUND_SIZE.finditer(text):
-        diameter = match.group(1)
-        sizes_with_pos.append((diameter, "圆", match.start(), match.end()))
+        prefix, diameter = match.groups()
+        sizes_with_pos.append((diameter, prefix, match.start(), match.end()))
     
     # 按位置排序
     sizes_with_pos.sort(key=lambda x: x[2])
@@ -768,6 +777,8 @@ def _extract_gift(text: str) -> tuple[str, int]:
     return gift_name, gift_num
 
 
+_HEURISTIC_MATERIALS = ["双面革", "吸水皮革", "镜面皮革", "双面格", "软玻璃", "丝圈", "防滑皮革", "仿皮"]
+
 def _extract_pattern(text: str, material_map: dict = None) -> str:
     """从文本中提取花型名称"""
     material_map = material_map or {}
@@ -777,7 +788,7 @@ def _extract_pattern(text: str, material_map: dict = None) -> str:
         return ""
 
     # 裁剪有图/裁剪无图是model_code，不是花型名，跳过
-    cut_keywords = ["裁剪有图", "裁剪无图"]
+    cut_keywords = ["裁剪有图", "剪裁有图"]
     for kw in cut_keywords:
         text = text.replace(kw, "").strip().strip("-;,")
 
@@ -790,14 +801,24 @@ def _extract_pattern(text: str, material_map: dict = None) -> str:
     # 如果没有关键词，取分号前的文本
     if ";" in text:
         before = text.split(";")[0].strip()
-        # 去掉材质
+        # 去掉材质（先从静态映射表，再从启发式列表）
         for key in sorted(material_map.keys(), key=len, reverse=True):
             if key in before:
                 before = before.replace(key, "").strip()
                 break
+        else:
+            for mat in _HEURISTIC_MATERIALS:
+                if mat in before:
+                    before = before.replace(mat, "").strip()
+                    break
         result = before if len(before) <= 20 else before[:20]
     else:
-        result = text if len(text) <= 20 else text[:20]
+        before = text
+        for mat in _HEURISTIC_MATERIALS:
+            if mat in before:
+                before = before.replace(mat, "").strip()
+                break
+        result = before if len(before) <= 20 else before[:20]
 
     # 如果结果和材质名相同，返回空让上层使用默认值
     if result:
@@ -963,7 +984,7 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
     trailing_remark = ""
     
     # 查找所有 "-N张，"、"-N张,"、"-N张 "（空格）的位置（作为分割点）
-    split_pattern = re.compile(r"-\d+[张个件套米](?:[，,]|\s)")
+    split_pattern = re.compile(r"-\d+[张个件套米](?:[，,；;]|\s)")
     
     split_positions = []
     for match in split_pattern.finditer(text):
@@ -1327,7 +1348,7 @@ def _clean_segment(segment: str) -> str:
     # 去掉数量汇总信息（如"共计2张"、"共三张"）
     segment = _RE_QTY_SUMMARY.sub("", segment).strip()
     
-    # 清理结尾符号（包括逗号）
-    segment = segment.strip().strip("-;,、，")
+    # 清理结尾符号（包括逗号和中文分号）
+    segment = segment.strip().strip("-;,、，；")
     
     return segment

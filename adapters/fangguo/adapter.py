@@ -1,11 +1,11 @@
 """
-方果ERP适配器 - 实现 ErpAdapter 接口
+方果ERP适配器 - 实现 ErpAdapter 接口（修复版）
 ====================================
-通过方果的 queryForPageForTrade 和 saveProduct 接口
-实现订单查询和商家编码修改。
+修改点：接口返回失败时打印具体错误原因
 """
 
 import re
+import json
 from typing import Any, Optional
 
 import requests
@@ -130,31 +130,6 @@ class FangguoAdapter(ErpAdapter):
             "numIids": "",
             "payment": 0,
             "paymentEqualType": None,
-            "factoryLackPicStatus": "",
-            "decodeErrorTypeList": [],
-            "autoPush": "",
-            "inventoryStatus": "",
-            "sort": 1,
-            "countTimeType": "",
-            "countTimeStart": "",
-            "countTimeEnd": "",
-            "jitSendStatus": "",
-            "inquiryModeByProductSn": 1,
-            "productSn": "",
-            "categoryIdList": [],
-            "customIdStr": "",
-            "inquiryModeByGiftCode": 0,
-            "giftCode": "",
-            "combinationGoodsType": None,
-            "deductWarehouseName": "",
-            "customOrderRemark": "",
-            "aeWarehouseIds": [],
-            "countryList": [],
-            "temuWarehouseIds": [],
-            "tkCrossWarehouseIds": [],
-            "priceType": "pay_price",
-            "minPrice": None,
-            "maxPrice": None,
             "firstOrderStatus": [],
             "firstPrintStatus": [],
             "lastSyncStatus": [],
@@ -261,47 +236,6 @@ class FangguoAdapter(ErpAdapter):
             return d[0] if d else {}
         return {}
 
-    # def _enrich_order_with_detail(self, order: Order) -> Order:
-    #     """如果订单没有备注/商品行，从详情接口补充"""
-    #     if order.shop_remark and order.items:
-    #         return order
-    #
-    #     detail = self.fetch_order_detail(
-    #         order_id=order.trade_id or order.id,
-    #         sys_tid=order.sys_tid,
-    #     )
-    #     if not detail:
-    #         return order
-    #
-    #     # 补充卖家备注
-    #     shop_remark = self._extract_field(detail, [
-    #         "shopRemark", "sellerRemark", "remark",
-    #         "备注", "卖家备注", "shop_remark",
-    #     ])
-    #     if shop_remark:
-    #         order.shop_remark = shop_remark
-    #
-    #     # 补充商品行
-    #     items = detail.get("orderItems") or detail.get("items") or []
-    #     if items and not order.items:
-    #         for it in items:
-    #             order.items.append(OrderItem(
-    #                 id=str(it.get("id") or ""),
-    #                 order_id=str(it.get("orderId") or order.trade_id),
-    #                 sys_oid=str(it.get("sysOid") or ""),
-    #                 oid=str(it.get("oid") or order.tid),
-    #                 title=str(it.get("title") or ""),
-    #                 sku_properties_name=str(it.get("skuPropertiesName") or ""),
-    #                 shop_mapping_sku=str(it.get("shopMappingSku") or ""),
-    #                 original_sku_id=str(it.get("originalSkuId") or ""),
-    #                 original_goods_id=str(it.get("originalGoodsId") or ""),
-    #                 merchandise_pic_path=str(it.get("merchandisePicPath") or ""),
-    #                 num=int(it.get("num") or 1),
-    #                 price=float(it.get("price") or 0),
-    #                 raw=it,
-    #             ))
-    #     return order
-
     def _enrich_order_with_detail(self, order: Order) -> Order:
         if order.shop_remark and order.items:
             return order
@@ -341,7 +275,7 @@ class FangguoAdapter(ErpAdapter):
         return order
 
     # -------------------------------------------------------------------
-    # 3. 修改商家编码
+    # 3. 修改商家编码（带详细错误日志）
     # -------------------------------------------------------------------
     def update_merchant_code(self, order: Order, parsed: ParsedRemark, parsed_list: list = None) -> bool:
         """
@@ -357,10 +291,10 @@ class FangguoAdapter(ErpAdapter):
         # 构建 orderItems，保留未被替换的现有商品行
         order_items = []
         template_item = order.items[0] if order.items else None
-        
+
         # 标记哪些原始商品行已被使用（用于替换）
         used_item_indices = set()
-        
+
         for idx, p in enumerate(effective_list):
             if template_item:
                 if idx < len(order.items) and not self._is_gift_item(order.items[idx]):
@@ -371,7 +305,7 @@ class FangguoAdapter(ErpAdapter):
             else:
                 new_item = self._build_default_item(order, p)
             order_items.append(new_item)
-        
+
         # 检查是否有赠品，处理赠品行（更新已有或创建新的）
         gift_name = ""
         gift_num = 0
@@ -382,12 +316,12 @@ class FangguoAdapter(ErpAdapter):
                 gift_num = p.gift_num
             if p.material_code:
                 material_code = p.material_code
-        
+
         if gift_name and gift_num > 0 and material_code:
             gift_idx = self._handle_gift_item(order_items, order, material_code, gift_name, gift_num, template_item, used_item_indices)
             if gift_idx is not None:
                 used_item_indices.add(gift_idx)
-        
+
         # 保留未被使用的现有商品行
         for idx, item in enumerate(order.items):
             if idx not in used_item_indices:
@@ -430,25 +364,24 @@ class FangguoAdapter(ErpAdapter):
         resp = self._session.post(API_SAVE_PRODUCT, json=payload, timeout=30)
         resp.raise_for_status()
         result = resp.json()
-        return result.get("e") == 0
+
+        # ===== 判断 API 返回结果 =====
+        # 方果返回: {"code": 0, "data": true, "msg": ""}
+        if result.get("code") == 0 and result.get("data") is True:
+            return True
+        else:
+            error_msg = result.get("msg", "未知错误")
+            raw_body = json.dumps(result, ensure_ascii=False, indent=2)
+            print(f"  ❌ 接口返回失败: code={result.get('code')}, msg={error_msg}")
+            print(f"  🔍 API返回原文:\n{raw_body}")
+            return False
 
     def _split_parsed_by_sizes(self, order: Order, parsed: ParsedRemark) -> list[ParsedRemark]:
-        """
-        如果备注中包含多个尺寸，拆成多个 ParsedRemark
-
-        例如：
-        卖家备注：定制吸水皮革楼梯垫浅灰3,100x4000cm一张，浅灰，100x1000cm一张，共计2张
-        →
-        [
-            ParsedRemark(..., picture='楼梯垫浅灰3;100x4000'),
-            ParsedRemark(..., picture='楼梯垫浅灰3;100x1000')
-        ]
-        """
+        """如果备注中包含多个尺寸，拆成多个 ParsedRemark"""
         remark = order.shop_remark or ""
         if not remark:
             return [parsed]
 
-        # 使用 extract_multiple_remarks 进行多尺寸拆分
         multi_parsed = extract_multiple_remarks(
             remark,
             material_map=self.material_map,
@@ -584,24 +517,12 @@ class FangguoAdapter(ErpAdapter):
         )
 
     def _build_gift_item(self, item: OrderItem, order: Order, material_code: str, gift_name: str, gift_num: int) -> dict:
-        """
-        构建赠品商品行
-        
-        赠品编码格式：材质-标准-赠品名称-赠品名称
-        例如：吸水皮革-标准-赠品沥水垫小圆或小方-赠品沥水垫小圆或小方
-        
-        参数：
-            item: 模板商品行
-            order: 订单对象
-            material_code: 材质编码（如"吸水皮革"）
-            gift_name: 赠品名称（不含"赠品"前缀）
-            gift_num: 赠品数量
-        """
+        """构建赠品商品行"""
         if gift_name.startswith("赠品"):
             gift_code = gift_name
         else:
             gift_code = f"赠品{gift_name}"
-        
+
         return {
             "materialId": None,
             "materialCode": material_code,
@@ -612,7 +533,7 @@ class FangguoAdapter(ErpAdapter):
             "multiHolePic": None,
             "multiImageExists": None,
             "modelId": None,
-            "modelCode": gift_code,
+            "modelCode": "标准",
             "modelCodeName": None,
             "brand": None,
             "customSize": False,
@@ -650,10 +571,10 @@ class FangguoAdapter(ErpAdapter):
             "giftBOList": [],
             "giftList": None,
             "giftMaterialList": None,
-            "giftCodeName": None,
+            "giftCodeName": gift_code,
             "filmGiftCodeId": None,
-            "filmGiftCode": "",
-            "filmGiftNum": 0,
+            "filmGiftCode": gift_code,
+            "filmGiftNum": gift_num,
             "filmGiftPicCode": None,
             "decorationGiftCodeId": None,
             "decorationGiftCode": "",
@@ -662,21 +583,21 @@ class FangguoAdapter(ErpAdapter):
             "giftsWithOrder": [],
             "picChange": 0,
             "orderId": item.order_id,
-            "originalSkuId": "",
-            "originalGoodsId": "",
-            "id": "",
-            "sysOid": "",
+            "originalSkuId": item.original_sku_id,
+            "originalGoodsId": item.original_goods_id,
+            "id": item.id,
+            "sysOid": item.sys_oid,
             "oid": item.oid,
-            "title": f"赠品{gift_name}",
-            "merchandisePicPath": "",
+            "title": item.title,
+            "merchandisePicPath": item.merchandise_pic_path,
             "workUrl": None,
             "effectUrl": None,
             "productionPicPath": None,
-            "num": gift_num,
+            "num": 1,
             "price": 0,
-            "skuPropertiesName": "",
+            "skuPropertiesName": item.sku_properties_name,
             "outerIid": "",
-            "shopMappingSku": f"{material_code}-标准-{gift_code}-{gift_code}",
+            "shopMappingSku": material_code + "-标准-" + gift_code + "-" + gift_code,
             "diyList": [{
                 "bg": "", "mask": "", "picName": "",
                 "isPicMove": 1, "sort": 1,
@@ -708,7 +629,7 @@ class FangguoAdapter(ErpAdapter):
             "packageQuantity": None,
             "refundStatusDesc": "",
             "cancelStatus": False,
-            "realModelCode": gift_code,
+            "realModelCode": "标准",
             "realModelId": None,
             "type": 0,
             "showRemarkInfo": True,
@@ -716,124 +637,61 @@ class FangguoAdapter(ErpAdapter):
             "loaded": True,
         }
 
-    def _handle_gift_item(self, order_items: list, order: Order, material_code: str, gift_name: str, gift_num: int, template_item: OrderItem = None, used_indices: set = None) -> int:
-        """
-        处理赠品行：检测已有赠品行并更新数量，或创建新的赠品行
-        
-        参数：
-            order_items: 当前构建的商品行列表
-            order: 订单对象
-            material_code: 材质编码
-            gift_name: 赠品名称
-            gift_num: 赠品数量
-            template_item: 模板商品行（用于创建新赠品行）
-            used_indices: 已使用的原始商品行索引集合
-        
-        返回：被使用的原始商品行索引（如果找到了并更新了），否则返回None
-        """
-        if gift_name.startswith("赠品"):
-            gift_code = gift_name
-        else:
-            gift_code = f"赠品{gift_name}"
-        
-        target_sku = f"{material_code}-标准-{gift_code}-{gift_code}"
-        
-        for item in order_items:
-            existing_sku = item.get("shopMappingSku", "")
-            if self._is_gift_match(existing_sku, target_sku, gift_name):
-                item["num"] = gift_num
-                return None
-        
-        if order.items:
-            for idx, existing_item in enumerate(order.items):
-                if used_indices and idx in used_indices:
-                    continue
-                if self._is_gift_match(existing_item.shop_mapping_sku, target_sku, gift_name):
-                    if existing_item.raw:
-                        cloned = existing_item.raw.copy()
-                        cloned["num"] = gift_num
-                        cloned["shopMappingSku"] = target_sku
-                        cloned["materialCode"] = material_code
-                        cloned["modelCode"] = gift_code
-                        cloned["pictureCode"] = gift_code
-                        cloned["picCode"] = gift_code
-                        cloned["realModelCode"] = gift_code
-                        cloned["colorCode"] = "标准"
-                        cloned["title"] = f"赠品{gift_name}"
-                        cloned["price"] = 0
-                        cloned["shopRemark"] = order.shop_remark or ""
-                        cloned["buyerRemark"] = order.buyer_remark or ""
+    def _handle_gift_item(self, order_items: list, order: Order, material_code: str,
+                          gift_name: str, gift_num: int, template_item: OrderItem,
+                          used_item_indices: set) -> int | None:
+        """处理赠品：更新已有赠品行或创建新的"""
+        # 查找现有商品行中是否已有同款赠品
+        for idx, item in enumerate(order.items):
+            if idx not in used_item_indices:
+                item_gift_code = getattr(item, 'filmGiftCode', '') or \
+                                 item.raw.get('filmGiftCode', '') if hasattr(item, 'raw') and item.raw else ''
+                if item_gift_code and gift_name in item_gift_code:
+                    # 更新已有赠品数量
+                    cloned = item.raw.copy() if item.raw else {}
+                    if cloned:
+                        if not cloned.get('filmGiftNum'):
+                            pass
+                        cloned['filmGiftNum'] = gift_num
+                        cloned['shopRemark'] = order.shop_remark or ""
+                        cloned['buyerRemark'] = order.buyer_remark or ""
                         order_items.append(cloned)
+                        used_item_indices.add(idx)
+                        return idx
                     else:
-                        new_item = self._build_order_item(existing_item, order, ParsedRemark(
-                            material_code=material_code,
-                            color_code="标准",
-                            model_code=gift_code,
-                            picture_code=gift_code,
-                            num=gift_num,
-                            gift_name=gift_name,
-                            gift_num=gift_num,
-                        ))
-                        new_item["title"] = f"赠品{gift_name}"
-                        new_item["price"] = 0
-                        order_items.append(new_item)
-                    return idx
-        
+                        new_gift = self._build_gift_item(item, order, material_code, gift_name, gift_num)
+                        order_items.append(new_gift)
+                        used_item_indices.add(idx)
+                        return idx
+
+        # 没有找到现有赠品，创建新的赠品行
         if template_item:
-            gift_item = self._build_gift_item(template_item, order, material_code, gift_name, gift_num)
-            order_items.append(gift_item)
-        
-        return None
-    
+            new_gift = self._build_gift_item(template_item, order, material_code, gift_name, gift_num)
+        else:
+            new_gift = self._build_gift_item(
+                OrderItem(id=order.trade_id, order_id=order.trade_id, oid=order.tid, num=1),
+                order, material_code, gift_name, gift_num,
+            )
+
+        order_items.append(new_gift)
+        return len(order_items) - 1
+
     def _is_gift_item(self, item: OrderItem) -> bool:
-        """检测商品行是否为赠品"""
-        if item.shop_mapping_sku and "赠品" in item.shop_mapping_sku:
-            return True
-        if item.title and "赠品" in item.title:
-            return True
-        return False
-    
-    def _is_gift_match(self, existing_sku: str, target_sku: str, gift_name: str) -> bool:
-        """模糊匹配赠品SKU"""
-        if existing_sku == target_sku:
-            return True
-        if existing_sku and "赠品" in existing_sku and gift_name in existing_sku:
-            return True
-        return False
+        """判断一个商品行是否是赠品行"""
+        gift_code = item.raw.get('filmGiftCode', '') if item.raw else ''
+        return bool(gift_code)
 
     # -------------------------------------------------------------------
-    # 3. 材质列表（可选，增强解析器）
+    # 工具方法
     # -------------------------------------------------------------------
 
-    def get_material_list(self) -> list[dict]:
-        return self._material_source.fetch()
-
-    def get_material_matcher(self):
-        return self._material_source.matcher_callback
-
-    # -------------------------------------------------------------------
-    # 辅助：尝试多种字段名
-    # -------------------------------------------------------------------
-
-    @staticmethod
-    def _extract_field(data: dict, candidates: list[str]) -> str:
-        for key in candidates:
-            val = data.get(key)
-            if val is None:
-                continue
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-            if isinstance(val, dict):
-                for sub_key in ["remark", "text", "value", "content", "备注"]:
-                    sub_val = val.get(sub_key)
-                    if sub_val and isinstance(sub_val, str) and sub_val.strip():
-                        return sub_val.strip()
-                for v in val.values():
-                    if isinstance(v, str) and v.strip():
-                        return v.strip()
+    def _extract_field(self, data: dict, field_names: list[str]) -> str:
+        for name in field_names:
+            val = data.get(name)
+            if val:
+                return str(val).strip()
         return ""
 
-    @staticmethod
-    def _print_keys_sample(orders_raw: list[dict], label: str = "第一个订单"):
-        if orders_raw:
-            print(f"  🔍 {label} 原始字段: {list(orders_raw[0].keys())}")
+    def get_material_matcher(self):
+        """返回材质自动匹配回调"""
+        return self._material_source.auto_match if hasattr(self._material_source, 'auto_match') else None
