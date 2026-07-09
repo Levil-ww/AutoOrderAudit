@@ -1,0 +1,19 @@
+2026.7.09
+修复一、
+修复adapter的商品行构建问题： 1.备注中含有两个商品，但实际只输出了一个，并且默认第二个
+    问题出在 adapter.py 的 update_merchant_code 方法中，构建 API 请求体 orderItems 的逻辑有误。
+         索引	                      逻辑	                                         id 字段值	      结果
+        idx=0	idx < len(order.items) → 使用 order.items[0]	                        item_001	  ✅ 更新第1行
+        idx=1	idx >= len(order.items) → 回退到 template_item (= order.items[0])	也是 item_001	❌ ID重复！
+
+两个商品行发送了 完全相同的 id、sysOid、oid，方果ERP 将它们视为同一行，第二个（45×90cm）覆盖了第一个（25×57cm），所以界面上只能看到45×90cm那一行。
+
+方案：在 adapter.py 的 update_merchant_code 中，对于超出现有商品行数量的新建商品行，使用 空白 OrderItem（ID字段为空），让ERP API识别为"新建行"而非"更新现有行"：
+    索引	        id	            含义
+    idx=0	item_001	更新原有商品行为 25×57cm
+    idx=1	""(空)	    ERP 自动为 45×90cm 创建新行
+
+测试结果：
+    解析层正确返回2个商品行 ✓
+    第1行保留原商品行ID → ERP更新该行 ✓
+    第2行使用空白ID → ERP创建新行，不会再冲突 ✓

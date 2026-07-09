@@ -296,12 +296,13 @@ class FangguoAdapter(ErpAdapter):
         used_item_indices = set()
 
         for idx, p in enumerate(effective_list):
-            if template_item:
-                if idx < len(order.items) and not self._is_gift_item(order.items[idx]):
-                    new_item = self._build_order_item(order.items[idx], order, p)
-                    used_item_indices.add(idx)
-                else:
-                    new_item = self._build_order_item(template_item, order, p)
+            if idx < len(order.items) and not self._is_gift_item(order.items[idx]):
+                new_item = self._build_order_item(order.items[idx], order, p)
+                used_item_indices.add(idx)
+            elif template_item:
+                # 超出现有商品行 → 新建商品行，使用空白ID让ERP创建新行
+                blank_item = OrderItem(order_id=order.trade_id)
+                new_item = self._build_order_item(blank_item, order, p)
             else:
                 new_item = self._build_default_item(order, p)
             order_items.append(new_item)
