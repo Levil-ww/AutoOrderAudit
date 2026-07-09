@@ -288,26 +288,67 @@ class FangguoAdapter(ErpAdapter):
         else:
             effective_list = self._split_parsed_by_sizes(order, parsed)
 
+        # 检查编码是否已正确（只检查非赠品商品行，避免被之前错误修改的赠品行误导）
+        expected_skus_set = {p.shop_mapping_sku for p in effective_list}
+        current_non_gift_skus = set()
+        for item in order.items:
+            if item.shop_mapping_sku and not self._is_gift_item(item):
+                current_non_gift_skus.add(item.shop_mapping_sku)
+        if current_non_gift_skus and expected_skus_set.issubset(current_non_gift_skus):
+            print(f"  ✅ 编码已正确，跳过修改")
+            return True
+
         # 构建 orderItems，保留未被替换的现有商品行
-        order_items = []
+        # 注意：ERP按数组位置匹配商品行，必须保持原有顺序
         template_item = order.items[0] if order.items else None
 
         # 标记哪些原始商品行已被使用（用于替换）
         used_item_indices = set()
 
+        # 第一步：按原位置构建已更新的商品行 + 保留赠品行
+        # 用字典按原索引位置存储，保持顺序
+        order_items_map = {}  # {original_index: item_dict}
+        new_items_to_append = []  # 超出原订单数量的新建行，追加到最后
+
         for idx, p in enumerate(effective_list):
             if idx < len(order.items) and not self._is_gift_item(order.items[idx]):
+                # 更新现有非赠品商品行 → 保持原位
                 new_item = self._build_order_item(order.items[idx], order, p)
+                order_items_map[idx] = new_item
                 used_item_indices.add(idx)
             elif template_item:
-                # 超出现有商品行 → 使用默认构造方式新建商品行
-                # 使用 order.trade_id 作为占位id，ERP会创建新行而不会误匹配现有行
-                new_item = self._build_default_item(order, p)
+                # 超出现有商品行 → 新建商品行（追加到末尾）
+                new_item = self._build_new_item(order, p)
+                new_items_to_append.append(new_item)
             else:
                 new_item = self._build_default_item(order, p)
-            order_items.append(new_item)
+                new_items_to_append.append(new_item)
 
-        # 检查是否有赠品，处理赠品行（更新已有或创建新的）
+        # 第二步：保留未被使用的现有商品行（保持原位置）
+        for idx, item in enumerate(order.items):
+            if idx not in used_item_indices:
+                if item.raw:
+                    cloned = item.raw.copy()
+                    cloned["shopRemark"] = order.shop_remark or ""
+                    cloned["buyerRemark"] = order.buyer_remark or ""
+                    order_items_map[idx] = cloned
+                else:
+                    new_item = self._build_order_item(item, order, ParsedRemark(
+                        material_code=item.shop_mapping_sku.split("-")[0] if "-" in item.shop_mapping_sku else "",
+                        color_code="标准",
+                        model_code=item.shop_mapping_sku.split("-")[2] if "-" in item.shop_mapping_sku and len(item.shop_mapping_sku.split("-")) > 2 else "",
+                        picture_code=item.shop_mapping_sku.split("-")[-1] if "-" in item.shop_mapping_sku else "",
+                        num=item.num,
+                    ))
+                    order_items_map[idx] = new_item
+
+        # 第三步：按原索引顺序合并，新建行追加到末尾
+        order_items = []
+        for idx in sorted(order_items_map.keys()):
+            order_items.append(order_items_map[idx])
+        order_items.extend(new_items_to_append)
+
+        # 第四步：检查是否有赠品，处理赠品行（更新已有或创建新的）
         gift_name = ""
         gift_num = 0
         material_code = ""
@@ -322,24 +363,6 @@ class FangguoAdapter(ErpAdapter):
             gift_idx = self._handle_gift_item(order_items, order, material_code, gift_name, gift_num, template_item, used_item_indices)
             if gift_idx is not None:
                 used_item_indices.add(gift_idx)
-
-        # 保留未被使用的现有商品行
-        for idx, item in enumerate(order.items):
-            if idx not in used_item_indices:
-                if item.raw:
-                    cloned = item.raw.copy()
-                    cloned["shopRemark"] = order.shop_remark or ""
-                    cloned["buyerRemark"] = order.buyer_remark or ""
-                    order_items.append(cloned)
-                else:
-                    new_item = self._build_order_item(item, order, ParsedRemark(
-                        material_code=item.shop_mapping_sku.split("-")[0] if "-" in item.shop_mapping_sku else "",
-                        color_code="标准",
-                        model_code=item.shop_mapping_sku.split("-")[2] if "-" in item.shop_mapping_sku and len(item.shop_mapping_sku.split("-")) > 2 else "",
-                        picture_code=item.shop_mapping_sku.split("-")[-1] if "-" in item.shop_mapping_sku else "",
-                        num=item.num,
-                    ))
-                    order_items.append(new_item)
 
         payload = {
             "orderType": 0,
@@ -361,6 +384,18 @@ class FangguoAdapter(ErpAdapter):
             "goodsIndex": 0,
             "shopId": "",
         }
+
+        # 打印payload摘要用于调试
+        try:
+            payload_str = json.dumps(payload, ensure_ascii=False)
+            if len(payload_str) > 2000:
+                print(f"  📤 发送payload: totalCount={payload['totalCount']}, items={len(payload['orderItems'])}个")
+                for i, it in enumerate(payload['orderItems']):
+                    print(f"      item[{i}]: id={it.get('id','')}, oid={it.get('oid','')}, sku={str(it.get('shopMappingSku',''))[:50]}")
+            else:
+                print(f"  📤 发送payload: {payload_str[:500]}")
+        except:
+            pass
 
         resp = self._session.post(API_SAVE_PRODUCT, json=payload, timeout=30)
         resp.raise_for_status()
@@ -510,10 +545,21 @@ class FangguoAdapter(ErpAdapter):
         }
 
     def _build_default_item(self, order: Order, parsed: ParsedRemark) -> dict:
-        """没有商品行时的默认构造"""
+        """没有商品行时的默认构造（新建行，ERP会创建新行）"""
         return self._build_order_item(
-            OrderItem(id=order.trade_id, order_id=order.trade_id,
-                      oid=order.tid, num=1),
+            OrderItem(id=None, order_id=order.trade_id,
+                      oid=None, sys_oid=None, num=1),
+            order, parsed,
+        )
+
+    def _build_new_item(self, order: Order, parsed: ParsedRemark) -> dict:
+        """超出原订单商品行数时，构建新商品行（所有标识字段置空，ERP创建新行）"""
+        return self._build_order_item(
+            OrderItem(id=None, order_id=order.trade_id,
+                      oid=None, sys_oid=None,
+                      original_sku_id=None, original_goods_id=None,
+                      title=None, merchandise_pic_path=None,
+                      price=0, num=1),
             order, parsed,
         )
 

@@ -81,7 +81,7 @@ _RE_SIZE = re.compile(
 
 # 圆形尺寸：圆直径80cm, 圆80cm, 直径80cm，
 _RE_ROUND_SIZE = re.compile(
-    r"(圆(?:直径)?|直径)\s*(\d+(?:\.\d+)?)\s*(?:cm|CM|厘米)?"
+    r"(圆形|圆(?:直径)?|直径)\s*(\d+(?:\.\d+)?)\s*(?:cm|CM|厘米)?"
 )
 
 # 数量匹配：不限于末尾，匹配所有 "-1张", "*2个" 等
@@ -176,7 +176,7 @@ def parse_remark(
             if last_semi != -1:
                 size_prefix = before_size[last_semi + 1:].strip().strip("-;,、")
     
-    actual_size = f"{first_size[0]}x{first_size[1]}CM" if first_size[1] not in ["圆", "圆直径", "直径"] else f"{first_size[1]}{first_size[0]}CM"
+    actual_size = f"{first_size[0]}x{first_size[1]}CM" if first_size[1] not in ["圆", "圆直径", "直径", "圆形"] else f"{first_size[1]}{first_size[0]}CM"
     # 如果有尺寸前缀，添加到实际尺寸前面
     if size_prefix:
         actual_size = f"{size_prefix}{actual_size}"
@@ -201,14 +201,14 @@ def parse_remark(
         after_cm = re.sub(r"-\d+[张个件套米]", "", after_cm).strip()
         # 去掉数量汇总信息（如"共计2张"、"共三张"）
         after_cm = _RE_QTY_SUMMARY.sub("", after_cm).strip()
-        
+
         # 去掉赠品信息
         for kw in _GIFT_KEYWORDS:
             pos = after_cm.find(kw)
             if pos != -1:
                 after_cm = after_cm[:pos].strip()
                 break
-        
+
         remark_after_size = after_cm.strip().strip(";，,、")
 
     # 提取花型名称：从分号前的文本中提取（去掉材质和定制前缀后）
@@ -227,7 +227,7 @@ def parse_remark(
                     break
             else:
                 pattern_name = before_semicolon.strip().strip("-;,")
-    
+
     # 去掉可能残留的"定制"前缀
     if pattern_name.startswith("定制"):
         pattern_name = pattern_name[2:].strip()
@@ -276,14 +276,14 @@ def extract_multiple_remarks(
         ParsedRemark(...picture='楼梯垫浅灰3;100x4000'),
         ParsedRemark(...picture='楼梯垫浅灰3;100x1000')
       ]
-    
+
     支持每个尺寸有独立描述：
         "等通知发 定制双面革无尽夏;44.5x60cm四个角都是半径5cm的圆角-1张，竖版53x60cm-1张"
     → [
         ParsedRemark(...picture='无尽夏;44.5x60四个角都是半径5cm的圆角'),
         ParsedRemark(...picture='无尽夏;竖版53x60')
       ]
-    
+
     支持不同花型：
         "定制双面革克罗印花;30x50cm-1张，莫比之窗;25x35cm-1张,格子多些..."
     → [
@@ -316,7 +316,7 @@ def extract_multiple_remarks(
 
     # 提取共同的材质信息（从原始文本）
     material_code, material_source = _extract_material_info(body, material_map, material_matcher)
-    
+
     # 为每个商品段独立解析
     for idx, (segment, qty) in enumerate(segments):
         # 如果段中没有"定制"关键字，添加前缀以便识别
@@ -734,6 +734,26 @@ def _extract_gift(text: str) -> tuple[str, int]:
                 if gift_name_candidate:
                     gift_name = gift_name_candidate[:30]
                     return gift_name, gift_num
+        
+        total_pos = before_gift.rfind("总共")
+        if total_pos != -1:
+            gift_name_candidate = before_gift[:total_pos].strip()
+            if gift_name_candidate and not _RE_SIZE.search(gift_name_candidate) and not _RE_ROUND_SIZE.search(gift_name_candidate):
+                gift_name_candidate = re.sub(r"\d+[张个件套米]", "", gift_name_candidate).strip()
+                gift_name_candidate = re.sub(r"[一二两三四五六七八九十]+[张个件套米]", "", gift_name_candidate).strip()
+                gift_name_candidate = gift_name_candidate.strip("-;,、，")
+                if gift_name_candidate:
+                    gift_name = gift_name_candidate[:30]
+                    return gift_name, gift_num
+        
+        if before_gift and not _RE_SIZE.search(before_gift) and not _RE_ROUND_SIZE.search(before_gift):
+            gift_name_candidate = re.sub(r"\d+[张个件套米]", "", before_gift).strip()
+            gift_name_candidate = re.sub(r"[一二两三四五六七八九十]+[张个件套米]", "", gift_name_candidate).strip()
+            gift_name_candidate = gift_name_candidate.replace("总共", "").strip()
+            gift_name_candidate = gift_name_candidate.strip("-;,、，")
+            if gift_name_candidate:
+                gift_name = gift_name_candidate[:30]
+                return gift_name, gift_num
         
         return gift_name, gift_num
     
