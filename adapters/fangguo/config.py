@@ -60,8 +60,8 @@ MATERIAL_MAP = {
 }
 
 # ========== 运行模式 ==========
-DRY_RUN = False       # False=打印提交（初次使用建议True测试）
-# DRY_RUN = True       # True=仅打印不提交（初次使用建议True测试）
+# DRY_RUN = False       # False=打印提交（初次使用建议True测试）
+DRY_RUN = True       # True=仅打印不提交（初次使用建议True测试）
 MAX_ORDERS = 0       # 0=不限制
 
 

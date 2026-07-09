@@ -59,13 +59,13 @@ class FangguoAdapter(ErpAdapter):
     # -------------------------------------------------------------------
 
     def query_orders(
-            self,
-            page_no: int = 1,
-            page_size: int = 500,
-            query_status: int = 1,
-            time_begin: str = "",
-            time_end: str = "",
-            **kwargs,
+        self,
+        page_no: int = 1,
+        page_size: int = 500,
+        query_status: int = 1,
+        time_begin: str = "",
+        time_end: str = "",
+        **kwargs,
     ) -> list[Order]:
         """调用 queryForPageForTrade 拉取待整理订单"""
         payload = {
@@ -99,7 +99,7 @@ class FangguoAdapter(ErpAdapter):
             "receiverMobileStrs": "",
             "buyerNickStrs": "",
             "receiverAddressStrs": "",
-            "tradeIdStr": "",
+            "tradeIdStr": kwargs.get("trade_id", ""),
             "barcode": "",
             "shopRemark": "",
             "buyerRemark": "",
@@ -289,12 +289,13 @@ class FangguoAdapter(ErpAdapter):
             effective_list = self._split_parsed_by_sizes(order, parsed)
 
         # 检查编码是否已正确（只检查非赠品商品行，避免被之前错误修改的赠品行误导）
+        # 使用精确匹配，确保当前编码与期望编码完全一致，多余的错误编码会触发修改
         expected_skus_set = {p.shop_mapping_sku for p in effective_list}
         current_non_gift_skus = set()
         for item in order.items:
             if item.shop_mapping_sku and not self._is_gift_item(item):
                 current_non_gift_skus.add(item.shop_mapping_sku)
-        if current_non_gift_skus and expected_skus_set.issubset(current_non_gift_skus):
+        if current_non_gift_skus and expected_skus_set == current_non_gift_skus:
             print(f"  ✅ 编码已正确，跳过修改")
             return True
 
@@ -307,40 +308,52 @@ class FangguoAdapter(ErpAdapter):
 
         # 第一步：按原位置构建已更新的商品行 + 保留赠品行
         # 用字典按原索引位置存储，保持顺序
-        order_items_map = {}  # {original_index: item_dict}
-        new_items_to_append = []  # 超出原订单数量的新建行，追加到最后
+        order_items_map = {}
+        new_items_to_append = []
+
+        matched_skus = {}
 
         for idx, p in enumerate(effective_list):
             if idx < len(order.items) and not self._is_gift_item(order.items[idx]):
-                # 更新现有非赠品商品行 → 保持原位
                 new_item = self._build_order_item(order.items[idx], order, p)
                 order_items_map[idx] = new_item
                 used_item_indices.add(idx)
+                matched_skus[p.shop_mapping_sku] = idx
             elif template_item:
-                # 超出现有商品行 → 新建商品行（追加到末尾）
                 new_item = self._build_new_item(order, p)
                 new_items_to_append.append(new_item)
             else:
                 new_item = self._build_default_item(order, p)
                 new_items_to_append.append(new_item)
 
-        # 第二步：保留未被使用的现有商品行（保持原位置）
+        # 第二步：只保留未被使用的赠品行，多余的错误编码商品行不保留（清理）
         for idx, item in enumerate(order.items):
             if idx not in used_item_indices:
-                if item.raw:
-                    cloned = item.raw.copy()
-                    cloned["shopRemark"] = order.shop_remark or ""
-                    cloned["buyerRemark"] = order.buyer_remark or ""
-                    order_items_map[idx] = cloned
+                if self._is_gift_item(item):
+                    if item.raw:
+                        cloned = item.raw.copy()
+                        cloned["shopRemark"] = order.shop_remark or ""
+                        cloned["buyerRemark"] = order.buyer_remark or ""
+                        order_items_map[idx] = cloned
+                    else:
+                        new_item = self._build_order_item(item, order, ParsedRemark(
+                            material_code=item.shop_mapping_sku.split("-")[0] if "-" in item.shop_mapping_sku else "",
+                            color_code="标准",
+                            model_code=item.shop_mapping_sku.split("-")[2] if "-" in item.shop_mapping_sku and len(item.shop_mapping_sku.split("-")) > 2 else "",
+                            picture_code=item.shop_mapping_sku.split("-")[-1] if "-" in item.shop_mapping_sku else "",
+                            num=item.num,
+                        ))
+                        order_items_map[idx] = new_item
                 else:
-                    new_item = self._build_order_item(item, order, ParsedRemark(
-                        material_code=item.shop_mapping_sku.split("-")[0] if "-" in item.shop_mapping_sku else "",
-                        color_code="标准",
-                        model_code=item.shop_mapping_sku.split("-")[2] if "-" in item.shop_mapping_sku and len(item.shop_mapping_sku.split("-")) > 2 else "",
-                        picture_code=item.shop_mapping_sku.split("-")[-1] if "-" in item.shop_mapping_sku else "",
-                        num=item.num,
-                    ))
-                    order_items_map[idx] = new_item
+                    item_sku = item.shop_mapping_sku or ""
+                    if item_sku and item_sku in expected_skus_set:
+                        if item_sku not in matched_skus:
+                            matched_skus[item_sku] = idx
+                            if item.raw:
+                                cloned = item.raw.copy()
+                                cloned["shopRemark"] = order.shop_remark or ""
+                                cloned["buyerRemark"] = order.buyer_remark or ""
+                                order_items_map[idx] = cloned
 
         # 第三步：按原索引顺序合并，新建行追加到末尾
         order_items = []
@@ -565,14 +578,12 @@ class FangguoAdapter(ErpAdapter):
 
     def _build_gift_item(self, item: OrderItem, order: Order, material_code: str, gift_name: str, gift_num: int) -> dict:
         """构建赠品商品行"""
-        if gift_name.startswith("赠品"):
-            gift_code = gift_name
-        else:
-            gift_code = f"赠品{gift_name}"
+        gift_material = "吸水皮革"
+        gift_code = "赠品沥水垫小圆或小方"
 
         return {
             "materialId": None,
-            "materialCode": material_code,
+            "materialCode": gift_material,
             "materialCodeName": None,
             "technology": None,
             "printWayId": None,
@@ -644,7 +655,7 @@ class FangguoAdapter(ErpAdapter):
             "price": 0,
             "skuPropertiesName": item.sku_properties_name,
             "outerIid": "",
-            "shopMappingSku": material_code + "-标准-" + gift_code + "-" + gift_code,
+            "shopMappingSku": gift_material + "-标准-" + gift_code + "-" + gift_code,
             "diyList": [{
                 "bg": "", "mask": "", "picName": "",
                 "isPicMove": 1, "sort": 1,
@@ -688,28 +699,34 @@ class FangguoAdapter(ErpAdapter):
                           gift_name: str, gift_num: int, template_item: OrderItem,
                           used_item_indices: set) -> int | None:
         """处理赠品：更新已有赠品行或创建新的"""
-        # 查找现有商品行中是否已有同款赠品
+        gift_material = "吸水皮革"
+        gift_code = "赠品沥水垫小圆或小方"
+        gift_sku = f"{gift_material}-标准-{gift_code}-{gift_code}"
+        
         for idx, item in enumerate(order.items):
-            if idx not in used_item_indices:
-                item_gift_code = getattr(item, 'filmGiftCode', '') or \
-                                 item.raw.get('filmGiftCode', '') if hasattr(item, 'raw') and item.raw else ''
-                if item_gift_code and gift_name in item_gift_code:
-                    # 更新已有赠品数量
-                    cloned = item.raw.copy() if item.raw else {}
-                    if cloned:
-                        if not cloned.get('filmGiftNum'):
-                            pass
-                        cloned['filmGiftNum'] = gift_num
-                        cloned['shopRemark'] = order.shop_remark or ""
-                        cloned['buyerRemark'] = order.buyer_remark or ""
-                        order_items.append(cloned)
-                        used_item_indices.add(idx)
-                        return idx
-                    else:
-                        new_gift = self._build_gift_item(item, order, material_code, gift_name, gift_num)
-                        order_items.append(new_gift)
-                        used_item_indices.add(idx)
-                        return idx
+            if idx not in used_item_indices and self._is_gift_item(item):
+                cloned = item.raw.copy() if item.raw else {}
+                if cloned:
+                    cloned['filmGiftNum'] = gift_num
+                    cloned['shopRemark'] = order.shop_remark or ""
+                    cloned['buyerRemark'] = order.buyer_remark or ""
+                    cloned['materialCode'] = gift_material
+                    cloned['modelCode'] = "标准"
+                    cloned['colorCode'] = "标准"
+                    cloned['pictureCode'] = gift_code
+                    cloned['picCode'] = gift_code
+                    cloned['giftCodeName'] = gift_code
+                    cloned['filmGiftCode'] = gift_code
+                    cloned['filmGiftPicCode'] = gift_code
+                    cloned['shopMappingSku'] = gift_sku
+                    order_items.append(cloned)
+                    used_item_indices.add(idx)
+                    return idx
+                else:
+                    new_gift = self._build_gift_item(item, order, material_code, gift_name, gift_num)
+                    order_items.append(new_gift)
+                    used_item_indices.add(idx)
+                    return idx
 
         # 没有找到现有赠品，创建新的赠品行
         if template_item:
