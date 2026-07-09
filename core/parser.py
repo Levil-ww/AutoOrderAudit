@@ -318,35 +318,39 @@ def extract_multiple_remarks(
     material_code, material_source = _extract_material_info(body, material_map, material_matcher)
     
     # 为每个商品段独立解析
-    for segment, qty in segments:
+    for idx, (segment, qty) in enumerate(segments):
         # 如果段中没有"定制"关键字，添加前缀以便识别
         if "定制" not in segment and is_custom:
             segment_with_prefix = f"定制{segment}"
         else:
             segment_with_prefix = segment
-        
+
         parsed = parse_remark(segment_with_prefix, material_map, material_matcher)
-        
+
         # 强制使用正确的材质
         if material_code:
             parsed.material_code = material_code
             parsed.material_source = material_source
-        
+
         # 使用从分割段中提取的数量
         parsed.num = qty
-        
+
         has_real_size = False
         if parsed.picture_code and ";" in parsed.picture_code:
             _, size_part = parsed.picture_code.split(";", 1)
             has_real_size = _RE_SIZE.search(size_part) or _RE_ROUND_SIZE.search(size_part)
-        
+
         # 更新success标志：如果材质和尺寸都有，视为成功
         if parsed.material_code and has_real_size:
             parsed.success = True
-        
+
         if parsed.success or (parsed.material_code and parsed.picture_code and has_real_size):
-            if trailing_remark:
+            # trailing_remark（如'裁剪图一张'）只附加到最后一个商品行
+            if trailing_remark and idx == len(segments) - 1:
                 clean_remark = _RE_QTY_SUMMARY.sub("", trailing_remark).strip().strip("-;,、，")
+                # 再清理一次可能的数量汇总残留
+                clean_remark = re.sub(r'共(?:计)?\d+[张个件套米]', '', clean_remark).strip().strip('，,、;；')
+                clean_remark = re.sub(r'共(?:计)?[一二两三四五六七八九十]+[张个件套米]', '', clean_remark).strip().strip('，,、;；')
                 if clean_remark:
                     if ";" in parsed.picture_code:
                         pattern_part, size_part = parsed.picture_code.split(";", 1)
