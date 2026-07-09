@@ -130,6 +130,14 @@ class AutoAuditEngine:
             self.stats["skipped"] += 1
             return
 
+        # 检查商品编码是否已正确（二次运行保护，避免重复修改）
+        expected_skus = {p.shop_mapping_sku for p in parsed_list}
+        current_skus = {item.shop_mapping_sku for item in order.items if item.shop_mapping_sku}
+        if expected_skus.issubset(current_skus) and current_skus:
+            print(f"  ✅ 编码已正确，跳过修改")
+            self.stats["skipped"] += 1
+            return
+
         parsed = parsed_list[0]
         summary = (
             f"  ✅ 材质: {parsed.material_code}  "

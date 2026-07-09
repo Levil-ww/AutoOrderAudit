@@ -300,9 +300,9 @@ class FangguoAdapter(ErpAdapter):
                 new_item = self._build_order_item(order.items[idx], order, p)
                 used_item_indices.add(idx)
             elif template_item:
-                # 超出现有商品行 → 新建商品行，使用空白ID让ERP创建新行
-                blank_item = OrderItem(order_id=order.trade_id)
-                new_item = self._build_order_item(blank_item, order, p)
+                # 超出现有商品行 → 使用默认构造方式新建商品行
+                # 使用 order.trade_id 作为占位id，ERP会创建新行而不会误匹配现有行
+                new_item = self._build_default_item(order, p)
             else:
                 new_item = self._build_default_item(order, p)
             order_items.append(new_item)
