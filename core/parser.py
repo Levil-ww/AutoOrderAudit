@@ -760,7 +760,7 @@ def _extract_gift(text: str) -> tuple[str, int]:
     
     if matched_keyword == "送":
         prev_char = text[gift_start_pos - 1] if gift_start_pos > 0 else ""
-        if prev_char in "发送达放":
+        if prev_char and prev_char in "发送达放":
             return gift_name, gift_num
         
         next_pos = gift_start_pos + 1
@@ -841,7 +841,7 @@ def _extract_gift(text: str) -> tuple[str, int]:
     
     if gift_name:
         gift_name = gift_name[:30]
-        if gift_name.startswith("赠品"):
+        if gift_name.startswith("赠品") and len(gift_name) > 2:
             gift_name = gift_name[2:].strip()
     
     return gift_name, gift_num

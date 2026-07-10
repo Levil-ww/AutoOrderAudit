@@ -416,7 +416,30 @@ class FangguoAdapter(ErpAdapter):
                     )
                 order_items.append(new_gift)
 
-        # 第三步：保留作废商品行（保持原样，不修改）
+        # 第三步：保留未匹配的非作废、非赠品商品行（保持原样，不修改）
+        # 这对于合并订单非常重要：被跳过的子订单的商品行需要保留
+        for idx, item in enumerate(order.items):
+            if idx not in used_item_indices and not item.is_void and not self._is_gift_item(item):
+                if item.raw:
+                    order_items.append(item.raw)
+                else:
+                    order_items.append({
+                        "id": item.id,
+                        "orderId": item.order_id,
+                        "sysOid": item.sys_oid,
+                        "oid": item.oid,
+                        "title": item.title,
+                        "skuPropertiesName": item.sku_properties_name,
+                        "shopMappingSku": item.shop_mapping_sku,
+                        "originalSkuId": item.original_sku_id,
+                        "originalGoodsId": item.original_goods_id,
+                        "merchandisePicPath": item.merchandise_pic_path,
+                        "num": item.num,
+                        "price": item.price,
+                        "shopRemark": item.shop_remark or "",
+                    })
+
+        # 第四步：保留作废商品行（保持原样，不修改）
         for idx, item in enumerate(order.items):
             if idx not in used_item_indices and item.is_void:
                 if item.raw:
