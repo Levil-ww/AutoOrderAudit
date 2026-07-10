@@ -196,6 +196,16 @@ class FangguoAdapter(ErpAdapter):
             is_void = it.get("discardStatus") or it.get("cancelStatus") or it.get("isVoid") or False
             if isinstance(is_void, int):
                 is_void = is_void != 0
+            
+            # 提取商品行级别的备注
+            item_remark = self._extract_field(it, [
+                "shopRemark", "sellerRemark", "remark",
+                "备注", "卖家备注", "shop_remark",
+            ])
+            
+            # 提取商品行所属的原始订单号（用于合并订单的拆分）
+            original_tid = str(it.get("tid") or it.get("oid") or it.get("sysOid") or "")
+            
             item = OrderItem(
                 id=str(it.get("id") or ""),
                 order_id=str(it.get("orderId") or order.trade_id),
@@ -211,6 +221,8 @@ class FangguoAdapter(ErpAdapter):
                 price=float(it.get("price") or 0),
                 is_void=bool(is_void),
                 raw=it,
+                shop_remark=item_remark,
+                original_tid=original_tid,
             )
             order.items.append(item)
         return order
@@ -264,6 +276,14 @@ class FangguoAdapter(ErpAdapter):
                     is_void = it.get("discardStatus") or it.get("cancelStatus") or it.get("isVoid") or False
                     if isinstance(is_void, int):
                         is_void = is_void != 0
+                    
+                    item_remark = self._extract_field(it, [
+                        "shopRemark", "sellerRemark", "remark",
+                        "备注", "卖家备注", "shop_remark",
+                    ])
+                    
+                    original_tid = str(it.get("tid") or it.get("oid") or it.get("sysOid") or "")
+                    
                     order.items.append(OrderItem(
                         id=str(it.get("id") or ""),
                         order_id=str(it.get("orderId") or order.trade_id),
@@ -279,6 +299,8 @@ class FangguoAdapter(ErpAdapter):
                         price=float(it.get("price") or 0),
                         is_void=bool(is_void),
                         raw=it,
+                        shop_remark=item_remark,
+                        original_tid=original_tid,
                     ))
         return order
 

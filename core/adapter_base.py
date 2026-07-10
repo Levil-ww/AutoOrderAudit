@@ -25,6 +25,8 @@ class OrderItem:
     price: float = 0
     is_void: bool = False
     raw: dict = field(default_factory=dict)
+    shop_remark: str = ""
+    original_tid: str = ""
 
 
 @dataclass

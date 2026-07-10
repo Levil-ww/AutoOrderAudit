@@ -103,7 +103,8 @@ _PATTERN_KEYWORDS = ["花幔", "卢浮梦境", "安妮森林", "暗夜缪斯", "
 "馨香","虚拟繁星","烟雨","夜兰图尔","夜眠花影","樱花粉兔","悠米","月夜花影",
 "绽蔓","织光造物","庄园秘境","巴洛克之星","白色大理石","柏川","摩登空间",
 "圈杏棕熊","柔漪","相伴","线条格纹","欧克","静好","蝴蝶契约","奥斯汀","无尽夏",
-"堇色素颜","青禾手记","风华格调","巴黎左岸","塞纳时光","旧枝漫语","哥特玫瑰"]
+"堇色素颜","青禾手记","风华格调","巴黎左岸","塞纳时光","旧枝漫语","哥特玫瑰","罗拉密码",
+ "飞屋构想","闲叙青釉","珍珠白","黑色诗人","浅灰绿",]
 
 # 赠品关键词
 _GIFT_KEYWORDS = ["送", "赠品", "附赠", "加送"]
@@ -1044,13 +1045,14 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
     将备注文本分割为独立的商品段
     
     分割规则：
-    1. 优先按 "-N张，"、"N张，" 或 "剪裁有图N张，" 模式分割（N为数字），这是最明确的记录分隔符
-    2. 对于每个分割段：
+    1. 优先检测合并订单：当备注中包含多个"定制"关键字且每个"定制"后面都有尺寸信息时，按"定制"拆分
+    2. 其次按 "-N张，"、"N张，" 或 "剪裁有图N张，" 模式分割（N为数字），这是最明确的记录分隔符
+    3. 对于每个分割段：
        - 第一个段保留完整的材质和花型信息
        - 后续段如果包含分号，说明有独立花型名
        - 后续段如果不包含分号，继承前面段的花型名
        - 保留尺寸前面的描述文本（如"竖版53x60"中的"竖版"）
-    3. 提取尾部共享备注（最后一个尺寸之后的逗号后面的内容，不包含尺寸）
+    4. 提取尾部共享备注（最后一个尺寸之后的逗号后面的内容，不包含尺寸）
     
     返回：(segments, trailing_remark)
     - segments: 商品段列表，每个元素为 (segment_text, quantity)
@@ -1059,6 +1061,58 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
     segments = []
     trailing_remark = ""
     
+    # ===== 检测合并订单 =====
+    # 合并订单的特征：备注中包含多个"定制"关键字，且每个"定制"后面都有尺寸信息
+    custom_positions = []
+    start_pos = 0
+    while True:
+        pos = text.find("定制", start_pos)
+        if pos == -1:
+            break
+        custom_positions.append(pos)
+        start_pos = pos + 2
+    
+    # 如果有多个"定制"关键字，检测是否为合并订单
+    if len(custom_positions) >= 2:
+        is_merged_order = True
+        
+        # 检查每个"定制"后面是否有尺寸信息
+        for i, pos in enumerate(custom_positions):
+            segment_candidate = text[pos:pos+100]
+            if not _RE_SIZE.search(segment_candidate) and not _RE_ROUND_SIZE.search(segment_candidate):
+                is_merged_order = False
+                break
+        
+        # 关键判断：合并订单中，第二个及以后的"定制"前面没有逗号分隔
+        # 如果第二个"定制"紧邻前面有逗号（如"做，定制"），说明是同一个订单中的多个商品
+        # 如果第二个"定制"前面没有逗号（如"赠品一张定制"），说明是合并订单
+        # 只检查前面3个字符，避免误判第一个商品描述中的逗号
+        if is_merged_order:
+            for i in range(1, len(custom_positions)):
+                curr_start = custom_positions[i]
+                # 检查"定制"前面3个字符是否有逗号
+                look_back = text[max(0, curr_start - 3):curr_start]
+                if "，" in look_back or "," in look_back or "；" in look_back or ";" in look_back:
+                    is_merged_order = False
+                    break
+        
+        if is_merged_order:
+            # 按"定制"关键字拆分
+            for i, pos in enumerate(custom_positions):
+                if i < len(custom_positions) - 1:
+                    end_pos = custom_positions[i + 1]
+                    segment = text[pos:end_pos].strip()
+                else:
+                    segment = text[pos:].strip()
+                
+                if segment:
+                    qty_match = re.search(r"-(\d+)[张个件套米]", segment)
+                    qty = int(qty_match.group(1)) if qty_match else 1
+                    segments.append((segment, qty))
+            
+            return segments, trailing_remark
+    
+    # ===== 原有分割逻辑 =====
     # 查找所有分割点："-N张，"、"N张，"、"剪裁有图N张，"、"剪裁无图N张，"、"-N张 "（空格）等
     # 注意：使用非贪婪匹配，避免跨段匹配
     split_pattern = re.compile(r"(?:-)?\d+[张个件套米](?:[，,；;]|\s+)")

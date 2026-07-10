@@ -105,19 +105,38 @@ class AutoAuditEngine:
         remark = order.shop_remark or ""
         print(f"  卖家备注: {remark[:60]}..." if len(remark) > 60 else f"  卖家备注: {remark}")
 
+        material_map = getattr(self.adapter, 'material_map', None)
+        material_matcher = getattr(self.adapter, 'get_material_matcher', lambda: None)()
+
+        # ===== 检测合并订单 =====
+        # 合并订单特征：订单号包含 &，或商品行有不同的 original_tid
+        is_merged_order = "&" in order.trade_id or "&" in order.tid
+        
+        if not is_merged_order:
+            # 检查商品行是否有不同的 original_tid
+            tids = set()
+            for item in order.items:
+                if item.original_tid:
+                    tids.add(item.original_tid)
+            if len(tids) >= 2:
+                is_merged_order = True
+
+        if is_merged_order:
+            self._process_merged_order(order, material_map, material_matcher)
+            return
+
+        # ===== 普通订单处理 =====
         if not remark.strip():
             print("  ⏭️  跳过：卖家备注为空")
             self.stats["skipped"] += 1
             return
 
+        # ===== 普通订单处理 =====
         for keyword in _SKIP_KEYWORDS:
             if keyword in remark:
                 print(f"  ⏭️  跳过：备注包含关键字 '{keyword}'")
                 self.stats["skipped"] += 1
                 return
-
-        material_map = getattr(self.adapter, 'material_map', None)
-        material_matcher = getattr(self.adapter, 'get_material_matcher', lambda: None)()
 
         parsed_list = extract_multiple_remarks(
             remark,
@@ -139,7 +158,6 @@ class AutoAuditEngine:
         )
         print(summary)
 
-        # 检查赠品信息
         gift_name = ""
         gift_num = 0
         for p in parsed_list:
@@ -159,7 +177,6 @@ class AutoAuditEngine:
             self.stats["success"] += 1
             return
 
-        # ===== 确认弹窗：在调用 API 之前征求用户意见 =====
         if self.confirm_callback:
             changes = []
             for p in parsed_list:
@@ -173,7 +190,6 @@ class AutoAuditEngine:
                 self.stats["cancelled"] += 1
                 return
 
-        # ===== 执行实际的 API 修改 =====
         try:
             ok = self.adapter.update_merchant_code(order, parsed_list[0], parsed_list)
             if ok is None:
@@ -183,6 +199,124 @@ class AutoAuditEngine:
                 print(f"  ✅ 修改成功！新编码: {parsed_list[0].shop_mapping_sku}")
                 if len(parsed_list) > 1:
                     print(f"  📦 包含 {len(parsed_list)} 个尺寸，已拆分处理")
+                self.stats["success"] += 1
+            else:
+                print(f"  ❌ 修改失败")
+                self.stats["failed"] += 1
+                self.stats["errors"].append(f"订单 {order.trade_id}: 接口返回失败")
+        except Exception as e:
+            print(f"  ❌ 请求异常: {e}")
+            self.stats["failed"] += 1
+            self.stats["errors"].append(f"订单 {order.trade_id}: {e}")
+
+    def _process_merged_order(self, order, material_map, material_matcher):
+        """
+        处理合并订单：按商品行的 original_tid 分组，每组使用自己的备注单独处理
+        """
+        print(f"  🔄 合并订单，按原始订单号分组处理")
+        
+        # 按 original_tid 分组商品行
+        groups = {}
+        for item in order.items:
+            tid = item.original_tid or order.tid
+            if tid not in groups:
+                groups[tid] = {
+                    'items': [],
+                    'remark': '',
+                }
+            groups[tid]['items'].append(item)
+            # 收集该组的备注（优先使用商品行级别的备注）
+            if item.shop_remark:
+                groups[tid]['remark'] = item.shop_remark
+        
+        # 合并订单中，每个原始订单使用自己的商品行备注
+        # 不回退使用订单级备注，因为订单级备注可能属于另一个原始订单
+        
+        # 处理每个分组
+        all_parsed_list = []
+        all_gifts = []
+        
+        for tid, group in groups.items():
+            group_remark = group['remark']
+            print(f"    原始订单 {tid[:16]}...: 备注='{group_remark[:40]}...'")
+            
+            # 检查跳过关键字
+            skip_reason = None
+            for keyword in _SKIP_KEYWORDS:
+                if keyword in group_remark:
+                    skip_reason = f"包含关键字 '{keyword}'"
+                    break
+            
+            if not group_remark.strip():
+                skip_reason = "备注为空"
+            
+            if skip_reason:
+                print(f"      ⏭️  跳过：{skip_reason}")
+                continue
+            
+            # 解析备注
+            parsed_list = extract_multiple_remarks(
+                group_remark,
+                material_map=material_map,
+                material_matcher=material_matcher,
+            )
+            
+            if not parsed_list:
+                print(f"      ⏭️  跳过：无法解析备注")
+                continue
+            
+            all_parsed_list.extend(parsed_list)
+            
+            # 检查赠品
+            for p in parsed_list:
+                if p.gift_name and p.gift_num > 0:
+                    all_gifts.append((p.gift_name, p.gift_num))
+        
+        if not all_parsed_list:
+            print(f"  ⏭️  跳过：所有分组均无法解析")
+            self.stats["skipped"] += 1
+            return
+        
+        # 输出解析结果
+        parsed = all_parsed_list[0]
+        summary = (
+            f"  ✅ 材质: {parsed.material_code}  "
+            f"|  颜色: {parsed.color_code}  "
+            f"|  尺寸: {parsed.model_code}  "
+            f"|  花型: {parsed.picture_code}"
+        )
+        print(summary)
+        
+        for gift_name, gift_num in all_gifts:
+            print(f"  🎁 赠品: {gift_name} x {gift_num}")
+        
+        if self.dry_run:
+            print()
+            for parsed in all_parsed_list:
+                print(f"  🔶 DRY RUN: 新编码 = {parsed.shop_mapping_sku}")
+            self.stats["success"] += 1
+            return
+        
+        if self.confirm_callback:
+            changes = []
+            for p in all_parsed_list:
+                changes.append(f"新编码: {p.shop_mapping_sku}")
+            for gift_name, gift_num in all_gifts:
+                changes.append(f"赠品: {gift_name} x {gift_num}")
+            
+            should_update = self.confirm_callback(order, all_parsed_list, changes)
+            if not should_update:
+                print(f"  ⏭️  用户取消（未修改）")
+                self.stats["cancelled"] += 1
+                return
+        
+        try:
+            ok = self.adapter.update_merchant_code(order, all_parsed_list[0], all_parsed_list)
+            if ok is None:
+                print(f"  ⏭️  跳过：订单所有商品行已作废")
+                self.stats["skipped"] += 1
+            elif ok:
+                print(f"  ✅ 修改成功！共 {len(all_parsed_list)} 个编码")
                 self.stats["success"] += 1
             else:
                 print(f"  ❌ 修改失败")
