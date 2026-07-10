@@ -23,6 +23,7 @@ class OrderItem:
     merchandise_pic_path: str = ""
     num: int = 1
     price: float = 0
+    is_void: bool = False
     raw: dict = field(default_factory=dict)
 
 

@@ -176,7 +176,10 @@ class AutoAuditEngine:
         # ===== 执行实际的 API 修改 =====
         try:
             ok = self.adapter.update_merchant_code(order, parsed_list[0], parsed_list)
-            if ok:
+            if ok is None:
+                print(f"  ⏭️  跳过：订单所有商品行已作废")
+                self.stats["skipped"] += 1
+            elif ok:
                 print(f"  ✅ 修改成功！新编码: {parsed_list[0].shop_mapping_sku}")
                 if len(parsed_list) > 1:
                     print(f"  📦 包含 {len(parsed_list)} 个尺寸，已拆分处理")

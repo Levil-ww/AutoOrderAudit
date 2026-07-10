@@ -189,10 +189,10 @@ def parse_remark(
     # ERP系统没有"裁剪无图"选项，所以将其映射为"定制尺寸"
     cut_type = ""
     cut_type_text = ""
-    if "裁剪有图" in text:
+    if "裁剪有图" in text or "剪裁有图" in text:
         cut_type = "裁剪有图"
         cut_type_text = "裁剪有图"
-    elif "裁剪无图" in text:
+    elif "裁剪无图" in text or "剪裁无图" in text:
         cut_type = "定制尺寸"
         cut_type_text = "裁剪无图"
 
@@ -206,12 +206,28 @@ def parse_remark(
         # 去掉数量汇总信息（如"共计2张"、"共三张"）
         after_cm = _RE_QTY_SUMMARY.sub("", after_cm).strip()
 
-        # 去掉赠品信息
+        # 去掉赠品信息：找到最早的赠品关键词位置，然后向前找到分隔符
+        # 处理"小垫子总共送3个"这种模式，把"小垫子"也去掉
+        gift_pos = -1
         for kw in _GIFT_KEYWORDS:
             pos = after_cm.find(kw)
             if pos != -1:
-                after_cm = after_cm[:pos].strip()
-                break
+                if gift_pos == -1 or pos < gift_pos:
+                    gift_pos = pos
+        
+        if gift_pos != -1:
+            # 向前找到逗号、分号或数量标记
+            separator_pos = -1
+            for sep in ["，", ",", "；", ";", "-", " "]:
+                pos = after_cm.rfind(sep, 0, gift_pos)
+                if pos > separator_pos:
+                    separator_pos = pos
+            
+            # 从分隔符位置截断，或者从开头截断（如果没有分隔符）
+            if separator_pos != -1:
+                after_cm = after_cm[:separator_pos].strip()
+            else:
+                after_cm = ""
 
         remark_after_size = after_cm.strip().strip(";，,、")
 
@@ -349,6 +365,8 @@ def extract_multiple_remarks(
             parsed.success = True
 
         if parsed.success or (parsed.material_code and parsed.picture_code and has_real_size):
+            if not parsed.material_code:
+                continue
             # trailing_remark（如'裁剪图一张'）只附加到最后一个商品行
             if trailing_remark and idx == len(segments) - 1:
                 clean_remark = _RE_QTY_SUMMARY.sub("", trailing_remark).strip().strip("-;,、，")
@@ -376,6 +394,18 @@ def extract_multiple_remarks(
 
 def _extract_all_sizes(text: str) -> list[tuple[str, str]]:
     """提取文本中所有尺寸对，包括矩形尺寸和圆形尺寸"""
+    # 先找到赠品信息的起始位置，只提取赠品之前的尺寸
+    gift_pos = -1
+    for kw in _GIFT_KEYWORDS:
+        pos = text.find(kw)
+        if pos != -1:
+            if gift_pos == -1 or pos < gift_pos:
+                gift_pos = pos
+    
+    # 如果有赠品信息，只处理赠品之前的文本
+    if gift_pos != -1:
+        text = text[:gift_pos]
+    
     sizes = []
     
     # 提取矩形尺寸
@@ -391,15 +421,27 @@ def _extract_all_sizes(text: str) -> list[tuple[str, str]]:
 
 def _extract_all_sizes_with_position(text: str) -> list[tuple[str, str, int, int]]:
     """提取文本中所有尺寸对，包括位置信息 (w, h, start_pos, end_pos)"""
+    # 先找到赠品信息的起始位置，只提取赠品之前的尺寸
+    gift_pos = -1
+    for kw in _GIFT_KEYWORDS:
+        pos = text.find(kw)
+        if pos != -1:
+            if gift_pos == -1 or pos < gift_pos:
+                gift_pos = pos
+    
     sizes_with_pos = []
     
     # 提取矩形尺寸（带位置）
     for match in _RE_SIZE.finditer(text):
+        if gift_pos != -1 and match.start() >= gift_pos:
+            continue
         w, h = match.groups()
         sizes_with_pos.append((w, h, match.start(), match.end()))
     
     # 提取圆形尺寸（带位置，保留原始前缀格式）
     for match in _RE_ROUND_SIZE.finditer(text):
+        if gift_pos != -1 and match.start() >= gift_pos:
+            continue
         prefix, diameter = match.groups()
         sizes_with_pos.append((diameter, prefix, match.start(), match.end()))
     
@@ -504,10 +546,10 @@ def _parse_multi_size_direct(
     # ERP系统没有"裁剪无图"选项，所以将其映射为"定制尺寸"
     cut_type = ""
     cut_type_text = ""
-    if "裁剪有图" in text:
+    if "裁剪有图" in text or "剪裁有图" in text:
         cut_type = "裁剪有图"
         cut_type_text = "裁剪有图"
-    elif "裁剪无图" in text:
+    elif "裁剪无图" in text or "剪裁无图" in text:
         cut_type = "定制尺寸"
         cut_type_text = "裁剪无图"
 
@@ -522,7 +564,13 @@ def _parse_multi_size_direct(
 
     # 尝试提取材质
     body = text[custom_pos:] if is_custom else text
-    _parse_material(body, ParsedRemark(), material_map, material_matcher)
+    temp_result = ParsedRemark()
+    _parse_material(body, temp_result, material_map, material_matcher)
+    material_code = temp_result.material_code
+    material_source = temp_result.material_source
+
+    if not material_code:
+        return results
 
     # 提取花型（取第一个尺寸前的文本作为基础花型）
     pattern_name = ""
@@ -538,10 +586,6 @@ def _parse_multi_size_direct(
                     break
             pattern_name = before
             break
-
-    material_code = _map_material(body.split(";")[0].strip() if ";" in body else body, material_map)
-    if not material_code:
-        return results
 
     for w, h in sizes:
         actual_size = f"{w}x{h}CM"
@@ -606,18 +650,25 @@ def _parse_material(text, result, material_map, material_matcher=None):
     if material_matcher:
         code, source = material_matcher(text)
         if code:
-            result.material_code = code
-            result.material_source = source
-            _remove_material_remainder(text, code, material_map, result)
-            return
+            if code.startswith("定制"):
+                code = code[2:].strip()
+            if code:
+                result.material_code = code
+                result.material_source = source
+                _remove_material_remainder(text, code, material_map, result)
+                return
 
     # 2. 静态映射表
     for key in sorted(material_map.keys(), key=len, reverse=True):
         if key in text:
-            result.material_code = material_map[key]
-            result.material_source = "static"
-            _remove_material_remainder(text, key, material_map, result)
-            return
+            code = material_map[key]
+            if code.startswith("定制"):
+                code = code[2:].strip()
+            if code:
+                result.material_code = code
+                result.material_source = "static"
+                _remove_material_remainder(text, key, material_map, result)
+                return
 
     # 3. 启发式（含"革"/"格"）
     if "革" in text or "格" in text:
@@ -635,6 +686,10 @@ def _parse_material(text, result, material_map, material_matcher=None):
             else:
                 result.material_code = _map_material(raw, material_map) or raw
                 result.material_source = "heuristic"
+            
+            if result.material_code.startswith("定制"):
+                result.material_code = result.material_code[2:].strip()
+            
             remainder = text.replace(raw, "").strip()
             if remainder and not result.picture_code:
                 result.picture_code = remainder
@@ -805,6 +860,13 @@ def _extract_pattern(text: str, material_map: dict = None) -> str:
     cut_keywords = ["裁剪有图", "剪裁有图"]
     for kw in cut_keywords:
         text = text.replace(kw, "").strip().strip("-;,")
+
+    # 移除赠品信息（在提取花型前）
+    for kw in _GIFT_KEYWORDS:
+        pos = text.find(kw)
+        if pos != -1:
+            text = text[:pos].strip().strip("-;,、，")
+            break
 
     # 检查其他花型关键词
     non_cut_keywords = [kw for kw in _PATTERN_KEYWORDS if kw not in cut_keywords]
@@ -982,7 +1044,7 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
     将备注文本分割为独立的商品段
     
     分割规则：
-    1. 优先按 "-N张，" 或 "-N张," 模式分割（N为数字），这是最明确的记录分隔符
+    1. 优先按 "-N张，"、"N张，" 或 "剪裁有图N张，" 模式分割（N为数字），这是最明确的记录分隔符
     2. 对于每个分割段：
        - 第一个段保留完整的材质和花型信息
        - 后续段如果包含分号，说明有独立花型名
@@ -997,8 +1059,9 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
     segments = []
     trailing_remark = ""
     
-    # 查找所有 "-N张，"、"-N张,"、"-N张 "（空格）的位置（作为分割点）
-    split_pattern = re.compile(r"-\d+[张个件套米](?:[，,；;]|\s)")
+    # 查找所有分割点："-N张，"、"N张，"、"剪裁有图N张，"、"剪裁无图N张，"、"-N张 "（空格）等
+    # 注意：使用非贪婪匹配，避免跨段匹配
+    split_pattern = re.compile(r"(?:-)?\d+[张个件套米](?:[，,；;]|\s+)")
     
     split_positions = []
     for match in split_pattern.finditer(text):
