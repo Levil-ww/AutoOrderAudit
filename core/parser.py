@@ -337,12 +337,12 @@ def extract_multiple_remarks(
             results.append(parsed)
         return results
 
-    # 提取共同的材质信息（从原始文本）
-    material_code, material_source = _extract_material_info(body, material_map, material_matcher)
+    # 为每个商品段独立解析，支持材质和花型继承
+    current_material = ""
+    current_material_source = ""
+    current_pattern = ""
 
-    # 为每个商品段独立解析
     for idx, (segment, qty) in enumerate(segments):
-        # 如果段中没有"定制"关键字，添加前缀以便识别
         if "定制" not in segment and is_custom:
             segment_with_prefix = f"定制{segment}"
         else:
@@ -350,12 +350,24 @@ def extract_multiple_remarks(
 
         parsed = parse_remark(segment_with_prefix, material_map, material_matcher)
 
-        # 强制使用正确的材质
-        if material_code:
-            parsed.material_code = material_code
-            parsed.material_source = material_source
+        # 材质继承逻辑：如果当前段有明确材质，更新current_material；否则继承
+        if parsed.material_code:
+            current_material = parsed.material_code
+            current_material_source = parsed.material_source
+        elif current_material:
+            parsed.material_code = current_material
+            parsed.material_source = current_material_source
 
-        # 使用从分割段中提取的数量
+        # 花型继承逻辑：如果当前段只有尺寸没有花型名，继承前一段的花型
+        if parsed.picture_code and ";" in parsed.picture_code:
+            pattern_part, size_part = parsed.picture_code.split(";", 1)
+            if not pattern_part.strip() and current_pattern:
+                parsed.picture_code = f"{current_pattern};{size_part}"
+            elif pattern_part.strip():
+                current_pattern = pattern_part.strip()
+        elif current_pattern and not parsed.picture_code:
+            parsed.picture_code = current_pattern
+
         parsed.num = qty
 
         has_real_size = False
@@ -1212,34 +1224,28 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
                             else:
                                 trailing_remark = after_comma
         
-        # 为后续段补充花型名（如果没有分号）
-        first_pattern = ""
-        if segments and ";" in segments[0][0]:
-            first_part = segments[0][0].split(";", 1)[0].strip()
-            pattern_candidate = first_part
-            if pattern_candidate.startswith("定制"):
-                pattern_candidate = pattern_candidate[2:].strip()
-            for key in ["双面革", "吸水皮革", "双面格", "镜面皮革", "丝圈", "软玻璃"]:
-                if key in pattern_candidate:
-                    pattern_candidate = pattern_candidate.replace(key, "").strip()
-                    break
-            if pattern_candidate:
-                first_pattern = pattern_candidate
-        
-        # 为后续段补充花型名，并保留尺寸前面的描述
+        # 为后续段补充花型名（如果没有分号），支持花型继承
         processed_segments = []
+        current_pattern = ""
+        
         for i, (seg, qty) in enumerate(segments):
             cleaned_seg = _clean_segment(seg)
             
-            if i == 0:
-                processed_segments.append((cleaned_seg, qty))
-                continue
-            
             if ";" in cleaned_seg:
+                first_part = cleaned_seg.split(";", 1)[0].strip()
+                pattern_candidate = first_part
+                if pattern_candidate.startswith("定制"):
+                    pattern_candidate = pattern_candidate[2:].strip()
+                for key in ["双面革", "吸水皮革", "双面格", "镜面皮革", "丝圈", "软玻璃"]:
+                    if key in pattern_candidate:
+                        pattern_candidate = pattern_candidate.replace(key, "").strip()
+                        break
+                if pattern_candidate:
+                    current_pattern = pattern_candidate
                 processed_segments.append((cleaned_seg, qty))
             else:
-                if first_pattern:
-                    processed_segments.append((f"{first_pattern};{cleaned_seg}", qty))
+                if current_pattern:
+                    processed_segments.append((f"{current_pattern};{cleaned_seg}", qty))
                 else:
                     processed_segments.append((cleaned_seg, qty))
         
