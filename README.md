@@ -16,14 +16,15 @@ AutoOrderAudit/
 ├── adapters/                   ← 🔴 ERP适配器（换系统就换这个文件夹）
 │   └── fangguo/                ← 方果ERP适配器
 │       ├── __init__.py       
-│       ├── config.py           ← 方果的API地址、鉴权信息 - (新增：7天滚动时间范围 + 动态Token)
+│       ├── config.py           ← 方果的API地址、鉴权信息 - (新增：7天滚动时间范围 + 动态Token) -> 增加reload_auth()引用更新最新的动态信息
 │       ├── material_source.py  ← 从方果拉取材质列表做自动匹配
 │       └── adapter.py          ← ErpAdapter 接口实现
 │
-├── auth_manager.py             ← 新增：Token管理（从外置JSON读）
-├── gui.py                      ← 新增：图形界面（客服使用）
+├── auth_client.py              ← 新增：登录API客户端（封装API）
+├── auth_manager.py             ← 新增：Token管理（从外置JSON读） - 增加自动登录功能
+├── gui.py                      ← 新增：图形界面（客服使用） - 增加登录对话框
 ├── run_gui.py                  ← 新增：GUI启动入口
-├── token.json                  ← 新增：外置Token配置文件
+├── token.json                  ← 新增：从外置Token配置文件 -> Token持久化文件
 ├── build.bat                   ← 新增：打包exe脚本
 │ 
 ├── main.py                     ← 入口（选择适配器 + 启动引擎）
