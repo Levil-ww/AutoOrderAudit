@@ -196,8 +196,13 @@ class FangguoAdapter(ErpAdapter):
         # 转换商品列表
         for it in items_raw:
             is_void = it.get("discardStatus") or it.get("cancelStatus") or it.get("isVoid") or False
+            refund_status = it.get("refundStatus") or it.get("refundStatusDesc") or ""
             if isinstance(is_void, int):
                 is_void = is_void != 0
+            if isinstance(refund_status, int):
+                refund_status = refund_status != 0
+            if isinstance(refund_status, str):
+                is_void = is_void or ("已退款" in refund_status)
             
             # 提取商品行级别的备注
             item_remark = self._extract_field(it, [
@@ -276,8 +281,13 @@ class FangguoAdapter(ErpAdapter):
             items = detail.get("orderItems") or detail.get("items") or []
             for it in items:
                     is_void = it.get("discardStatus") or it.get("cancelStatus") or it.get("isVoid") or False
+                    refund_status = it.get("refundStatus") or it.get("refundStatusDesc") or ""
                     if isinstance(is_void, int):
                         is_void = is_void != 0
+                    if isinstance(refund_status, int):
+                        refund_status = refund_status != 0
+                    if isinstance(refund_status, str):
+                        is_void = is_void or ("已退款" in refund_status)
                     
                     item_remark = self._extract_field(it, [
                         "shopRemark", "sellerRemark", "remark",
@@ -350,10 +360,11 @@ class FangguoAdapter(ErpAdapter):
         valid_items = [item for item in order.items if not self._is_gift_item(item) and not item.is_void]
         valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gift_item(item) and not item.is_void]
         
-        # 检查是否所有非赠品行都已作废（只有一个商品行且已作废的情况）
+        # 检查是否存在任何已作废或已退款的非赠品行
         non_gift_items = [item for item in order.items if not self._is_gift_item(item)]
-        if non_gift_items and not valid_items:
-            print(f"  ⏭️  跳过：所有非赠品行都已作废")
+        void_non_gift_items = [item for item in non_gift_items if item.is_void]
+        if void_non_gift_items:
+            print(f"  ⏭️  跳过：存在已作废或已退款的商品行")
             return None
         
         # 检查当前订单是否已经完全正确
