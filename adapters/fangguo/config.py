@@ -69,3 +69,15 @@ MAX_ORDERS = 0       # 0=不限制
 def get_time_range_display() -> str:
     """返回当前时间范围的人类可读文本，供GUI显示"""
     return f"{TIME_BEGIN[:10]} ~ {TIME_END[:10]} (最近7天)"
+
+
+def reload_auth():
+    """
+    重新加载鉴权信息。
+    登录成功后调用此函数，使新Token立即生效。
+    """
+    global AUTHORIZATION, COOKIE_STR, TENANT_ID
+    from auth_manager import get_authorization, get_cookie_str, get_tenant_id
+    AUTHORIZATION = get_authorization()
+    COOKIE_STR = get_cookie_str()
+    TENANT_ID = get_tenant_id()

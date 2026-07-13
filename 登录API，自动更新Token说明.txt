@@ -1,0 +1,225 @@
+2026.7.11
+1. 登录方果API
+     项目	                值
+    请求方式	    POST
+    URL	        https://fangguo.com/fgapp/basic/system/auth/login
+    请求体	    {"username": "手机号", "password": "密码"}
+    成功响应	    {"code": 0, "data": {"accessToken": "...", "tenantId": "...", "mainUsername": "..."}}
+    响应Header	Set-Cookie: JSESSIONID=xxx; Path=/; HttpOnly
+
+2. 后续方果 API 需要三个凭证
+       凭证	                来源	                        用法
+    accessToken	    登录响应体 data.accessToken	    Authorization: Bearer {token}
+    tenantId	    登录响应体 data.tenantId	        tenant-id: {tenantId} 请求头
+    JSESSIONID	    登录响应 Set-Cookie	            Cookie: JSESSIONID={id}
+
+
+3. 修改后的项目结构
+    fangguo_audit/
+        ├── auth_client.py          # 🔥 NEW - 登录API客户端
+        ├── auth_manager.py         # 🔥 MODIFIED - 增加自动登录功能
+        ├── gui.py                  # 🔥 MODIFIED - 增加登录对话框
+        ├── token.json              # Token持久化文件
+        ├── core/
+        │   ├── __init__.py
+        │   ├── adapter_base.py     # 不变
+        │   ├── engine.py           # 不变
+        │   └── parser.py           # 不变
+        └── adapters/fangguo/
+            ├── __init__.py
+            ├── config.py           # 🔥 MODIFIED - 增加reload_auth()
+            ├── adapter.py          # 不变
+            └── material_source.py  # 不变
+
+问题一、使用后发现会拉取不到待整理订单的详情数据
+修复原因：根因：Python 变量绑定陷阱
+    问题的本质在 adapter.py 和 material_source.py 中。
+    登录后的变量传递链路：
+        ① 程序启动 → config.py → AUTHORIZATION = "" (token.json此时为空)
+        ② 程序启动 → adapter.py → from .config import AUTHORIZATION
+                                  → adapter.AUTHORIZATION = ""  ← 复制了空值！
+        ③ 用户登录 → auto_login() → reload_auth()
+                                  → config.AUTHORIZATION = "Bearer xxx..." ✅
+                                  → adapter.AUTHORIZATION 还是 "" ❌ 没人告诉它
+        ④ 点击审单 → FangguoAdapter() → _create_session()
+                                       → 用的是 adapter.AUTHORIZATION（空值）
+                                       → API认证失败 → 返回空数据
+
+    关键问题：from .config import AUTHORIZATION 在导入时复制变量值，后续 reload_auth() 更新了 config 模块的变量，但 adapter/material_source 模块中的变量还是旧值。
+
+修复内容一：我修改了 2 个文件，将 from .config import XXX（复制变量）改为 from . import config as fg_config + fg_config.XXX（模块引用）：
+        文件	                                                            修改方式
+adapters/fangguo/adapter.py	            from . import config as fg_config，所有引用改为 fg_config.AUTHORIZATION / fg_config.COOKIE_STR / fg_config.TENANT_ID 等
+adapters/fangguo/material_source.py	    同上
+
+验证结果：
+    模拟: reload_auth() 更新 config.AUTHORIZATION = "Bearer NEW_TOKEN"
+    → 创建 adapter → adapter._session.headers['authorization'] = "Bearer NEW_TOKEN" ✅
+现在登录后点击「开始审单」，adapter 会读到最新的 Token，查询订单应该能正常返回数据了
+                |
+                |   并不可以，继续修复
+
+当Token无效时，API返回 "code":401,"data":null,"msg":"账号未登录"，adapter 静默吞掉了错误。
+问题出在 auto_login 获取的JSESSIONID可能不对
+解析代码按 ; 分割，Max-Age=1800, JSESSIONID=... 这部分不以 JSESSIONID= 开头，所以JSESSIONID提取失败 → cookie_str="JSESSIONID=" → API认证失败 → 静默返回空数据！
+
+修复内容二：用 resp.cookies.get("JSESSIONID") 直接获取，requests 库自带Cookie解析
+Bug 1（上一轮已修复）：Python import 变量复制
+    from .config import AUTHORIZATION → 复制了初始空值 → reload_auth() 后不更新
+    ✅ 已修复为 from . import config as fg_config + fg_config.AUTHORIZATION
+
+Bug 2（本轮新发现）：JSESSIONID 提取失败
+    resp.headers.get("Set-Cookie") 返回的是两个Cookie合并后的字符串：
+    acw_tc=xxx;path=/;HttpOnly;Max-Age=1800, JSESSIONID=D35D...; Path=/; HttpOnly
+    旧代码按 ; 分割后逐段查找 startswith("JSESSIONID=")：
+结果：JSESSIONID 提取为空 → cookie_str="JSESSIONID=" → 查询API返回 "账号未登录" → 静默返回0条数据
+
+    ✅ 修复方案：改用 resp.cookies.get("JSESSIONID")，requests 库自带Cookie解析引擎，正确处理多个Set-Cookie头
+    额外改进
+        在 adapter.py 的 query_orders() 中增加了API错误日志输出，如果API返回错误码，日志会直接显示原因，方便排查：
+                            |   没有响应，也不显示错误的日志输出
+                            |
+                            |   新bug -> 不同账号登录不成功，只读取原有的登录账号？？
+
+基于不同账号登录都是默认的旧账号进行修复：
+之前程序保存了API返回的 mainUsername，所以显示的一直是主账号。
+
+
+2026.7.13
+修复内容三：已修复 -- 改了 auth_manager.py 第169行：
+            修改前	                             修改后
+    username=result.main_username	username=username（保存你实际输入的账号）
+现在 token.json 中保存的 username 会是你在登录框里输入的号码（18268607612），而不是 API 返回的主账号。
+
+另外，日志中会额外显示：🔍 新Token信息: tenant=3005247, user=18268607612 (API返回mainUsername=18867616178)
+                                    |
+                                    | 还是不对
+       发现是因为登录方果系统后存在两个子系统（工厂端 / 店铺端），登录后默认进入工厂端，因此找不到订单
+
+关键的切换API：
+GET /user/system/permission/get-permission-info → 获取用户信息，包含可用的tenants列表
+POST /user/system/auth/login/tenant → 登录到指定tenant上下文
+    - **工厂端** has tenant_id=3005247, type=2, isDefault=true
+    - **店铺端** has tenant_id=5068663, type=1, isDefault=false
+ 登录API返回的是工厂端的tenant_id（因为是默认），但待整理订单在店铺端。之前一直用工厂端的tenant_id查订单，当然查不到
+
+修复内容四：
+         文件	                                                改动
+    auth_client.py	    新增 get_shop_tenant() 函数，调用 /user/system/permission/get-permission-info 获取用户的所有tenants，找到 type=1（店铺端）的 tenant_id
+    auth_manager.py	    auto_login() 登录成功后，自动调用 get_shop_tenant() 找到店铺端tenant_id，切换保存到 token.json
+
+自动切换流程
+    1. 登录API → 返回 tenant_id=3005247（工厂端，默认）
+    2. 程序自动调用 get_shop_tenant()
+       → 找到 tenant_id=5068663（店铺端）✅
+    3. 保存店铺端 tenant_id 到 token.json
+    4. 开始审单 → 用店铺端 tenant_id 查询 → 查到订单！
+                       |
+                       |    仍然查询不到订单
+    经检验：样本Token确实能查到数据，说明问题不在headers上。关键区别是——登录方式不同。浏览器网页登录后还有一步「登录到指定tenant」，而我直接用基础登录的Token可能权限不够。
+                        |
+    基础登录后，网页还会自动调用login/tenant API 来获取指定tenant上下文的Token，而我们的代码跳过了这一步！
+
+修复内容五： 在 auth_client.py 中，基础登录成功后再调用 login/tenant 获取店铺端Token：
+    现在 login() 函数已经自动完成两步登录，无需额外的 get_shop_tenant 调用了。
+
+✅ 完整流程验证通过！
+    基础登录 → 获取初始Token
+    login/tenant → 获取店铺端Token
+    用新Token查订单 → 10条数据！
+
+找到并修复了最终的根因 --- 有问题的三步走 vs 正确的三步走
+    ❌ 之前（客户只走了两步）：
+       1. POST /basic/system/auth/login  → 得到工厂端Token
+       2. 直接查订单 → ❌ 没有数据（Token没有店铺端权限）
+
+    ✅ 现在（自动走三步）：
+       1. POST /basic/system/auth/login  → 得到初始Token
+       2. POST /user/system/auth/login/tenant  → 得到店铺端Token 🔑【新增】
+       3. 用店铺端Token查订单 → ✅ 查到数据！
+
+修改的具体内容：
+        文件	                                                改动
+    auth_client.py	login() 函数登录成功后，自动追加调用 login/tenant API，获取店铺端上下文的访问令牌。新增 _do_tenant_login() 函数
+
+现在登录流程完全自动化了：
+    输入账号密码→基础登录→自动获取店铺端Token→保存→刷新配置→查订单
+                         |
+                         |  仍是查询不到订单数据的状态
+
+    关键发现！login/tenant 返回了 tenant=3005247（工厂端），但我们需要店铺端
+       ——> login/tenant 传 tenantId 参数可以指定登录到哪个tenant。修改登录流程——先用基本信息查到店铺端tenant_id，再传入 login/tenant API。
+
+    根本原因
+        login/tenant API 传空body时只返回默认tenant（工厂端 3005247）的Token，即使 tenant-id header 设成店铺端，Token本身没有店铺端权限，API就返回空数据。
+
+    修复后的完整流程：
+        1. 基础登录 → 初始Token
+        2. 调用 get-permission-info → 找到店铺端 tenant_id=5068663
+        3. 调用 login/tenant 传入 tenantId=5068663 → 拿到店铺端Token 🎯
+        4. 用店铺端Token查订单 → ✅ 查到数据
+
+修改内容六：
+        文件	                                                改动
+    auth_client.py	    新增 _find_shop_tenant() 查找店铺端tenant_id；_do_tenant_login() 增加 target_tenant_id 参数，登录时传入店铺端tenant_id
+    auth_manager.py	    移除冗余的 get_shop_tenant 调用（已整合到 login() 内部）
+                                    |
+                                    |   还是查询不到订单信息
+                        发现传了 tenantId=5068663 但API忽略了这个参数
+
+也就是说：即使传了 tenantId=5068663，对auto-login Token仍返回工厂端。说明 login/tenant 不接受这个参数来切换tenant。
+                                           |
+                                           |    找网页上"切换"按钮实际调用的API：
+                发现 _do_tenant_login 的请求里少了 tenant-id 请求头
+重新操作：
+    1.退出登录 → 重新登录
+    2.看日志中 login/tenant 的结果
+    3.开始审单
+        🔍 找到店铺端: tenant_id=5068663
+        🔑 login/tenant 获取新Token成功: tenant=5068663  ← 之前是3005247，这次应该是5068663
+
+
+
+2026.7.13
+实现一键登录，自动管理更新Token
+1. 新建 auth_client.py
+封装方果ERP登录API，核心功能：
+    - login(username, password) - 调用方果登录接口获取Token
+    - _find_shop_tenant() - 自动查找店铺端tenant_id（方果有工厂端和店铺端两个子系统）
+    - _do_tenant_login() - 二次登录获取店铺端Token
+    - verify_token() - 验证Token有效性
+
+2. 修改 auth_manager.py
+扩展Token管理模块，新增：
+    - auto_login() - 一键登录并自动保存Token到token.json
+    - register_auth_callback() / unregister_auth_callback() - 登录状态变化回调机制
+    - reset_auth() - 退出登录，清除Token
+    - is_logged_in() - 检查是否已登录
+    - AuthInfo.update() - 支持用另一个AuthInfo更新自身
+    - 新增 username 字段记录登录账号
+
+3. 修改 adapters/fangguo/config.py
+新增 reload_auth() 函数，登录成功后调用使新Token立即生效。
+
+4. 修改 gui.py
+添加完整的登录界面功能：
+    - LoginDialog 类 - 登录对话框（输入手机号和密码）
+    - _open_login() - 打开登录对话框
+    - _logout() - 退出登录按钮
+    - _check_login_on_startup() - 启动时检查登录状态
+    - 替换「Token」按钮为「登录」按钮
+    - 添加「退出登录」按钮
+    - 更新状态卡片显示为「登录状态」
+
+登录还是存在找不到账号的数据问题，发现是程序在导入时使用的是将变量复制到本地，登录后调用reload_auth() 更新 config 模块的全局变量，但 adapter/material_source 中使用的仍然是旧值！
+    正确的应该是使用模块引用，每次访问都是读取动态的config模块的最新值。
+修复内容一：
+    1. 修改 adapter.py
+        - 将直接导入改为 from . import config as fg_config
+        - 将所有 AUTHORIZATION , COOKIE_STR , TENANT_ID , API_QUERY_ORDER , API_SAVE_PRODUCT , API_ORDER_DETAIL , MATERIAL_MAP 改为 fg_config.xxx
+        - 添加调试日志，打印当前使用的认证信息
+    2. 修改 material_source.py
+        - 将直接导入改为 from . import config as fg_config
+        - 将所有 AUTHORIZATION , COOKIE_STR , TENANT_ID , API_MATERIAL_LIST 改为 fg_config.xxx
+
+总结： -- 现在一键登录功能可以正常工作了：登录后调用 reload_auth() 更新 config 模块的全局变量，adapter 和 material_source 通过模块引用动态获取最新的认证信息。

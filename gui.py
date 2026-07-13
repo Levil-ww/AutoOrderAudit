@@ -16,8 +16,15 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from auth_manager import get_auth_status, load_auth, TOKEN_FILE
-from adapters.fangguo.config import DRY_RUN, MAX_ORDERS, PAGE_SIZE, QUERY_STATUS, get_time_range_display
+from auth_manager import (
+    get_auth_status, load_auth, save_auth, AuthInfo,
+    TOKEN_FILE, auto_login, register_auth_callback,
+    unregister_auth_callback, is_logged_in,
+)
+from adapters.fangguo.config import (
+    DRY_RUN, MAX_ORDERS, PAGE_SIZE, QUERY_STATUS,
+    get_time_range_display, reload_auth,
+)
 
 
 # ================================================================
@@ -44,6 +51,148 @@ COLORS = {
 
 FONT = "Microsoft YaHei"
 FONT_MONO = "Consolas"
+
+
+class LoginDialog:
+    """登录对话框"""
+
+    def __init__(self, parent, on_success=None):
+        """
+        Args:
+            parent: 父窗口
+            on_success: 登录成功回调，签名 on_success(auth: AuthInfo)
+        """
+        self.parent = parent
+        self.on_success = on_success
+        self.result = None
+
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("登录方果ERP")
+        self.dialog.geometry("400x320")
+        self.dialog.resizable(False, False)
+        self.dialog.configure(bg=COLORS["card_bg"])
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+
+        self._center()
+        self._build_ui()
+
+    def _center(self):
+        self.dialog.update_idletasks()
+        pw = self.parent.winfo_width()
+        ph = self.parent.winfo_height()
+        px = self.parent.winfo_x()
+        py = self.parent.winfo_y()
+        w, h = 400, 320
+        x = px + (pw - w) // 2
+        y = py + (ph - h) // 2
+        self.dialog.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _build_ui(self):
+        container = tk.Frame(self.dialog, bg=COLORS["card_bg"], padx=30, pady=20)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(
+            container, text="🔐 登录方果ERP",
+            font=(FONT, 16, "bold"),
+            bg=COLORS["card_bg"], fg=COLORS["header_fg"],
+        ).pack(anchor="w", pady=(0, 20))
+
+        tk.Label(
+            container, text="手机号",
+            font=(FONT, 10), bg=COLORS["card_bg"], fg=COLORS["label_fg"],
+        ).pack(anchor="w")
+        self.username_var = tk.StringVar()
+        tk.Entry(
+            container, textvariable=self.username_var,
+            font=(FONT, 12), bg="#f9fafb",
+            relief=tk.SOLID, bd=1,
+        ).pack(fill=tk.X, pady=(4, 14), ipady=4)
+
+        tk.Label(
+            container, text="密码",
+            font=(FONT, 10), bg=COLORS["card_bg"], fg=COLORS["label_fg"],
+        ).pack(anchor="w")
+        self.password_var = tk.StringVar()
+        password_entry = tk.Entry(
+            container, textvariable=self.password_var,
+            font=(FONT, 12), bg="#f9fafb",
+            show="*", relief=tk.SOLID, bd=1,
+        )
+        password_entry.pack(fill=tk.X, pady=(4, 20), ipady=4)
+        password_entry.bind("<Return>", lambda e: self._do_login())
+
+        self.status_label = tk.Label(
+            container, text="",
+            font=(FONT, 10), bg=COLORS["card_bg"], fg=COLORS["danger"],
+        )
+        self.status_label.pack(anchor="w")
+
+        btn_frame = tk.Frame(container, bg=COLORS["card_bg"])
+        btn_frame.pack(fill=tk.X)
+
+        self.login_btn = tk.Button(
+            btn_frame, text="登 录", font=(FONT, 12, "bold"),
+            bg=COLORS["accent"], fg="#ffffff",
+            padx=24, pady=8, relief=tk.FLAT, bd=0,
+            cursor="hand2", command=self._do_login,
+        )
+        self.login_btn.pack(side=tk.RIGHT)
+
+        tk.Button(
+            btn_frame, text="取消", font=(FONT, 12),
+            bg=COLORS["card_bg"], fg=COLORS["label_fg"],
+            padx=16, pady=8, relief=tk.FLAT, bd=0,
+            cursor="hand2", command=self.dialog.destroy,
+        ).pack(side=tk.RIGHT, padx=(0, 10))
+
+    def _do_login(self):
+        username = self.username_var.get().strip()
+        password = self.password_var.get()
+        print(f"🔍 登录对话框提交: username=\"{username}\"")
+
+        if not username:
+            self.status_label.config(text="请输入手机号")
+            return
+        if not password:
+            self.status_label.config(text="请输入密码")
+            return
+
+        self.login_btn.config(state=tk.DISABLED, text="登录中...", bg="#9ca3af")
+        self.status_label.config(text="正在登录...", fg=COLORS["info"])
+        self.dialog.update()
+
+        def _do():
+            try:
+                result = auto_login(username, password)
+                self.dialog.after(0, self._login_callback, result)
+            except Exception as e:
+                self.dialog.after(0, self._error_callback, str(e))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _login_callback(self, result):
+        self.login_btn.config(state=tk.NORMAL, text="登 录", bg=COLORS["accent"])
+
+        if result.success:
+            self.status_label.config(
+                text=f"✅ {result.msg}（{result.main_username}）",
+                fg=COLORS["success"],
+            )
+            self.dialog.update()
+            self.dialog.after(800, self._close_success)
+        else:
+            self.status_label.config(text=f"❌ {result.msg}", fg=COLORS["danger"])
+
+    def _error_callback(self, error_msg):
+        self.login_btn.config(state=tk.NORMAL, text="登 录", bg=COLORS["accent"])
+        self.status_label.config(text=f"❌ 登录异常: {error_msg}", fg=COLORS["danger"])
+
+    def _close_success(self):
+        auth = load_auth()
+        self.dialog.destroy()
+        if self.on_success:
+            self.on_success(auth)
 
 
 class TextRedirector(io.StringIO):
@@ -96,11 +245,10 @@ class AutoAuditGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("方果ERP · 自动审单工具")
-        self.root.geometry("820x680")
+        self.root.geometry("820x720")
         self.root.resizable(True, True)
         self.root.configure(bg=COLORS["bg"])
         self._running = False
-        # 批量确认决策缓存：None=未决定，True=全部确定，False=全部取消
         self._batch_confirm_decision = None
 
         self._center_window()
@@ -108,14 +256,18 @@ class AutoAuditGUI:
         self._build_layout()
         self._refresh_status()
 
+        register_auth_callback(self._on_auth_changed)
+
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self.root.after(500, self._check_login_on_startup)
 
     # ------------------------------------------------------------
     #  窗口
     # ------------------------------------------------------------
     def _center_window(self):
         self.root.update_idletasks()
-        w, h = 820, 680
+        w, h = 820, 720
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
         self.root.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
@@ -173,7 +325,7 @@ class AutoAuditGUI:
         mode_fg = COLORS["warning"] if DRY_RUN else COLORS["success"]
         self._make_badge(badge_frame, mode_text, mode_bg, mode_fg).pack(side=tk.RIGHT, padx=(6, 0))
 
-        self._make_badge(badge_frame, "v1.1", COLORS["info_bg"], COLORS["info"]).pack(side=tk.RIGHT)
+        self._make_badge(badge_frame, "v2.0", COLORS["info_bg"], COLORS["info"]).pack(side=tk.RIGHT)
 
     def _make_badge(self, parent, text, bg, fg):
         return tk.Label(
@@ -190,7 +342,7 @@ class AutoAuditGUI:
 
         # 三张卡片并排
         self._card_token = self._make_status_card(
-            frame, "🔐 鉴权状态", "检查中...", 0
+            frame, "🔐 登录状态", "检查中...", 0
         )
         self._card_time = self._make_status_card(
             frame, "📅 审单范围", get_time_range_display(), 1
@@ -277,8 +429,8 @@ class AutoAuditGUI:
 
         # 初始信息
         print(f"🟢 自动审单工具已启动 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print("📌 点击下方「开始审单」即可运行")
-        print("📌 Token到期请联系技术人员更新 token.json\n")
+        print("📌 点击下方「登录」按钮，输入手机号密码即可开始使用")
+        print("📌 点击「开始审单」自动处理待整理订单\n")
 
     # ------------------------------------------------------------
     #  底部按钮
@@ -303,8 +455,13 @@ class AutoAuditGUI:
         ).pack(side=tk.LEFT, padx=(0, 8))
 
         self._make_button(
-            btn_group, "📂 Token", COLORS["warning"], "#ffffff",
-            self._open_token_file, 10,
+            btn_group, "� 登录", COLORS["accent"], "#ffffff",
+            self._open_login, 10,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        self._make_button(
+            btn_group, "🚪 退出登录", COLORS["danger"], "#ffffff",
+            self._logout, 10,
         ).pack(side=tk.LEFT, padx=(0, 8))
 
         self._make_button(
@@ -329,6 +486,71 @@ class AutoAuditGUI:
         )
 
     # ------------------------------------------------------------
+    #  登录相关
+    # ------------------------------------------------------------
+    def _check_login_on_startup(self):
+        """启动时检查登录状态"""
+        auth = load_auth()
+        if not auth.authorization:
+            print("🔐 检测到未登录，请点击「登录」按钮输入账号密码")
+        elif not auth.is_valid:
+            print(f"⚠️ Token已过期（{auth.expires_at}），请重新登录")
+        else:
+            print(f"✅ Token有效（{auth.username or ''}，剩余{auth.remaining_days}天）")
+
+    def _open_login(self):
+        """打开登录对话框"""
+        LoginDialog(self.root, on_success=self._on_login_success)
+
+    def _on_login_success(self, auth: AuthInfo):
+        """登录成功后回调"""
+        from adapters.fangguo import config as fg_config
+        print(f"🔍 登录前 config.TENANT_ID = {fg_config.TENANT_ID}")
+        print(f"🔍 登录前 config.AUTHORIZATION 前缀 = {fg_config.AUTHORIZATION[:20] if fg_config.AUTHORIZATION else '空'}")
+
+        from auth_manager import TOKEN_FILE
+        try:
+            with open(TOKEN_FILE, "r", encoding="utf-8") as _f:
+                _raw = _f.read()
+            print(f"🔍 当前 token.json 内容:\n{_raw}")
+        except Exception as _e:
+            print(f"⚠️ 读 token.json 失败: {_e}")
+
+        try:
+            reload_auth()
+            print(f"🔍 登录后 config.TENANT_ID = {fg_config.TENANT_ID}")
+            print(f"🔍 登录后 config.AUTHORIZATION 前缀 = {fg_config.AUTHORIZATION[:20] if fg_config.AUTHORIZATION else '空'}")
+        except Exception as e:
+            print(f"⚠️ reload_auth() 失败: {e}")
+        self._refresh_status()
+        print(f"✅ 登录成功！欢迎 {auth.username or ''}")
+        print(f"🔐 Token有效期至 {auth.expires_at}（剩余{auth.remaining_days}天）")
+        print("💡 现在可以开始审单了")
+        if not self._running:
+            self.start_btn.config(state=tk.NORMAL, bg=COLORS["success"])
+
+    def _on_auth_changed(self, auth: AuthInfo):
+        """鉴权信息变化回调（来自auth_manager的通知）"""
+        self._refresh_status()
+
+    def _logout(self):
+        """退出登录，清除Token"""
+        if not load_auth().authorization:
+            return
+        if not messagebox.askyesno("确认退出", "确定要退出登录吗？退出后需重新登录才能使用。"):
+            return
+
+        from auth_manager import reset_auth
+        reset_auth()
+        try:
+            reload_auth()
+        except Exception:
+            pass
+        self._refresh_status()
+        print("🔐 已退出登录")
+        print("📌 下次使用时点击「登录」按钮重新登录")
+
+    # ------------------------------------------------------------
     #  操作
     # ------------------------------------------------------------
     def _refresh_status(self):
@@ -336,9 +558,9 @@ class AutoAuditGUI:
         status = auth.status_text
         self._card_token.config(text=status)
 
-        if "有效" in status and "即将" not in status:
+        if "✅" in status:
             self._card_token.config(fg=COLORS["success"])
-        elif "即将" in status:
+        elif "⚠️" in status:
             self._card_token.config(fg=COLORS["warning"])
         else:
             self._card_token.config(fg=COLORS["danger"])
@@ -414,15 +636,16 @@ class AutoAuditGUI:
 
         auth = load_auth()
         if not auth.authorization:
-            messagebox.showerror("鉴权失败", "❌ 未检测到有效Token！\n\n请联系技术人员更新 token.json")
+            messagebox.showerror("未登录", "❌ 请先点击「登录」按钮输入账号密码！")
             return
         if not auth.is_valid:
             ret = messagebox.askyesno(
                 "Token已过期",
-                f"⚠️ Token已过期（{auth.expires_at}），仍要尝试吗？"
+                f"⚠️ Token已过期（{auth.expires_at}），是否重新登录？"
             )
-            if not ret:
-                return
+            if ret:
+                self._open_login()
+            return
 
         self._running = True
         self._batch_confirm_decision = None  # 重置批量确认决策
@@ -432,6 +655,7 @@ class AutoAuditGUI:
         print("\n" + "━" * 60)
         print(f"🚀 开始自动审单 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"📅 时间范围: {get_time_range_display()}")
+        print(f"👤 当前用户: {auth.username or 'Unknown'}")
         print("━" * 60 + "\n")
 
         threading.Thread(target=self._run_audit, daemon=True).start()
@@ -480,6 +704,10 @@ class AutoAuditGUI:
         if self._running:
             if not messagebox.askyesno("确认退出", "审单正在运行，确定退出吗？"):
                 return
+        try:
+            unregister_auth_callback(self._on_auth_changed)
+        except Exception:
+            pass
         sys.stdout = sys.__stdout__
         self.root.destroy()
 

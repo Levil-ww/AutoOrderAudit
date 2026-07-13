@@ -1,19 +1,29 @@
 """
 Token管理模块
 =============
-从外置 token.json 读取鉴权信息，支持：
-1. 技术人员更新token.json即可，客服无需改代码
-2. 自动检测Token是否过期
-3. 过期前提醒剩余天数
+支持两种模式：
+1. 自动登录：客服输入账号密码，程序自动获取Token（推荐）
+2. 手动配置：技术人员更新token.json，客服直接使用
+
+功能：
+- 自动检测Token是否过期
+- 过期前提醒剩余天数
+- 自动登录并保存Token
 """
 
 import json
 import os
-from datetime import datetime, date
+import threading
+from datetime import datetime, date, timedelta
 from typing import Optional
 
+from auth_client import login as api_login, LoginResult
 
-TOKEN_FILE = os.path.join(os.path.dirname(__file__), "token.json")
+
+TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.json")
+
+_login_callbacks: list = []
+_lock = threading.Lock()
 
 
 class AuthInfo:
@@ -23,14 +33,16 @@ class AuthInfo:
         authorization: str = "",
         cookie_str: str = "",
         tenant_id: str = "",
-        expires_at: str = "",  # "2026-07-14"
+        expires_at: str = "",
         note: str = "",
+        username: str = "",
     ):
         self.authorization = authorization
         self.cookie_str = cookie_str
         self.tenant_id = tenant_id
         self.expires_at = expires_at
         self.note = note
+        self.username = username
 
     @property
     def is_valid(self) -> bool:
@@ -59,13 +71,29 @@ class AuthInfo:
     def status_text(self) -> str:
         """人类可读的状态文本"""
         if not self.authorization:
-            return "❌ 未配置Token"
+            return "❌ 未登录（请点击「登录」按钮）"
         if not self.is_valid:
-            return f"❌ Token已过期（{self.expires_at}）"
+            return f"❌ Token已过期（{self.expires_at}），请重新登录"
         days = self.remaining_days
         if days <= 1:
-            return f"⚠️ Token即将过期（剩余{days}天），请找技术人员更新"
-        return f"✅ Token有效（剩余{days}天，到期{self.expires_at}）"
+            return f"⚠️ Token即将过期（剩余{days}天），请重新登录"
+        user = f" ({self.username})" if self.username else ""
+        return f"✅ 已登录{user}（剩余{days}天）"
+
+    def update(self, other: "AuthInfo"):
+        """用另一个 AuthInfo 更新自身"""
+        if other.authorization:
+            self.authorization = other.authorization
+        if other.cookie_str:
+            self.cookie_str = other.cookie_str
+        if other.tenant_id:
+            self.tenant_id = other.tenant_id
+        if other.expires_at:
+            self.expires_at = other.expires_at
+        if other.note:
+            self.note = other.note
+        if other.username:
+            self.username = other.username
 
 
 def load_auth() -> AuthInfo:
@@ -86,13 +114,14 @@ def load_auth() -> AuthInfo:
             tenant_id=data.get("tenant_id", ""),
             expires_at=data.get("expires_at", ""),
             note=data.get("note", ""),
+            username=data.get("username", ""),
         )
     except (json.JSONDecodeError, IOError):
         return AuthInfo()
 
 
 def save_auth(auth: AuthInfo) -> bool:
-    """保存鉴权信息到 token.json（给技术人员用的写工具）"""
+    """保存鉴权信息到 token.json"""
     try:
         data = {
             "authorization": auth.authorization,
@@ -100,17 +129,91 @@ def save_auth(auth: AuthInfo) -> bool:
             "tenant_id": auth.tenant_id,
             "expires_at": auth.expires_at,
             "note": auth.note,
-            "_tips": "===== 技术人员修改此文件 =====",
-            "_how_to": "1. 登录方果ERP → F12 → Application → 复制Token/Cookie",
-            "_how_to2": "2. 更新下方 authorization 和 cookie_str 的值",
-            "_how_to3": "3. expires_at 设为Token到期日期（格式：2026-07-14）",
-            "_how_to4": "4. 保存后发给客服覆盖即可",
+            "username": auth.username,
+            "_tips": "===== 此文件由程序自动管理，无需手动修改 =====",
+            "_how_to": "如需手动更新，请使用程序内的「登录」功能",
         }
         with open(TOKEN_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         return True
     except IOError:
         return False
+
+
+def auto_login(username: str, password: str) -> LoginResult:
+    """
+    自动登录方果ERP并保存Token到 token.json。
+
+    Args:
+        username: 方果账号（手机号）
+        password: 登录密码
+
+    Returns:
+        LoginResult 对象
+    """
+    print(f"🔍 TOKEN_FILE 路径 = {TOKEN_FILE}")
+    result = api_login(username, password)
+
+    if result.success:
+        auth = AuthInfo(
+            authorization=f"Bearer {result.access_token}",
+            cookie_str=f"JSESSIONID={result.jsessionid}",
+            tenant_id=str(result.tenant_id),
+            expires_at=_compute_expires_at(result),
+            username=username,
+        )
+
+        print(f"🔍 新Token信息: tenant={auth.tenant_id}, user={auth.username} (API返回mainUsername={result.main_username})")
+        print(f"🔍 新Token前缀: {auth.authorization[:25]}...")
+        saved = save_auth(auth)
+        print(f"🔍 save_auth() 返回值 = {saved} {'✅' if saved else '❌ 写入失败！'}")
+
+        try:
+            from adapters.fangguo.config import reload_auth
+            reload_auth()
+        except ImportError:
+            pass
+
+        _notify_login_callbacks(auth)
+
+    return result
+
+
+def _compute_expires_at(result: LoginResult) -> str:
+    """根据登录结果计算过期日期（默认7天后）"""
+    return (date.today() + timedelta(days=7)).strftime("%Y-%m-%d")
+
+
+def _notify_login_callbacks(auth: AuthInfo):
+    """通知所有登录状态变化回调"""
+    for cb in _login_callbacks:
+        try:
+            cb(auth)
+        except Exception:
+            pass
+
+
+def register_auth_callback(callback) -> None:
+    """
+    注册鉴权状态变化回调。
+    当Token更新（登录/刷新）时会被调用。
+    回调签名: callback(auth: AuthInfo)
+    """
+    _login_callbacks.append(callback)
+
+
+def unregister_auth_callback(callback) -> None:
+    """取消注册鉴权状态变化回调"""
+    if callback in _login_callbacks:
+        _login_callbacks.remove(callback)
+
+
+def reset_auth() -> bool:
+    """
+    重置鉴权信息（清除Token）。
+    用于退出登录。
+    """
+    return save_auth(AuthInfo())
 
 
 def create_token_template():
@@ -146,6 +249,12 @@ def get_cookie_str() -> str:
 
 def get_tenant_id() -> str:
     return load_auth().tenant_id
+
+
+def is_logged_in() -> bool:
+    """检查是否已登录（有有效Token）"""
+    auth = load_auth()
+    return bool(auth.authorization) and auth.is_valid
 
 
 if __name__ == "__main__":

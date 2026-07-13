@@ -14,11 +14,7 @@ from urllib3.util.retry import Retry
 
 from core import ErpAdapter, Order, OrderItem, ParsedRemark, parse_remark
 from core.parser import extract_multiple_remarks
-from .config import (
-    API_QUERY_ORDER, API_SAVE_PRODUCT, API_ORDER_DETAIL,
-    AUTHORIZATION, COOKIE_STR, TENANT_ID,
-    MATERIAL_MAP,
-)
+from . import config as fg_config
 from .material_source import get_material_source
 
 
@@ -28,7 +24,7 @@ class FangguoAdapter(ErpAdapter):
     def __init__(self):
         self._session = self._create_session()
         self._material_source = get_material_source()
-        self.material_map = MATERIAL_MAP
+        self.material_map = fg_config.MATERIAL_MAP
 
     def get_adapter_name(self) -> str:
         return "方果ERP"
@@ -41,15 +37,21 @@ class FangguoAdapter(ErpAdapter):
         session = requests.Session()
         retry = Retry(total=3, backoff_factor=1, allowed_methods={"POST"})
         session.mount("https://", HTTPAdapter(max_retries=retry))
+
+        _t = fg_config.TENANT_ID or "(空)"
+        _a = fg_config.AUTHORIZATION[:25] + "..." if fg_config.AUTHORIZATION else "(空)"
+        _c = fg_config.COOKIE_STR[:25] + "..." if fg_config.COOKIE_STR else "(空)"
+        print(f"  🔍 Session使用: tenant={_t}, auth={_a}, cookie={_c}")
+
         session.headers.update({
             "accept": "application/json, text/plain, */*",
-            "authorization": AUTHORIZATION,
+            "authorization": fg_config.AUTHORIZATION,
             "content-type": "application/json",
-            "cookie": COOKIE_STR,
+            "cookie": fg_config.COOKIE_STR,
             "from-client": "0",
             "origin": "https://fangguo.com",
             "referer": "https://fangguo.com/business/order",
-            "tenant-id": TENANT_ID,
+            "tenant-id": fg_config.TENANT_ID,
             "x-timezone-offset": "Asia/Shanghai",
         })
         return session
@@ -134,7 +136,7 @@ class FangguoAdapter(ErpAdapter):
             "firstPrintStatus": [],
             "lastSyncStatus": [],
         }
-        resp = self._session.post(API_QUERY_ORDER, json=payload, timeout=30)
+        resp = self._session.post(fg_config.API_QUERY_ORDER, json=payload, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         raw_orders = self._parse_order_list(data)
@@ -242,7 +244,7 @@ class FangguoAdapter(ErpAdapter):
             "pageSize": 100,
             "total": 1,
         }
-        resp = self._session.post(API_ORDER_DETAIL, json=payload, timeout=30)
+        resp = self._session.post(fg_config.API_ORDER_DETAIL, json=payload, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         d = data.get("data")
@@ -558,7 +560,7 @@ class FangguoAdapter(ErpAdapter):
         except:
             pass
 
-        resp = self._session.post(API_SAVE_PRODUCT, json=payload, timeout=30)
+        resp = self._session.post(fg_config.API_SAVE_PRODUCT, json=payload, timeout=30)
         resp.raise_for_status()
         result = resp.json()
 

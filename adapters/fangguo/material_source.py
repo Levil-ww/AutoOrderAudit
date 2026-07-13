@@ -9,7 +9,7 @@ from typing import Optional
 
 import requests
 
-from .config import API_MATERIAL_LIST, AUTHORIZATION, COOKIE_STR, TENANT_ID
+from . import config as fg_config
 
 
 class FangguoMaterialSource:
@@ -28,14 +28,14 @@ class FangguoMaterialSource:
 
         headers = {
             "accept": "application/json, text/plain, */*",
-            "authorization": AUTHORIZATION,
+            "authorization": fg_config.AUTHORIZATION,
             "content-type": "application/json",
-            "cookie": COOKIE_STR,
-            "tenant-id": TENANT_ID,
+            "cookie": fg_config.COOKIE_STR,
+            "tenant-id": fg_config.TENANT_ID,
         }
         try:
             resp = requests.post(
-                API_MATERIAL_LIST, json={"factoryId": 0, "needAll": 1},
+                fg_config.API_MATERIAL_LIST, json={"factoryId": 0, "needAll": 1},
                 headers=headers, timeout=15,
             )
             resp.raise_for_status()
