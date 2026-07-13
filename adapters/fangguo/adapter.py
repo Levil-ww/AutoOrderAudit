@@ -323,13 +323,26 @@ class FangguoAdapter(ErpAdapter):
         2. 如果部分商品行已作废，跳过作废行，使用有效行进行修改
         3. 如果有效行数不足，创建新商品行
         """
+        # 检测是否为合并订单（解析结果带有 original_tid）
+        is_merged_order = any(p.original_tid for p in (parsed_list or []))
+        
+        # 合并订单跳过 _split_parsed_by_sizes，因为解析结果已经按分组处理过了
         if parsed_list and len(parsed_list) > 1:
             effective_list = parsed_list
-        else:
+        elif not is_merged_order:
             effective_list = self._split_parsed_by_sizes(order, parsed)
+        else:
+            effective_list = parsed_list or [parsed]
 
         # 获取期望的商品编码集合
         expected_skus_set = {p.shop_mapping_sku for p in effective_list}
+        
+        # 调试日志：打印每个商品行的信息
+        print(f"  📋 商品行详情 ({len(order.items)} 行):")
+        for idx, item in enumerate(order.items):
+            is_gift = self._is_gift_item(item)
+            film_gift_code = item.raw.get('filmGiftCode', '') if item.raw else ''
+            print(f"    [{idx}] id={item.id[:10]}..., title={item.title[:30]}..., is_void={item.is_void}, is_gift={is_gift}, filmGiftCode='{film_gift_code}', original_tid='{item.original_tid[:10]}'...")
         
         # 获取所有非赠品、非作废的有效商品行
         valid_items = [item for item in order.items if not self._is_gift_item(item) and not item.is_void]
@@ -341,13 +354,27 @@ class FangguoAdapter(ErpAdapter):
             print(f"  ⏭️  跳过：所有非赠品行都已作废")
             return None
         
-        # 检查当前订单是否已经完全正确（行数和编码都匹配）
-        current_non_gift_skus = {item.shop_mapping_sku for item in valid_items if item.shop_mapping_sku}
-        
-        is_already_correct = (
-            len(valid_items) == len(effective_list) and
-            current_non_gift_skus == expected_skus_set
-        )
+        # 检查当前订单是否已经完全正确
+        # 合并订单需要验证每个商品行的 original_tid 和 SKU 是否都匹配
+        is_already_correct = False
+        if len(valid_items) == len(effective_list):
+            if is_merged_order:
+                # 合并订单：按 original_tid 验证每个商品行的 SKU 是否正确
+                parsed_by_tid = {p.original_tid: p for p in effective_list if p.original_tid}
+                all_matched = True
+                for item in valid_items:
+                    p = parsed_by_tid.get(item.original_tid)
+                    if p and item.shop_mapping_sku != p.shop_mapping_sku:
+                        all_matched = False
+                        break
+                    if not p and item.shop_mapping_sku:
+                        all_matched = False
+                        break
+                is_already_correct = all_matched
+            else:
+                # 普通订单：集合比较即可
+                current_non_gift_skus = {item.shop_mapping_sku for item in valid_items if item.shop_mapping_sku}
+                is_already_correct = current_non_gift_skus == expected_skus_set
         
         if is_already_correct:
             print(f"  ✅ 编码已正确，跳过修改")
@@ -363,17 +390,39 @@ class FangguoAdapter(ErpAdapter):
         # 获取所有非赠品、非作废的有效商品行索引
         valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gift_item(item) and not item.is_void]
 
-        # 第一步：为每个解析结果创建商品行
-        for idx, p in enumerate(effective_list):
-            if idx < len(valid_indices):
+        # 第一步：为每个解析结果创建商品行（按 original_tid 匹配）
+        for p in effective_list:
+            matched_item_idx = None
+            match_method = "unknown"
+            
+            # 如果解析结果有 original_tid，按 original_tid 匹配商品行
+            if p.original_tid:
+                for idx in valid_indices:
+                    if idx not in used_item_indices:
+                        item = order.items[idx]
+                        if item.original_tid == p.original_tid:
+                            matched_item_idx = idx
+                            match_method = "original_tid"
+                            break
+            
+            # 如果没有匹配到，按顺序使用未使用的有效商品行
+            if matched_item_idx is None:
+                for idx in valid_indices:
+                    if idx not in used_item_indices:
+                        matched_item_idx = idx
+                        match_method = "sequential"
+                        break
+            
+            if matched_item_idx is not None:
+                matched_item = order.items[matched_item_idx]
+                print(f"    匹配: 解析结果[{p.shop_mapping_sku[:30]}...] -> 商品行[{matched_item_idx}] original_tid={matched_item.original_tid[:10]}... 方法={match_method}")
                 # 使用现有有效行作为基础，替换编码信息
-                item_idx = valid_indices[idx]
-                new_item = self._build_order_item(order.items[item_idx], order, p)
+                new_item = self._build_order_item(matched_item, order, p)
                 # 确保普通商品行不是赠品
                 new_item['filmGiftCode'] = ''
                 new_item['giftCodeName'] = None
                 new_item['filmGiftNum'] = 0
-                used_item_indices.add(item_idx)
+                used_item_indices.add(matched_item_idx)
             elif template_item:
                 # 超出原有效行数，创建新商品行
                 new_item = self._build_new_item(order, p)
@@ -403,18 +452,37 @@ class FangguoAdapter(ErpAdapter):
             
             if existing_gift_idx is not None:
                 # 更新现有赠品行
-                new_gift = self._build_gift_item(order.items[existing_gift_idx], order, material_code, gift_name, gift_num)
+                new_gift = self._build_gift_item(order.items[existing_gift_idx], order, material_code, gift_name, gift_num, is_new=False)
                 order_items.append(new_gift)
             else:
-                # 创建新赠品行
+                # 创建新赠品行（标识字段置空，ERP会创建新行）
                 if template_item:
-                    new_gift = self._build_gift_item(template_item, order, material_code, gift_name, gift_num)
+                    new_gift = self._build_gift_item(template_item, order, material_code, gift_name, gift_num, is_new=True)
                 else:
                     new_gift = self._build_gift_item(
                         OrderItem(id=order.trade_id, order_id=order.trade_id, oid=order.tid, num=1),
-                        order, material_code, gift_name, gift_num,
+                        order, material_code, gift_name, gift_num, is_new=True,
                     )
                 order_items.append(new_gift)
+
+        # 第二步.5：如果备注中没有赠品信息，但订单中存在赠品行，保留现有赠品行不变
+        # 这确保赠品行在没有备注说明时保持原样，不会被误修改或删除
+        if not gift_name:
+            for idx, item in enumerate(order.items):
+                if idx not in used_item_indices and self._is_gift_item(item):
+                    if item.raw:
+                        order_items.append(item.raw)
+                    else:
+                        order_items.append({
+                            "id": item.id,
+                            "orderId": item.order_id,
+                            "sysOid": item.sys_oid,
+                            "oid": item.oid,
+                            "title": item.title,
+                            "shopMappingSku": item.shop_mapping_sku,
+                            "num": item.num,
+                            "price": item.price,
+                        })
 
         # 第三步：保留未匹配的非作废、非赠品商品行（保持原样，不修改）
         # 这对于合并订单非常重要：被跳过的子订单的商品行需要保留
@@ -518,6 +586,8 @@ class FangguoAdapter(ErpAdapter):
         )
 
         if len(multi_parsed) > 1:
+            for p in multi_parsed:
+                p.original_tid = parsed.original_tid
             return multi_parsed
 
         return [parsed]
@@ -656,10 +726,34 @@ class FangguoAdapter(ErpAdapter):
             order, parsed,
         )
 
-    def _build_gift_item(self, item: OrderItem, order: Order, material_code: str, gift_name: str, gift_num: int) -> dict:
-        """构建赠品商品行"""
+    def _build_gift_item(self, item: OrderItem, order: Order, material_code: str, gift_name: str, gift_num: int, is_new: bool = False) -> dict:
+        """构建赠品商品行
+        
+        Args:
+            is_new: 是否为创建新赠品行。如果为True，标识字段置空，ERP会创建新行；
+                    如果为False，保留原商品行的标识字段，用于更新现有赠品行
+        """
         gift_material = "吸水皮革"
         gift_code = "赠品沥水垫小圆或小方"
+
+        if is_new:
+            id_field = None
+            sys_oid_field = None
+            oid_field = None
+            original_sku_id_field = None
+            original_goods_id_field = None
+            title_field = None
+            merchandise_pic_path_field = None
+            sku_properties_name_field = ""
+        else:
+            id_field = item.id
+            sys_oid_field = item.sys_oid
+            oid_field = item.oid
+            original_sku_id_field = item.original_sku_id
+            original_goods_id_field = item.original_goods_id
+            title_field = item.title
+            merchandise_pic_path_field = item.merchandise_pic_path
+            sku_properties_name_field = item.sku_properties_name
 
         return {
             "materialId": None,
@@ -720,20 +814,20 @@ class FangguoAdapter(ErpAdapter):
             "decorationGiftPicCode": None,
             "giftsWithOrder": [],
             "picChange": 0,
-            "orderId": item.order_id,
-            "originalSkuId": item.original_sku_id,
-            "originalGoodsId": item.original_goods_id,
-            "id": item.id,
-            "sysOid": item.sys_oid,
-            "oid": item.oid,
-            "title": item.title,
-            "merchandisePicPath": item.merchandise_pic_path,
+            "orderId": order.trade_id,
+            "originalSkuId": original_sku_id_field,
+            "originalGoodsId": original_goods_id_field,
+            "id": id_field,
+            "sysOid": sys_oid_field,
+            "oid": oid_field,
+            "title": title_field,
+            "merchandisePicPath": merchandise_pic_path_field,
             "workUrl": None,
             "effectUrl": None,
             "productionPicPath": None,
             "num": 1,
             "price": 0,
-            "skuPropertiesName": item.sku_properties_name,
+            "skuPropertiesName": sku_properties_name_field,
             "outerIid": "",
             "shopMappingSku": gift_material + "-标准-" + gift_code + "-" + gift_code,
             "diyList": [{
@@ -803,27 +897,52 @@ class FangguoAdapter(ErpAdapter):
                     used_item_indices.add(idx)
                     return idx
                 else:
-                    new_gift = self._build_gift_item(item, order, material_code, gift_name, gift_num)
+                    new_gift = self._build_gift_item(item, order, material_code, gift_name, gift_num, is_new=False)
                     order_items.append(new_gift)
                     used_item_indices.add(idx)
                     return idx
 
         # 没有找到现有赠品，创建新的赠品行
         if template_item:
-            new_gift = self._build_gift_item(template_item, order, material_code, gift_name, gift_num)
+            new_gift = self._build_gift_item(template_item, order, material_code, gift_name, gift_num, is_new=True)
         else:
             new_gift = self._build_gift_item(
                 OrderItem(id=order.trade_id, order_id=order.trade_id, oid=order.tid, num=1),
-                order, material_code, gift_name, gift_num,
+                order, material_code, gift_name, gift_num, is_new=True,
             )
 
         order_items.append(new_gift)
         return len(order_items) - 1
 
     def _is_gift_item(self, item: OrderItem) -> bool:
-        """判断一个商品行是否是赠品行"""
+        """判断一个商品行是否是赠品行
+        
+        检测方式（任一满足即为赠品）：
+        1. filmGiftCode 字段非空
+        2. 商品标题包含"赠品"
+        3. shop_mapping_sku 包含"赠品"
+        4. price为0且标题包含"垫"（常见赠品如沥水垫、防滑垫等）
+        """
+        # 方式1：检查 filmGiftCode 字段
         gift_code = item.raw.get('filmGiftCode', '') if item.raw else ''
-        return bool(gift_code)
+        if gift_code:
+            return True
+        
+        # 方式2：检查标题是否包含"赠品"
+        title = item.title or ''
+        if '赠品' in title:
+            return True
+        
+        # 方式3：检查 shop_mapping_sku 是否包含"赠品"
+        sku = item.shop_mapping_sku or ''
+        if '赠品' in sku:
+            return True
+        
+        # 方式4：检查 price 为0 且标题包含"垫"（常见赠品）
+        if item.price == 0 and '垫' in title:
+            return True
+        
+        return False
 
     # -------------------------------------------------------------------
     # 工具方法

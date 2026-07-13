@@ -225,6 +225,8 @@ class AutoAuditEngine:
                     'remark': '',
                 }
             groups[tid]['items'].append(item)
+            # 确保 item.original_tid 与分组键一致（处理空值情况）
+            item.original_tid = tid
             # 收集该组的备注（优先使用商品行级别的备注）
             if item.shop_remark:
                 groups[tid]['remark'] = item.shop_remark
@@ -264,6 +266,9 @@ class AutoAuditEngine:
             if not parsed_list:
                 print(f"      ⏭️  跳过：无法解析备注")
                 continue
+            
+            for p in parsed_list:
+                p.original_tid = tid
             
             all_parsed_list.extend(parsed_list)
             
