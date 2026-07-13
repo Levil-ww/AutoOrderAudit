@@ -106,13 +106,13 @@ _PATTERN_KEYWORDS = ["花幔", "卢浮梦境", "安妮森林", "暗夜缪斯", "
 "堇色素颜","青禾手记","风华格调","巴黎左岸","塞纳时光","旧枝漫语","哥特玫瑰","罗拉密码",
 "飞屋构想","闲叙青釉","浮游家园","凡尔赛的梦","古巴夏日","繁花说","繁花朵朵","静谧之夜",
 "香榭丽舍","平安喜乐","爱丽丝梦境","墨上花开","好多熊熊","青华","奥利奥","花之密语","绽放",
-"吉金陌野","雾蓝花信","珍珠白","黑色诗人","浅灰绿","牛油果绿","藏青蓝","菱花白","裴颇浅灰","奶油布丁",
+"吉金陌野","雾蓝花信","黑色诗人","浅灰绿","牛油果绿","藏青蓝","菱花白","裴颇浅灰","奶油布丁",
 "莫系几何","夏昔","淡蓝夕雾","栀夏花语","简若","晨光","如期而至","侘寂风","汀兰","圣托里尼","蓝色鲸鱼",
 "浅灰","深灰","一抹杏黄","抹茶绿","丹若云青","淡蓝相知","苏梦半盏","墨绿物语","日暮晨曦","半沐","涂鸦乐园",
 "和颜悦色","殷红甜梦","旅途星海","事事都橙","水泥灰","新中式","祥瑞","花之恋","北欧大理石","童话","雅致恬静",
 "归序","遇到童话","纯白色","梅花时节","普安蒂","草柳依依","杏仁白","花开富贵","粉色格子","青蔓","浅陌云雾",
 "浅陌倾城","宇宙航行","近水含烟","春意花香","丹华","法卡","一见倾心","初雪悠然","麦田守望","粉色皇冠大理石",
-"素缕花肆","夏卫安福","太空兔茶话会","都柏林狂欢","闲叙素年","深邃蓝","里芙","马蒂斯的猫",]
+"素缕花肆","夏卫安福","太空兔茶话会","都柏林狂欢","闲叙素年","深邃蓝","里芙","马蒂斯的猫","藏衣鲤锁"]
 
 # 赠品关键词
 _GIFT_KEYWORDS = ["送", "赠品", "附赠", "加送"]
@@ -189,6 +189,10 @@ def parse_remark(
             if last_semi != -1:
                 size_prefix = before_size[last_semi + 1:].strip().strip("-;,、")
     
+    # 去掉尺寸前缀中的"规格"
+    if size_prefix.startswith("规格"):
+        size_prefix = size_prefix[2:].strip().strip("-;,、")
+    
     actual_size = f"{first_size[0]}x{first_size[1]}CM" if first_size[1] not in ["圆", "圆直径", "直径", "圆形"] else f"{first_size[1]}{first_size[0]}CM"
     # 如果有尺寸前缀，添加到实际尺寸前面
     if size_prefix:
@@ -260,6 +264,24 @@ def parse_remark(
     # 去掉可能残留的"定制"前缀
     if pattern_name.startswith("定制"):
         pattern_name = pattern_name[2:].strip()
+
+    # 先检查是否匹配已知花型关键词（更健壮的方式）
+    # 按长度从长到短排序，优先匹配更长的关键词（如"真爱花"优先于"爱花"）
+    matched_keyword = ""
+    for kw in sorted(_PATTERN_KEYWORDS, key=len, reverse=True):
+        if kw in pattern_name:
+            matched_keyword = kw
+            break
+    
+    if matched_keyword:
+        # 保留关键词后面的附加信息（如"黑色诗人22#"中的"22#"）
+        kw_start = pattern_name.find(matched_keyword)
+        kw_end = kw_start + len(matched_keyword)
+        suffix = pattern_name[kw_end:].strip().strip("-;,、")
+        pattern_name = matched_keyword + suffix
+    else:
+        # 清理花型名称中的冗余前缀（如"颜色分类:"、"真"、"无痕"等）
+        pattern_name = _clean_pattern_name(pattern_name)
 
     # 如果没有分号，从整个body中提取（去掉材质和尺寸）
     if not pattern_name:
@@ -869,6 +891,23 @@ def _extract_gift(text: str) -> tuple[str, int]:
 
 _HEURISTIC_MATERIALS = ["双面革", "吸水皮革", "镜面皮革", "双面格", "软玻璃", "丝圈", "防滑皮革", "仿皮"]
 
+_PATTERN_CLEAN_PREFIXES = ["颜色分类:", "颜色分类", "真", "无痕", "止滑", "规格"]
+
+def _clean_pattern_name(pattern_name: str) -> str:
+    """清理花型名称中的冗余前缀"""
+    if not pattern_name:
+        return pattern_name
+    
+    result = pattern_name.strip()
+    
+    for prefix in _PATTERN_CLEAN_PREFIXES:
+        if result.startswith(prefix):
+            result = result[len(prefix):].strip().strip("-;,、")
+    
+    result = result.strip().strip("-;,、")
+    
+    return result
+
 def _extract_pattern(text: str, material_map: dict = None) -> str:
     """从文本中提取花型名称"""
     material_map = material_map or {}
@@ -916,6 +955,9 @@ def _extract_pattern(text: str, material_map: dict = None) -> str:
                 before = before.replace(mat, "").strip()
                 break
         result = before if len(before) <= 20 else before[:20]
+
+    # 清理花型名称中的冗余前缀（如"颜色分类:"、"真"、"无痕"等）
+    result = _clean_pattern_name(result)
 
     # 如果结果和材质名相同，返回空让上层使用默认值
     if result:
