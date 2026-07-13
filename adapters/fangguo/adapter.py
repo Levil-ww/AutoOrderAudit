@@ -736,7 +736,18 @@ class FangguoAdapter(ErpAdapter):
                     如果为False，保留原商品行的标识字段，用于更新现有赠品行
         """
         gift_material = "吸水皮革"
-        gift_code = "赠品沥水垫小圆或小方"
+        if "圆垫" in gift_name:
+            model_code = "赠品沥水垫小圆或小方"
+            picture_code = "赠品沥水垫小圆或小方"
+            gift_code = "赠品沥水垫小圆或小方"
+        elif "方垫" in gift_name:
+            model_code = "30x50"
+            picture_code = "随机发；30x50"
+            gift_code = "30x50-随机发；30x50"
+        else:
+            model_code = "赠品沥水垫小圆或小方"
+            picture_code = "赠品沥水垫小圆或小方"
+            gift_code = "赠品沥水垫小圆或小方"
 
         if is_new:
             id_field = None
@@ -767,7 +778,7 @@ class FangguoAdapter(ErpAdapter):
             "multiHolePic": None,
             "multiImageExists": None,
             "modelId": None,
-            "modelCode": "标准",
+            "modelCode": model_code,
             "modelCodeName": None,
             "brand": None,
             "customSize": False,
@@ -781,7 +792,7 @@ class FangguoAdapter(ErpAdapter):
             "customPicture": False,
             "pictureId": None,
             "pictureType": None,
-            "pictureCode": gift_code,
+            "pictureCode": picture_code,
             "picTypeId": None,
             "pictureCodePath": None,
             "pictureEffectPicPath": None,
@@ -831,7 +842,7 @@ class FangguoAdapter(ErpAdapter):
             "price": 0,
             "skuPropertiesName": sku_properties_name_field,
             "outerIid": "",
-            "shopMappingSku": gift_material + "-标准-" + gift_code + "-" + gift_code,
+            "shopMappingSku": f"{gift_material}-标准-{model_code}-{picture_code}",
             "diyList": [{
                 "bg": "", "mask": "", "picName": "",
                 "isPicMove": 1, "sort": 1,
@@ -857,13 +868,13 @@ class FangguoAdapter(ErpAdapter):
             "isCombinationGoods": False,
             "deriveSysOid": None,
             "inventoryNum": None,
-            "picCode": gift_code,
+            "picCode": picture_code,
             "lockStatusDesc": "",
             "lockStatus": False,
             "packageQuantity": None,
             "refundStatusDesc": "",
             "cancelStatus": False,
-            "realModelCode": "标准",
+            "realModelCode": model_code,
             "realModelId": None,
             "type": 0,
             "showRemarkInfo": True,
@@ -876,8 +887,19 @@ class FangguoAdapter(ErpAdapter):
                           used_item_indices: set) -> int | None:
         """处理赠品：更新已有赠品行或创建新的"""
         gift_material = "吸水皮革"
-        gift_code = "赠品沥水垫小圆或小方"
-        gift_sku = f"{gift_material}-标准-{gift_code}-{gift_code}"
+        if "圆垫" in gift_name:
+            model_code = "赠品沥水垫小圆或小方"
+            picture_code = "赠品沥水垫小圆或小方"
+            gift_code = "赠品沥水垫小圆或小方"
+        elif "方垫" in gift_name:
+            model_code = "30x50"
+            picture_code = "随机发；30x50"
+            gift_code = "30x50-随机发；30x50"
+        else:
+            model_code = "赠品沥水垫小圆或小方"
+            picture_code = "赠品沥水垫小圆或小方"
+            gift_code = "赠品沥水垫小圆或小方"
+        gift_sku = f"{gift_material}-标准-{model_code}-{picture_code}"
         
         for idx, item in enumerate(order.items):
             if idx not in used_item_indices and self._is_gift_item(item):
@@ -887,14 +909,15 @@ class FangguoAdapter(ErpAdapter):
                     cloned['shopRemark'] = order.shop_remark or ""
                     cloned['buyerRemark'] = order.buyer_remark or ""
                     cloned['materialCode'] = gift_material
-                    cloned['modelCode'] = "标准"
+                    cloned['modelCode'] = model_code
                     cloned['colorCode'] = "标准"
-                    cloned['pictureCode'] = gift_code
-                    cloned['picCode'] = gift_code
+                    cloned['pictureCode'] = picture_code
+                    cloned['picCode'] = picture_code
                     cloned['giftCodeName'] = gift_code
                     cloned['filmGiftCode'] = gift_code
                     cloned['filmGiftPicCode'] = gift_code
                     cloned['shopMappingSku'] = gift_sku
+                    cloned['realModelCode'] = model_code
                     order_items.append(cloned)
                     used_item_indices.add(idx)
                     return idx

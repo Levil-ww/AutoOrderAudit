@@ -5,6 +5,11 @@
   1. Token 从外置 token.json 读取，客服无需改代码
   2. 时间范围自动计算为「最近7天」
   3. 技术人员只需更新 token.json 即可
+
+  相较于原 config.py 的改进 - v2：
+  1. Token 自动从 auth_manager 读取，支持运行时刷新
+  2. 新增 reload_auth()，登录后可热加载新Token
+  3. 时间范围自动计算为「最近7天」
 """
 
 from datetime import datetime, timedelta
