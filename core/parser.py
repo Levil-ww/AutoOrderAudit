@@ -98,6 +98,9 @@ _CHINESE_NUMBERS = r"(?:[一二两三四五六七八九十]|\d+)"
 # 数量汇总信息匹配（如"共计两张"、"共三张"、"共计5张"）
 _RE_QTY_SUMMARY = re.compile(rf"共(?:计)?{_CHINESE_NUMBERS}[张个件套米]")
 
+# 到货返信息匹配（如"到货返22"、"到货返50元"）
+_RE_ARRIVAL_REFUND = re.compile(r"到货返\d+[元]?")
+
 # 花型关键词
 _PATTERN_KEYWORDS = ["花幔", "卢浮梦境", "安妮森林", "暗夜缪斯", "萃园", 
 "玫瑰骑士", "花园秘境", "复古大花", "中古大花","凯特玫瑰","中古花园",
@@ -222,6 +225,8 @@ def parse_remark(
         after_cm = re.sub(r"-\d+[张个件套米]", "", after_cm).strip()
         # 去掉数量汇总信息（如"共计2张"、"共三张"）
         after_cm = _RE_QTY_SUMMARY.sub("", after_cm).strip()
+        # 过滤掉"到货返xx"这种无关备注
+        after_cm = _RE_ARRIVAL_REFUND.sub("", after_cm).strip()
 
         # 去掉赠品信息：找到最早的赠品关键词位置，然后向前找到分隔符
         # 处理"小垫子总共送3个"这种模式，把"小垫子"也去掉
@@ -417,6 +422,8 @@ def extract_multiple_remarks(
             # trailing_remark（如'裁剪图一张'）只附加到最后一个商品行
             if trailing_remark and idx == len(segments) - 1:
                 clean_remark = _RE_QTY_SUMMARY.sub("", trailing_remark).strip().strip("-;,、，")
+                # 过滤掉"到货返xx"这种无关备注
+                clean_remark = _RE_ARRIVAL_REFUND.sub("", clean_remark).strip().strip("-;,、，")
                 # 再清理一次可能的数量汇总残留
                 clean_remark = re.sub(r'共(?:计)?\d+[张个件套米]', '', clean_remark).strip().strip('，,、;；')
                 clean_remark = re.sub(r'共(?:计)?[一二两三四五六七八九十]+[张个件套米]', '', clean_remark).strip().strip('，,、;；')
@@ -607,6 +614,7 @@ def _parse_multi_size_direct(
         after_cm = cm_match.group(1)
         after_cm = re.sub(r"-\d+[张个件套米]", "", after_cm).strip()
         after_cm = _RE_QTY_SUMMARY.sub("", after_cm).strip()
+        after_cm = _RE_ARRIVAL_REFUND.sub("", after_cm).strip()
         remark_after_size = after_cm.strip().strip(";，,、")
 
     # 尝试提取材质
@@ -1270,6 +1278,7 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
                 if gift_pos == -1:
                     if after_comma and not _RE_SIZE.search(after_comma) and not _RE_ROUND_SIZE.search(after_comma):
                         after_comma = _RE_QTY_SUMMARY.sub("", after_comma).strip().strip("-;,、，")
+                        after_comma = _RE_ARRIVAL_REFUND.sub("", after_comma).strip().strip("-;,、，")
                         if after_comma:
                             if trailing_remark:
                                 trailing_remark = f"{trailing_remark}，{after_comma}"
@@ -1511,6 +1520,7 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
                 if gift_pos == -1:
                     if not _RE_SIZE.search(after_comma) and not _RE_ROUND_SIZE.search(after_comma) and after_comma:
                         after_comma = _RE_QTY_SUMMARY.sub("", after_comma).strip().strip("-;,、，")
+                        after_comma = _RE_ARRIVAL_REFUND.sub("", after_comma).strip().strip("-;,、，")
                         if after_comma:
                             trailing_remark = after_comma
     
@@ -1535,6 +1545,9 @@ def _clean_segment(segment: str) -> str:
     
     # 去掉数量汇总信息（如"共计2张"、"共三张"）
     segment = _RE_QTY_SUMMARY.sub("", segment).strip()
+    
+    # 过滤掉"到货返xx"这种无关备注
+    segment = _RE_ARRIVAL_REFUND.sub("", segment).strip()
     
     # 清理结尾符号（包括逗号和中文分号）
     segment = segment.strip().strip("-;,、，；")
