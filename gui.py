@@ -244,8 +244,8 @@ class TextRedirector(io.StringIO):
 class AutoAuditGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("方果ERP · 自动审单工具")
-        self.root.geometry("820x720")
+        self.root.title("方果ERP · 自动审单工具v2.0")
+        self.root.geometry("950x720")
         self.root.resizable(True, True)
         self.root.configure(bg=COLORS["bg"])
         self._running = False
@@ -267,7 +267,7 @@ class AutoAuditGUI:
     # ------------------------------------------------------------
     def _center_window(self):
         self.root.update_idletasks()
-        w, h = 820, 720
+        w, h = 950, 720
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
         self.root.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
