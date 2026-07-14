@@ -7,7 +7,7 @@ import time
 from datetime import datetime
 from typing import Callable, Optional
 
-from .adapter_base import ErpAdapter
+from .adapter_base import ErpAdapter, Order, OrderItem
 from .parser import parse_remark, extract_multiple_remarks
 
 
@@ -27,7 +27,13 @@ _SKIP_KEYWORDS = [
     "仓库发",
     "工厂发",
     "补发",
-    "差价",
+]
+
+
+_PRICE_DIFF_KEYWORDS = [
+    "补差价专拍",
+    "差价专用",
+    "少几元拍几个",
 ]
 
 
@@ -54,6 +60,188 @@ class AutoAuditEngine:
         self.confirm_callback = confirm_callback
         self.stats = {"total": 0, "success": 0, "skipped": 0, "failed": 0, "errors": [],
                       "cancelled": 0}  # cancelled 统计用户取消的数量
+
+    def _is_price_difference_order(self, order: Order) -> bool:
+        """
+        判断订单是否为补差价订单
+        通过检查商品行标题是否包含补差价相关关键字
+        """
+        for item in order.items:
+            if item.title:
+                for keyword in _PRICE_DIFF_KEYWORDS:
+                    if keyword in item.title:
+                        return True
+        return False
+
+    def _process_price_difference_order(self, order: Order):
+        """
+        处理补差价订单的逻辑：
+        1. 如果订单只有补差价商品行且备注为空，跳过不处理
+        2. 如果备注包含"差价不发货"，将编码修改为"定制-定制-补差价-不打印"，数量改为1
+        3. 如果备注非空且不包含"差价不发货"，按正常解析逻辑处理
+        4. 如果订单有其他商品行且备注为空，仅修改补差价商品行数量为1
+        """
+        remark = order.shop_remark or ""
+        print(f"  💰 补差价订单处理")
+        
+        price_diff_items = [item for item in order.items if self._is_price_difference_item(item)]
+        only_price_diff = len(price_diff_items) == len(order.items)
+        
+        if only_price_diff and not remark.strip():
+            print(f"  ⏭️  跳过：只有补差价订单且备注为空")
+            self.stats["skipped"] += 1
+            return
+        
+        if "差价不发货" in remark:
+            print(f"  📝 差价不发货：修改编码为'定制-定制-补差价-不打印'，数量改为1")
+            
+            if self.dry_run:
+                print(f"  🔶 DRY RUN: 修改编码为'定制-定制-补差价-不打印'")
+                self.stats["success"] += 1
+                return
+            
+            try:
+                ok = self.adapter.update_price_difference_order(order, price_diff_items, ship=False)
+                if ok:
+                    print(f"  ✅ 修改成功！")
+                    self.stats["success"] += 1
+                else:
+                    print(f"  ❌ 修改失败")
+                    self.stats["failed"] += 1
+            except Exception as e:
+                print(f"  ❌ 请求异常: {e}")
+                self.stats["failed"] += 1
+            return
+        
+        if remark.strip():
+            print(f"  📝 备注含信息，按正常解析逻辑处理")
+            self._process_normal_order_logic(order)
+            return
+        
+        print(f"  📝 备注为空，仅修改补差价商品行数量为1")
+        if self.dry_run:
+            print(f"  🔶 DRY RUN: 仅修改数量为1")
+            self.stats["success"] += 1
+            return
+        
+        try:
+            ok = self.adapter.update_price_difference_order(order, price_diff_items, ship=True)
+            if ok:
+                print(f"  ✅ 修改成功！数量已改为1")
+                self.stats["success"] += 1
+            else:
+                print(f"  ❌ 修改失败")
+                self.stats["failed"] += 1
+        except Exception as e:
+            print(f"  ❌ 请求异常: {e}")
+            self.stats["failed"] += 1
+
+    def _is_price_difference_item(self, item: OrderItem) -> bool:
+        """判断商品行是否为补差价商品"""
+        if item.title:
+            for keyword in _PRICE_DIFF_KEYWORDS:
+                if keyword in item.title:
+                    return True
+        return False
+
+    def _process_normal_order_logic(self, order: Order, price_diff_updates: list = None):
+        """
+        普通订单处理逻辑（从 _process_order 提取的公共逻辑）
+        
+        Args:
+            price_diff_updates: 补差价商品行更新列表，用于合并订单或混合订单的一次性处理
+        """
+        remark = order.shop_remark or ""
+        
+        for keyword in _SKIP_KEYWORDS:
+            if keyword in remark:
+                print(f"  ⏭️  跳过：备注包含关键字 '{keyword}'")
+                self.stats["skipped"] += 1
+                return
+
+        material_map = getattr(self.adapter, 'material_map', None)
+        material_matcher = getattr(self.adapter, 'get_material_matcher', lambda: None)()
+
+        parsed_list = extract_multiple_remarks(
+            remark,
+            material_map=material_map,
+            material_matcher=material_matcher,
+        )
+
+        if not parsed_list:
+            print(f"  ⏭️  跳过：无法解析备注")
+            self.stats["skipped"] += 1
+            return
+
+        parsed = parsed_list[0]
+        summary = (
+            f"  ✅ 材质: {parsed.material_code}  "
+            f"|  颜色: {parsed.color_code}  "
+            f"|  尺寸: {parsed.model_code}  "
+            f"|  花型: {parsed.picture_code}"
+        )
+        print(summary)
+
+        gift_name = ""
+        gift_num = 0
+        for p in parsed_list:
+            if p.gift_name:
+                gift_name = p.gift_name
+                gift_num = p.gift_num
+                break
+        if gift_name:
+            print(f"  🎁 赠品: {gift_name} x {gift_num}")
+
+        if self.dry_run:
+            print()
+            for parsed in parsed_list:
+                print(f"  🔶 DRY RUN: 新编码 = {parsed.shop_mapping_sku}")
+            if gift_name:
+                print(f"  🔶 DRY RUN: 将添加赠品商品行 = {gift_name} x {gift_num}")
+            if price_diff_updates:
+                for update in price_diff_updates:
+                    action = "修改编码为'定制-定制-补差价-不打印'" if not update['ship'] else "仅修改数量为1"
+                    print(f"  🔶 DRY RUN: 补差价订单 -> {action}")
+            self.stats["success"] += 1
+            return
+
+        if self.confirm_callback:
+            changes = []
+            for p in parsed_list:
+                changes.append(f"新编码: {p.shop_mapping_sku}")
+            if gift_name:
+                changes.append(f"赠品: {gift_name} x {gift_num}")
+            if price_diff_updates:
+                for update in price_diff_updates:
+                    action = "修改编码为'定制-定制-补差价-不打印'" if not update['ship'] else "仅修改数量为1"
+                    changes.append(f"补差价订单: {action}")
+
+            should_update = self.confirm_callback(order, parsed_list, changes)
+            if not should_update:
+                print(f"  ⏭️  用户取消：新编码 {parsed_list[0].shop_mapping_sku}（未修改）")
+                self.stats["cancelled"] += 1
+                return
+
+        try:
+            ok = self.adapter.update_merchant_code(order, parsed_list[0], parsed_list, price_diff_updates)
+            if ok is None:
+                print(f"  ⏭️  跳过：订单所有商品行已作废")
+                self.stats["skipped"] += 1
+            elif ok:
+                print(f"  ✅ 修改成功！新编码: {parsed_list[0].shop_mapping_sku}")
+                if len(parsed_list) > 1:
+                    print(f"  📦 包含 {len(parsed_list)} 个尺寸，已拆分处理")
+                if price_diff_updates:
+                    print(f"  ✅ 补差价订单修改成功！")
+                self.stats["success"] += 1
+            else:
+                print(f"  ❌ 修改失败")
+                self.stats["failed"] += 1
+                self.stats["errors"].append(f"订单 {order.trade_id}: 接口返回失败")
+        except Exception as e:
+            print(f"  ❌ 请求异常: {e}")
+            self.stats["failed"] += 1
+            self.stats["errors"].append(f"订单 {order.trade_id}: {e}")
 
     def run(self, page_no=1, page_size=500, query_status=1, time_begin="", time_end=""):
         print("=" * 60)
@@ -108,6 +296,11 @@ class AutoAuditEngine:
         material_map = getattr(self.adapter, 'material_map', None)
         material_matcher = getattr(self.adapter, 'get_material_matcher', lambda: None)()
 
+        # ===== 检测补差价订单 =====
+        if self._is_price_difference_order(order):
+            self._process_price_difference_order(order)
+            return
+
         # ===== 检测合并订单 =====
         # 合并订单特征：订单号包含 &，或商品行有不同的 original_tid
         is_merged_order = "&" in order.trade_id or "&" in order.tid
@@ -131,83 +324,7 @@ class AutoAuditEngine:
             self.stats["skipped"] += 1
             return
 
-        # ===== 普通订单处理 =====
-        for keyword in _SKIP_KEYWORDS:
-            if keyword in remark:
-                print(f"  ⏭️  跳过：备注包含关键字 '{keyword}'")
-                self.stats["skipped"] += 1
-                return
-
-        parsed_list = extract_multiple_remarks(
-            remark,
-            material_map=material_map,
-            material_matcher=material_matcher,
-        )
-
-        if not parsed_list:
-            print(f"  ⏭️  跳过：无法解析备注")
-            self.stats["skipped"] += 1
-            return
-
-        parsed = parsed_list[0]
-        summary = (
-            f"  ✅ 材质: {parsed.material_code}  "
-            f"|  颜色: {parsed.color_code}  "
-            f"|  尺寸: {parsed.model_code}  "
-            f"|  花型: {parsed.picture_code}"
-        )
-        print(summary)
-
-        gift_name = ""
-        gift_num = 0
-        for p in parsed_list:
-            if p.gift_name:
-                gift_name = p.gift_name
-                gift_num = p.gift_num
-                break
-        if gift_name:
-            print(f"  🎁 赠品: {gift_name} x {gift_num}")
-
-        if self.dry_run:
-            print()
-            for parsed in parsed_list:
-                print(f"  🔶 DRY RUN: 新编码 = {parsed.shop_mapping_sku}")
-            if gift_name:
-                print(f"  🔶 DRY RUN: 将添加赠品商品行 = {gift_name} x {gift_num}")
-            self.stats["success"] += 1
-            return
-
-        if self.confirm_callback:
-            changes = []
-            for p in parsed_list:
-                changes.append(f"新编码: {p.shop_mapping_sku}")
-            if gift_name:
-                changes.append(f"赠品: {gift_name} x {gift_num}")
-
-            should_update = self.confirm_callback(order, parsed_list, changes)
-            if not should_update:
-                print(f"  ⏭️  用户取消：新编码 {parsed_list[0].shop_mapping_sku}（未修改）")
-                self.stats["cancelled"] += 1
-                return
-
-        try:
-            ok = self.adapter.update_merchant_code(order, parsed_list[0], parsed_list)
-            if ok is None:
-                print(f"  ⏭️  跳过：订单所有商品行已作废")
-                self.stats["skipped"] += 1
-            elif ok:
-                print(f"  ✅ 修改成功！新编码: {parsed_list[0].shop_mapping_sku}")
-                if len(parsed_list) > 1:
-                    print(f"  📦 包含 {len(parsed_list)} 个尺寸，已拆分处理")
-                self.stats["success"] += 1
-            else:
-                print(f"  ❌ 修改失败")
-                self.stats["failed"] += 1
-                self.stats["errors"].append(f"订单 {order.trade_id}: 接口返回失败")
-        except Exception as e:
-            print(f"  ❌ 请求异常: {e}")
-            self.stats["failed"] += 1
-            self.stats["errors"].append(f"订单 {order.trade_id}: {e}")
+        self._process_normal_order_logic(order)
 
     def _process_merged_order(self, order, material_map, material_matcher):
         """
@@ -223,6 +340,7 @@ class AutoAuditEngine:
                 groups[tid] = {
                     'items': [],
                     'remark': '',
+                    'is_price_diff': False,
                 }
             groups[tid]['items'].append(item)
             # 确保 item.original_tid 与分组键一致（处理空值情况）
@@ -230,6 +348,9 @@ class AutoAuditEngine:
             # 收集该组的备注（优先使用商品行级别的备注）
             if item.shop_remark:
                 groups[tid]['remark'] = item.shop_remark
+            # 检测是否为补差价分组
+            if self._is_price_difference_item(item):
+                groups[tid]['is_price_diff'] = True
         
         # 合并订单中，每个原始订单使用自己的商品行备注
         # 不回退使用订单级备注，因为订单级备注可能属于另一个原始订单
@@ -237,77 +358,130 @@ class AutoAuditEngine:
         # 处理每个分组
         all_parsed_list = []
         all_gifts = []
+        price_diff_updates = []
         
         for tid, group in groups.items():
             group_remark = group['remark']
-            print(f"    原始订单 {tid[:16]}...: 备注='{group_remark[:40]}...'")
+            is_price_diff = group['is_price_diff']
+            print(f"    原始订单 {tid[:16]}...: 备注='{group_remark[:40]}...' {'(补差价)' if is_price_diff else ''}")
             
-            # 检查跳过关键字
-            skip_reason = None
-            for keyword in _SKIP_KEYWORDS:
-                if keyword in group_remark:
-                    skip_reason = f"包含关键字 '{keyword}'"
-                    break
-            
-            if not group_remark.strip():
-                skip_reason = "备注为空"
-            
-            if skip_reason:
-                print(f"      ⏭️  跳过：{skip_reason}")
-                continue
-            
-            # 解析备注
-            parsed_list = extract_multiple_remarks(
-                group_remark,
-                material_map=material_map,
-                material_matcher=material_matcher,
-            )
-            
-            if not parsed_list:
-                print(f"      ⏭️  跳过：无法解析备注")
-                continue
-            
-            for p in parsed_list:
-                p.original_tid = tid
-            
-            all_parsed_list.extend(parsed_list)
-            
-            # 检查赠品
-            for p in parsed_list:
-                if p.gift_name and p.gift_num > 0:
-                    all_gifts.append((p.gift_name, p.gift_num))
+            if is_price_diff:
+                if not group_remark.strip():
+                    print(f"      📝 补差价订单备注为空，仅修改数量为1")
+                    price_diff_updates.append({
+                        'tid': tid,
+                        'items': group['items'],
+                        'remark': group_remark,
+                        'ship': True,
+                    })
+                elif "差价不发货" in group_remark:
+                    print(f"      📝 差价不发货：修改编码为'定制-定制-补差价-不打印'，数量改为1")
+                    price_diff_updates.append({
+                        'tid': tid,
+                        'items': group['items'],
+                        'remark': group_remark,
+                        'ship': False,
+                    })
+                else:
+                    print(f"      📝 补差价订单备注含信息，按正常解析逻辑处理")
+                    skip_reason = None
+                    for keyword in _SKIP_KEYWORDS:
+                        if keyword in group_remark:
+                            skip_reason = f"包含关键字 '{keyword}'"
+                            break
+                    
+                    if skip_reason:
+                        print(f"        ⏭️  跳过：{skip_reason}")
+                        continue
+                    
+                    parsed_list = extract_multiple_remarks(
+                        group_remark,
+                        material_map=material_map,
+                        material_matcher=material_matcher,
+                    )
+                    
+                    if not parsed_list:
+                        print(f"        ⏭️  跳过：无法解析备注")
+                        continue
+                    
+                    for p in parsed_list:
+                        p.original_tid = tid
+                    
+                    all_parsed_list.extend(parsed_list)
+                    
+                    for p in parsed_list:
+                        if p.gift_name and p.gift_num > 0:
+                            all_gifts.append((p.gift_name, p.gift_num))
+            else:
+                skip_reason = None
+                for keyword in _SKIP_KEYWORDS:
+                    if keyword in group_remark:
+                        skip_reason = f"包含关键字 '{keyword}'"
+                        break
+                
+                if not group_remark.strip():
+                    skip_reason = "备注为空"
+                
+                if skip_reason:
+                    print(f"      ⏭️  跳过：{skip_reason}")
+                    continue
+                
+                parsed_list = extract_multiple_remarks(
+                    group_remark,
+                    material_map=material_map,
+                    material_matcher=material_matcher,
+                )
+                
+                if not parsed_list:
+                    print(f"      ⏭️  跳过：无法解析备注")
+                    continue
+                
+                for p in parsed_list:
+                    p.original_tid = tid
+                
+                all_parsed_list.extend(parsed_list)
+                
+                for p in parsed_list:
+                    if p.gift_name and p.gift_num > 0:
+                        all_gifts.append((p.gift_name, p.gift_num))
         
-        if not all_parsed_list:
+        if not all_parsed_list and not price_diff_updates:
             print(f"  ⏭️  跳过：所有分组均无法解析")
             self.stats["skipped"] += 1
             return
         
-        # 输出解析结果
-        parsed = all_parsed_list[0]
-        summary = (
-            f"  ✅ 材质: {parsed.material_code}  "
-            f"|  颜色: {parsed.color_code}  "
-            f"|  尺寸: {parsed.model_code}  "
-            f"|  花型: {parsed.picture_code}"
-        )
-        print(summary)
-        
-        for gift_name, gift_num in all_gifts:
-            print(f"  🎁 赠品: {gift_name} x {gift_num}")
+        if all_parsed_list:
+            parsed = all_parsed_list[0]
+            summary = (
+                f"  ✅ 材质: {parsed.material_code}  "
+                f"|  颜色: {parsed.color_code}  "
+                f"|  尺寸: {parsed.model_code}  "
+                f"|  花型: {parsed.picture_code}"
+            )
+            print(summary)
+            
+            for gift_name, gift_num in all_gifts:
+                print(f"  🎁 赠品: {gift_name} x {gift_num}")
         
         if self.dry_run:
-            print()
-            for parsed in all_parsed_list:
-                print(f"  🔶 DRY RUN: 新编码 = {parsed.shop_mapping_sku}")
+            if all_parsed_list:
+                for parsed in all_parsed_list:
+                    print(f"  🔶 DRY RUN: 新编码 = {parsed.shop_mapping_sku}")
+            for update in price_diff_updates:
+                action = "修改编码为'定制-定制-补差价-不打印'" if not update['ship'] else "仅修改数量为1"
+                print(f"  🔶 DRY RUN: 补差价订单 {update['tid'][:16]}... -> {action}")
             self.stats["success"] += 1
             return
         
-        if self.confirm_callback:
+        if self.confirm_callback and all_parsed_list:
             changes = []
             for p in all_parsed_list:
                 changes.append(f"新编码: {p.shop_mapping_sku}")
             for gift_name, gift_num in all_gifts:
                 changes.append(f"赠品: {gift_name} x {gift_num}")
+            for update in price_diff_updates:
+                action = "修改编码为'定制-定制-补差价-不打印'" if not update['ship'] else "仅修改数量为1"
+                changes.append(f"补差价订单: {action}")
             
             should_update = self.confirm_callback(order, all_parsed_list, changes)
             if not should_update:
@@ -316,17 +490,27 @@ class AutoAuditEngine:
                 return
         
         try:
-            ok = self.adapter.update_merchant_code(order, all_parsed_list[0], all_parsed_list)
-            if ok is None:
-                print(f"  ⏭️  跳过：订单所有商品行已作废")
-                self.stats["skipped"] += 1
-            elif ok:
-                print(f"  ✅ 修改成功！共 {len(all_parsed_list)} 个编码")
-                self.stats["success"] += 1
+            if all_parsed_list or price_diff_updates:
+                ok = self.adapter.update_merchant_code(order, 
+                    all_parsed_list[0] if all_parsed_list else None, 
+                    all_parsed_list,
+                    price_diff_updates
+                )
+                if ok is None:
+                    print(f"  ⏭️  跳过：订单所有商品行已作废")
+                    self.stats["skipped"] += 1
+                elif ok:
+                    print(f"  ✅ 修改成功！共 {len(all_parsed_list)} 个编码")
+                    if price_diff_updates:
+                        print(f"  ✅ 补差价订单修改成功！")
+                    self.stats["success"] += 1
+                else:
+                    print(f"  ❌ 修改失败")
+                    self.stats["failed"] += 1
+                    self.stats["errors"].append(f"订单 {order.trade_id}: 接口返回失败")
             else:
-                print(f"  ❌ 修改失败")
-                self.stats["failed"] += 1
-                self.stats["errors"].append(f"订单 {order.trade_id}: 接口返回失败")
+                print(f"  ⏭️  跳过：所有分组均无法解析")
+                self.stats["skipped"] += 1
         except Exception as e:
             print(f"  ❌ 请求异常: {e}")
             self.stats["failed"] += 1

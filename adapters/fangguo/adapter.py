@@ -319,11 +319,12 @@ class FangguoAdapter(ErpAdapter):
     # -------------------------------------------------------------------
     # 3. 修改商家编码（带详细错误日志）
     # -------------------------------------------------------------------
-    def update_merchant_code(self, order: Order, parsed: ParsedRemark, parsed_list: list = None) -> bool:
+    def update_merchant_code(self, order: Order, parsed: ParsedRemark, parsed_list: list = None, price_diff_updates: list = None) -> bool:
         """
         调用 saveProduct 接口更新商家编码
         支持多尺寸：如果备注中有多个尺寸，会拆分成多个商品行
         支持赠品：检测已有赠品行并更新数量，或创建新的赠品行
+        支持补差价订单：通过 price_diff_updates 参数处理补差价商品行
         
         强制修复逻辑：
         1. 即使订单被标记为"解码失败"也能强制重新修改
@@ -334,6 +335,11 @@ class FangguoAdapter(ErpAdapter):
         1. 如果所有非赠品行都已作废，跳过整个订单
         2. 如果部分商品行已作废，跳过作废行，使用有效行进行修改
         3. 如果有效行数不足，创建新商品行
+        
+        Args:
+            price_diff_updates: 补差价商品行更新列表，每个元素包含 {'items': [...], 'ship': True/False}
+                               - ship=True: 仅修改数量为1
+                               - ship=False: 修改编码为"定制-定制-补差价-不打印"，数量改为1
         """
         # 检测是否为合并订单（解析结果带有 original_tid）
         is_merged_order = any(p.original_tid for p in (parsed_list or []))
@@ -356,13 +362,13 @@ class FangguoAdapter(ErpAdapter):
             film_gift_code = item.raw.get('filmGiftCode', '') if item.raw else ''
             print(f"    [{idx}] id={item.id[:10]}..., title={item.title[:30]}..., is_void={item.is_void}, is_gift={is_gift}, filmGiftCode='{film_gift_code}', original_tid='{item.original_tid[:10]}'...")
         
-        # 获取所有非赠品、非作废的有效商品行
-        valid_items = [item for item in order.items if not self._is_gift_item(item) and not item.is_void]
-        valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gift_item(item) and not item.is_void]
+        # 获取所有非赠品、非补差价、非作废的有效商品行
+        valid_items = [item for item in order.items if not self._is_gift_item(item) and not self._is_price_difference_item(item) and not item.is_void]
+        valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gift_item(item) and not self._is_price_difference_item(item) and not item.is_void]
         
-        # 检查是否存在任何已作废或已退款的非赠品行
-        non_gift_items = [item for item in order.items if not self._is_gift_item(item)]
-        void_non_gift_items = [item for item in non_gift_items if item.is_void]
+        # 检查是否存在任何已作废或已退款的非赠品、非补差价商品行
+        non_gift_non_price_diff_items = [item for item in order.items if not self._is_gift_item(item) and not self._is_price_difference_item(item)]
+        void_non_gift_items = [item for item in non_gift_non_price_diff_items if item.is_void]
         if void_non_gift_items:
             print(f"  ⏭️  跳过：存在已作废或已退款的商品行")
             return None
@@ -497,10 +503,10 @@ class FangguoAdapter(ErpAdapter):
                             "price": item.price,
                         })
 
-        # 第三步：保留未匹配的非作废、非赠品商品行（保持原样，不修改）
+        # 第三步：保留未匹配的非作废、非赠品、非补差价商品行（保持原样，不修改）
         # 这对于合并订单非常重要：被跳过的子订单的商品行需要保留
         for idx, item in enumerate(order.items):
-            if idx not in used_item_indices and not item.is_void and not self._is_gift_item(item):
+            if idx not in used_item_indices and not item.is_void and not self._is_gift_item(item) and not self._is_price_difference_item(item):
                 if item.raw:
                     order_items.append(item.raw)
                 else:
@@ -537,6 +543,24 @@ class FangguoAdapter(ErpAdapter):
                         "shopMappingSku": item.shop_mapping_sku,
                         "cancelStatus": True,
                     })
+
+        # 第五步：处理补差价商品行
+        if price_diff_updates:
+            for update in price_diff_updates:
+                for item in update['items']:
+                    item_idx = None
+                    for idx, ord_item in enumerate(order.items):
+                        if ord_item.id == item.id:
+                            item_idx = idx
+                            break
+                    
+                    if item_idx is not None and item_idx not in used_item_indices:
+                        if update['ship']:
+                            new_item = self._build_order_item_keep_sku(item, order, num=1)
+                        else:
+                            new_item = self._build_price_diff_no_ship_item(item, order)
+                        order_items.append(new_item)
+                        used_item_indices.add(item_idx)
 
         payload = {
             "orderType": 0,
@@ -849,7 +873,7 @@ class FangguoAdapter(ErpAdapter):
             "workUrl": None,
             "effectUrl": None,
             "productionPicPath": None,
-            "num": 1,
+            "num": gift_num,
             "price": 0,
             "skuPropertiesName": sku_properties_name_field,
             "outerIid": "",
@@ -950,6 +974,8 @@ class FangguoAdapter(ErpAdapter):
         order_items.append(new_gift)
         return len(order_items) - 1
 
+    _PRICE_DIFF_KEYWORDS = ["补差价专拍", "差价专用", "少几元拍几个"]
+
     def _is_gift_item(self, item: OrderItem) -> bool:
         """判断一个商品行是否是赠品行
         
@@ -980,6 +1006,14 @@ class FangguoAdapter(ErpAdapter):
         
         return False
 
+    def _is_price_difference_item(self, item: OrderItem) -> bool:
+        """判断商品行是否为补差价商品"""
+        if item.title:
+            for keyword in self._PRICE_DIFF_KEYWORDS:
+                if keyword in item.title:
+                    return True
+        return False
+
     # -------------------------------------------------------------------
     # 工具方法
     # -------------------------------------------------------------------
@@ -994,3 +1028,336 @@ class FangguoAdapter(ErpAdapter):
     def get_material_matcher(self):
         """返回材质自动匹配回调"""
         return self._material_source.auto_match if hasattr(self._material_source, 'auto_match') else None
+
+    def update_price_difference_order(self, order: Order, items: list = None, ship: bool = True) -> bool:
+        """
+        处理补差价订单：
+        - ship=True: 仅修改数量为1（默认，差价需要发货）
+        - ship=False: 修改编码为"定制-定制-补差价-不打印"，数量改为1（差价不发货）
+        
+        Args:
+            order: 订单对象
+            items: 指定要修改的商品行列表（用于合并订单，默认使用所有商品行）
+            ship: 是否需要发货，False表示不发货（使用特殊编码）
+        """
+        target_items = items or order.items
+        
+        print(f"  🔧 处理补差价订单: ship={ship}, items={len(target_items)}")
+        
+        order_items = []
+        used_item_indices = set()
+        
+        for idx, item in enumerate(order.items):
+            if item in target_items:
+                if ship:
+                    new_item = self._build_order_item_keep_sku(item, order, num=1)
+                else:
+                    new_item = self._build_price_diff_no_ship_item(item, order)
+                order_items.append(new_item)
+                used_item_indices.add(idx)
+            else:
+                if item.raw:
+                    order_items.append(item.raw)
+                else:
+                    order_items.append({
+                        "id": item.id,
+                        "orderId": item.order_id,
+                        "sysOid": item.sys_oid,
+                        "oid": item.oid,
+                        "title": item.title,
+                        "skuPropertiesName": item.sku_properties_name,
+                        "shopMappingSku": item.shop_mapping_sku,
+                        "originalSkuId": item.original_sku_id,
+                        "originalGoodsId": item.original_goods_id,
+                        "merchandisePicPath": item.merchandise_pic_path,
+                        "num": item.num,
+                        "price": item.price,
+                        "shopRemark": item.shop_remark or "",
+                    })
+        
+        payload = {
+            "orderType": 0,
+            "id": order.trade_id,
+            "shopRemark": order.shop_remark or "",
+            "buyerRemark": order.buyer_remark or "",
+            "factoryId": order.factory_id,
+            "platform": 0,
+            "platformDesc": "",
+            "allManualOrder": False,
+            "sysTid": order.sys_tid,
+            "tid": order.tid,
+            "dfStatus": 0,
+            "tradeInitNum": 1,
+            "orderItems": order_items,
+            "totalCount": len(order_items),
+            "outerOrderStatusDesc": "",
+            "storeName": order.store_name,
+            "goodsIndex": 0,
+            "shopId": "",
+        }
+        
+        try:
+            payload_str = json.dumps(payload, ensure_ascii=False)
+            if len(payload_str) > 2000:
+                print(f"  📤 发送payload: totalCount={payload['totalCount']}, items={len(payload['orderItems'])}个")
+                for i, it in enumerate(payload['orderItems']):
+                    print(f"      item[{i}]: id={it.get('id','')}, oid={it.get('oid','')}, sku={str(it.get('shopMappingSku',''))[:50]}, num={it.get('num',1)}")
+            else:
+                print(f"  📤 发送payload: {payload_str[:500]}")
+        except:
+            pass
+        
+        resp = self._session.post(fg_config.API_SAVE_PRODUCT, json=payload, timeout=30)
+        resp.raise_for_status()
+        result = resp.json()
+        
+        if result.get("code") == 0 and result.get("data") is True:
+            return True
+        else:
+            error_msg = result.get("msg", "未知错误")
+            raw_body = json.dumps(result, ensure_ascii=False, indent=2)
+            print(f"  ❌ 接口返回失败: code={result.get('code')}, msg={error_msg}")
+            print(f"  🔍 API返回原文:\n{raw_body}")
+            return False
+
+    def _build_order_item_keep_sku(self, item: OrderItem, order: Order, num: int = 1) -> dict:
+        """
+        构建商品行，保持原有商家编码不变，仅修改数量
+        """
+        return {
+            "materialId": None,
+            "materialCode": item.raw.get("materialCode", "") if item.raw else "",
+            "materialCodeName": None,
+            "technology": None,
+            "printWayId": None,
+            "multiImageUrlExists": None,
+            "multiHolePic": None,
+            "multiImageExists": None,
+            "modelId": None,
+            "modelCode": item.raw.get("modelCode", "") if item.raw else "",
+            "modelCodeName": None,
+            "brand": None,
+            "customSize": True,
+            "isCompactModel": None,
+            "compactFactoryModelCode": None,
+            "compactFactoryModelName": None,
+            "compactFactoryModelId": None,
+            "colorId": None,
+            "colorCode": item.raw.get("colorCode", "") if item.raw else "",
+            "colorCodeName": None,
+            "customPicture": True,
+            "pictureId": None,
+            "pictureType": None,
+            "pictureCode": item.raw.get("pictureCode", "") if item.raw else "",
+            "picTypeId": None,
+            "pictureCodePath": None,
+            "pictureEffectPicPath": None,
+            "familyNamePic": None,
+            "folderId": None,
+            "mustUrlPictureCheckSuccess": False,
+            "designerPicCheck": None,
+            "sizeMap": None,
+            "designPicList": None,
+            "effectPicList": None,
+            "factorySkuId": None,
+            "putSale": None,
+            "stockOut": None,
+            "combinationGoods": False,
+            "factorySkuShopIdS": None,
+            "holeSitePic": None,
+            "picTechnology": None,
+            "map4decodeGift": None,
+            "map4FactoryDecodeGift": None,
+            "multiplePicList": None,
+            "giftBOList": [],
+            "giftList": None,
+            "giftMaterialList": None,
+            "giftCodeName": None,
+            "filmGiftCodeId": None,
+            "filmGiftCode": "",
+            "filmGiftNum": 0,
+            "filmGiftPicCode": None,
+            "decorationGiftCodeId": None,
+            "decorationGiftCode": "",
+            "decorationGiftNum": 0,
+            "decorationGiftPicCode": None,
+            "giftsWithOrder": [],
+            "picChange": 0,
+            "orderId": item.order_id,
+            "originalSkuId": item.original_sku_id,
+            "originalGoodsId": item.original_goods_id,
+            "id": item.id,
+            "sysOid": item.sys_oid,
+            "oid": item.oid,
+            "title": item.title,
+            "merchandisePicPath": item.merchandise_pic_path,
+            "workUrl": None,
+            "effectUrl": None,
+            "productionPicPath": None,
+            "num": num,
+            "price": item.price,
+            "skuPropertiesName": item.sku_properties_name,
+            "outerIid": "",
+            "shopMappingSku": item.shop_mapping_sku,
+            "diyList": [{
+                "bg": "", "mask": "", "picName": "",
+                "isPicMove": 1, "sort": 1,
+                "effectUrl": "", "workUrl": "",
+                "mobileIdentityNo": None, "picSourceType": 0,
+                "layerList": [], "mobileLayerList": None, "lastImgUrl": None,
+            }],
+            "productType": 0,
+            "productSn": None,
+            "boxGiftCode": None,
+            "shopRemark": order.shop_remark or "",
+            "buyerRemark": order.buyer_remark or "",
+            "tid": order.tid,
+            "originTradeId": order.trade_id,
+            "oldSysTid": None,
+            "magnifyingSelectPic": False,
+            "copySortFlag": 1,
+            "logisticsOrderNum": None,
+            "logisticsCompanyCode": "ZTO",
+            "picType": 0,
+            "oldPicWatermarkFlag": 0,
+            "maxSendNum": None,
+            "isCombinationGoods": False,
+            "deriveSysOid": None,
+            "inventoryNum": None,
+            "picCode": item.raw.get("pictureCode", "") if item.raw else "",
+            "lockStatusDesc": "",
+            "lockStatus": False,
+            "packageQuantity": None,
+            "refundStatusDesc": "",
+            "cancelStatus": False,
+            "realModelCode": item.raw.get("modelCode", "") if item.raw else "",
+            "realModelId": None,
+            "type": 0,
+            "showRemarkInfo": True,
+            "check": True,
+            "loaded": True,
+        }
+
+    def _build_price_diff_no_ship_item(self, item: OrderItem, order: Order) -> dict:
+        """
+        构建补差价不发货的商品行，使用特殊编码"定制-定制-补差价-不打印"
+        """
+        material_code = "定制"
+        color_code = "定制"
+        model_code = "补差价"
+        picture_code = "不打印"
+        shop_mapping_sku = f"{material_code}-{color_code}-{model_code}-{picture_code}"
+        
+        return {
+            "materialId": None,
+            "materialCode": material_code,
+            "materialCodeName": None,
+            "technology": None,
+            "printWayId": None,
+            "multiImageUrlExists": None,
+            "multiHolePic": None,
+            "multiImageExists": None,
+            "modelId": None,
+            "modelCode": model_code,
+            "modelCodeName": None,
+            "brand": None,
+            "customSize": True,
+            "isCompactModel": None,
+            "compactFactoryModelCode": None,
+            "compactFactoryModelName": None,
+            "compactFactoryModelId": None,
+            "colorId": None,
+            "colorCode": color_code,
+            "colorCodeName": None,
+            "customPicture": True,
+            "pictureId": None,
+            "pictureType": None,
+            "pictureCode": picture_code,
+            "picTypeId": None,
+            "pictureCodePath": None,
+            "pictureEffectPicPath": None,
+            "familyNamePic": None,
+            "folderId": None,
+            "mustUrlPictureCheckSuccess": False,
+            "designerPicCheck": None,
+            "sizeMap": None,
+            "designPicList": None,
+            "effectPicList": None,
+            "factorySkuId": None,
+            "putSale": None,
+            "stockOut": None,
+            "combinationGoods": False,
+            "factorySkuShopIdS": None,
+            "holeSitePic": None,
+            "picTechnology": None,
+            "map4decodeGift": None,
+            "map4FactoryDecodeGift": None,
+            "multiplePicList": None,
+            "giftBOList": [],
+            "giftList": None,
+            "giftMaterialList": None,
+            "giftCodeName": None,
+            "filmGiftCodeId": None,
+            "filmGiftCode": "",
+            "filmGiftNum": 0,
+            "filmGiftPicCode": None,
+            "decorationGiftCodeId": None,
+            "decorationGiftCode": "",
+            "decorationGiftNum": 0,
+            "decorationGiftPicCode": None,
+            "giftsWithOrder": [],
+            "picChange": 0,
+            "orderId": item.order_id,
+            "originalSkuId": item.original_sku_id,
+            "originalGoodsId": item.original_goods_id,
+            "id": item.id,
+            "sysOid": item.sys_oid,
+            "oid": item.oid,
+            "title": item.title,
+            "merchandisePicPath": item.merchandise_pic_path,
+            "workUrl": None,
+            "effectUrl": None,
+            "productionPicPath": None,
+            "num": 1,
+            "price": item.price,
+            "skuPropertiesName": item.sku_properties_name,
+            "outerIid": "",
+            "shopMappingSku": shop_mapping_sku,
+            "diyList": [{
+                "bg": "", "mask": "", "picName": "",
+                "isPicMove": 1, "sort": 1,
+                "effectUrl": "", "workUrl": "",
+                "mobileIdentityNo": None, "picSourceType": 0,
+                "layerList": [], "mobileLayerList": None, "lastImgUrl": None,
+            }],
+            "productType": 0,
+            "productSn": None,
+            "boxGiftCode": None,
+            "shopRemark": order.shop_remark or "",
+            "buyerRemark": order.buyer_remark or "",
+            "tid": order.tid,
+            "originTradeId": order.trade_id,
+            "oldSysTid": None,
+            "magnifyingSelectPic": False,
+            "copySortFlag": 1,
+            "logisticsOrderNum": None,
+            "logisticsCompanyCode": "ZTO",
+            "picType": 0,
+            "oldPicWatermarkFlag": 0,
+            "maxSendNum": None,
+            "isCombinationGoods": False,
+            "deriveSysOid": None,
+            "inventoryNum": None,
+            "picCode": picture_code,
+            "lockStatusDesc": "",
+            "lockStatus": False,
+            "packageQuantity": None,
+            "refundStatusDesc": "",
+            "cancelStatus": False,
+            "realModelCode": model_code,
+            "realModelId": None,
+            "type": 0,
+            "showRemarkInfo": True,
+            "check": True,
+            "loaded": True,
+        }
