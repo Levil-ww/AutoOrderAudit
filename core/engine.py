@@ -102,7 +102,10 @@ class AutoAuditEngine:
             
             try:
                 ok = self.adapter.update_price_difference_order(order, price_diff_items, ship=False)
-                if ok:
+                if ok is None:
+                    print(f"  ⏭️  跳过：补差价订单编码已正确")
+                    self.stats["skipped"] += 1
+                elif ok:
                     print(f"  ✅ 修改成功！")
                     self.stats["success"] += 1
                 else:
@@ -126,7 +129,10 @@ class AutoAuditEngine:
         
         try:
             ok = self.adapter.update_price_difference_order(order, price_diff_items, ship=True)
-            if ok:
+            if ok is None:
+                print(f"  ⏭️  跳过：补差价订单数量已为1")
+                self.stats["skipped"] += 1
+            elif ok:
                 print(f"  ✅ 修改成功！数量已改为1")
                 self.stats["success"] += 1
             else:

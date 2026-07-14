@@ -371,3 +371,20 @@ valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gif
   1. 当商品编码与解析结果完全匹配时，输出"✅ 编码已正确，跳过修改"并返回 True
   2. 当商品编码不匹配时，执行修改逻辑（不会跳过）
   3. 普通订单使用集合比较验证，合并订单按 original_tid 逐行验证
+
+五、修复差价订单的重复修改问题  -->  差价订单的幂等优化
+修改内容：
+  1. adapter.py - update_price_difference_order 方法
+  - 添加了编码正确性检查逻辑：
+    - ship=True （差价需要发货）：检查商品行数量是否已为1
+    - ship=False （差价不发货）：检查编码是否为 定制-定制-补差价-不打印 且数量为1
+    - 如果已正确，返回 None 表示跳过
+
+  2. engine.py - _process_price_difference_order 方法
+    - "差价不发货"场景：处理 None 返回值，记录跳过统计
+    - "备注为空"场景：处理 None 返回值，记录跳过统计
+
+  3. adapter.py - update_merchant_code 方法
+    - 当普通商品行编码已正确时，额外检查合并订单中的补差价商品行是否也已正确
+    - 如果都正确，返回 True 表示跳过
+

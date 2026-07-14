@@ -396,8 +396,26 @@ class FangguoAdapter(ErpAdapter):
                 is_already_correct = current_non_gift_skus == expected_skus_set
         
         if is_already_correct:
-            print(f"  ✅ 编码已正确，跳过修改")
-            return True
+            # 检查补差价商品行是否也已经正确
+            price_diff_already_correct = True
+            if price_diff_updates:
+                for update in price_diff_updates:
+                    for item in update['items']:
+                        if update['ship']:
+                            if item.num != 1:
+                                price_diff_already_correct = False
+                                break
+                        else:
+                            expected_sku = "定制-定制-补差价-不打印"
+                            if item.shop_mapping_sku != expected_sku or item.num != 1:
+                                price_diff_already_correct = False
+                                break
+                    if not price_diff_already_correct:
+                        break
+            
+            if price_diff_already_correct:
+                print(f"  ✅ 编码已正确，跳过修改")
+                return True
 
         # 完全重建 orderItems，基于解析结果
         # 使用第一个有效商品行作为模板，保留必要的原始字段
@@ -1043,6 +1061,25 @@ class FangguoAdapter(ErpAdapter):
         target_items = items or order.items
         
         print(f"  🔧 处理补差价订单: ship={ship}, items={len(target_items)}")
+        
+        # 检查是否已经正确，跳过重复修改
+        is_already_correct = True
+        for item in target_items:
+            if ship:
+                # ship=True: 检查数量是否已经为1
+                if item.num != 1:
+                    is_already_correct = False
+                    break
+            else:
+                # ship=False: 检查编码是否为"定制-定制-补差价-不打印"且数量为1
+                expected_sku = "定制-定制-补差价-不打印"
+                if item.shop_mapping_sku != expected_sku or item.num != 1:
+                    is_already_correct = False
+                    break
+        
+        if is_already_correct:
+            print(f"  ✅ 补差价订单编码已正确，跳过修改")
+            return None
         
         order_items = []
         used_item_indices = set()
