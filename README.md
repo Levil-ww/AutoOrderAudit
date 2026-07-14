@@ -36,16 +36,19 @@ AutoOrderAudit/
 │       ├── config.py                  # 方果配置（API地址、材质映射、运行模式）
 │       ├── material_source.py         # 材质数据源（从API拉取材质列表）
 │       └── ExampleFangguo.txt         # 示例/模板文件
+│
 ├── core/                              # 核心引擎模块（通用，不依赖具体ERP）
 │   ├── __init__.py                    # 包入口，导出核心类
 │   ├── adapter_base.py                # ERP适配器抽象接口基类
 │   ├── engine.py                      # 自动审单引擎（核心流程编排）
 │   └── parser.py                      # 卖家备注解析引擎（正则+规则）
+│
 ├── Test/                              # 测试模块
 ├── auth_client.py                     # 方果登录客户端（封装登录API）
 ├── auth_manager.py                    # Token管理（自动登录/保存/刷新）
 ├── gui.py                             # 图形界面（tkinter美化版）
 ├── run_gui.py                         # GUI启动脚本
+│
 ├── test.py                            # 测试入口脚本
 ├── token.json                         # Token存储文件（程序自动管理）
 ├── requirements.txt                   # Python依赖列表
