@@ -406,8 +406,8 @@ class FangguoAdapter(ErpAdapter):
         order_items = []
         used_item_indices = set()
 
-        # 获取所有非赠品、非作废的有效商品行索引
-        valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gift_item(item) and not item.is_void]
+        # 获取所有非赠品、非补差价、非作废的有效商品行索引
+        valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gift_item(item) and not self._is_price_difference_item(item) and not item.is_void]
 
         # 第一步：为每个解析结果创建商品行（按 original_tid 匹配）
         for p in effective_list:

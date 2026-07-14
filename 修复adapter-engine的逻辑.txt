@@ -298,7 +298,7 @@ for tid in groups:
 
 
 2026.7.14
-关于订单中补差价订单的修改逻辑：
+一、关于订单中补差价订单的修改逻辑：
   单一订单（只是补差价订单） -> 备注含有定制信息 -> 按照备注解析，修改编码和数量
                           -> 备注没有信息（空白） -> 不修改，跳过该订单
   多订单（有原始订单信息，也有补差价订单） -> 普通的多商品订单（订单中含有补差价订单）： -> 备注含有定制信息 -> 按照备注解析，修改编码和数量
@@ -335,7 +335,7 @@ adapter.py
     合并订单中的补差价分组         按分组单独处理，支持同时处理普通商品和补差价商品
 
 
-修复差价问题后，出现原本的普通订单的修改逻辑实现错误。
+二、修复差价问题后，出现原本的普通订单的修改逻辑实现错误。
   程序运行报告的错误为：• 订单 2076861456319741954: name '_PRICE_DIFF_KEYWORDS' is not defined  -- 说明代码中引用了未定义的变量
 问题根因：在 adapter.py 中， _PRICE_DIFF_KEYWORDS 是定义在 FangguoAdapter 类上的类属性（第 977 行），但在 _is_price_difference_item 方法中（第 1012 行）被引用时缺少 self. 前缀，导致 Python 无法在正确的作用域中找到该变量。
   修复内容：  代码1012行：  for keyword in _PRICE_DIFF_KEYWORDS:
@@ -345,10 +345,29 @@ adapter.py
          - 普通商品 → 正确识别为 False
 
 
-修复赠品数量没有修改的问题
+三、修复赠品数量没有修改的问题
   备注 "定制镜面皮革蔓生花方形;竖版114x180cm裁剪有图-1张，赠品圆垫-2张" ：
     - 赠品编码 ： 吸水皮革-标准-赠品沥水垫小圆或小方-赠品沥水垫小圆或小方 （正确，不包含多余内容）
     - ✅ 赠品数量 ： 2 （正确，从备注中提取）
 
+四、关于修改编码验证逻辑
+测试一：编码已正确时跳过修改
+  - 返回值： True
+  - 输出： ✅ 编码已正确，跳过修改
+  - ✅ 通过
 
+测试二：编码不正确时执行修改
+  - 返回值： False （API请求失败，测试环境无真实ERP）
+  - 输出：不包含"编码已正确，跳过修改"
+  - ✅ 通过
 
+修复补差价商品行的过滤
+  # 修改前（缺少补差价过滤）
+valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gift_item(item) and not item.is_void]
+  # 修改后（添加补差价过滤）
+valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gift_item(item) and not self._is_price_difference_item(item) and not item.is_void]
+
+结论：程序已经正确实现了“编码已正确则跳过修改”的功能
+  1. 当商品编码与解析结果完全匹配时，输出"✅ 编码已正确，跳过修改"并返回 True
+  2. 当商品编码不匹配时，执行修改逻辑（不会跳过）
+  3. 普通订单使用集合比较验证，合并订单按 original_tid 逐行验证
