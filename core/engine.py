@@ -118,7 +118,13 @@ class AutoAuditEngine:
         
         if remark.strip():
             print(f"  📝 备注含信息，按正常解析逻辑处理")
-            self._process_normal_order_logic(order)
+            price_diff_updates = [{
+                'tid': order.tid,
+                'items': price_diff_items,
+                'remark': remark,
+                'ship': True,
+            }]
+            self._process_normal_order_logic(order, price_diff_updates)
             return
         
         print(f"  📝 备注为空，仅修改补差价商品行数量为1")

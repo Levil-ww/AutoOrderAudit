@@ -388,3 +388,24 @@ valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gif
     - 当普通商品行编码已正确时，额外检查合并订单中的补差价商品行是否也已正确
     - 如果都正确，返回 True 表示跳过
 
+
+六、关于补差价订单的数量修改并传递问题
+问题分析：
+    当订单包含补差价商品行且备注中有定制信息时，系统会按正常逻辑解析并修改普通商品行的编码，但 补差价商品行的数量没有被修改为1 。
+
+原因在于 engine.py 的 _process_price_difference_order 方法中（第119-122行），当备注含信息时调用 _process_normal_order_logic(order) 时， 没有传递补差价商品行的更新信息 。
+而 adapter.py 的 update_merchant_code 方法完全依赖 price_diff_updates 参数来处理补差价商品行（第565-581行），没有这个参数，补差价商品行就不会被修改。
+
+修复方案：
+    在 engine.py 中，当补差价订单备注含定制信息时，创建 price_diff_updates 参数并传递给 _process_normal_order_logic
+
+    if remark.strip():
+    print(f"  📝 备注含信息，按正常解析逻辑处理")
+    price_diff_updates = [{
+        'tid': order.tid,
+        'items': price_diff_items,
+        'remark': remark,
+        'ship': True,
+    }]
+    self._process_normal_order_logic(order, price_diff_updates)
+    return
