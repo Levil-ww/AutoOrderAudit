@@ -101,6 +101,9 @@ _RE_QTY_SUMMARY = re.compile(rf"共(?:计)?{_CHINESE_NUMBERS}[张个件套米]")
 # 到货返信息匹配（如"到货返22"、"到货返50元"）
 _RE_ARRIVAL_REFUND = re.compile(r"到货返\d+[元]?")
 
+# 无关词语匹配（如"桌垫"、"地垫"等，作为后缀时应过滤）
+_RE_IRRELEVANT_SUFFIX = re.compile(r"(桌垫|地垫)[，,；;]?")
+
 # 花型关键词
 _PATTERN_KEYWORDS = ["花幔", "卢浮梦境", "安妮森林", "暗夜缪斯", "萃园", 
 "玫瑰骑士", "花园秘境", "复古大花", "中古大花","凯特玫瑰","中古花园",
@@ -227,6 +230,8 @@ def parse_remark(
         after_cm = _RE_QTY_SUMMARY.sub("", after_cm).strip()
         # 过滤掉"到货返xx"这种无关备注
         after_cm = _RE_ARRIVAL_REFUND.sub("", after_cm).strip()
+        # 过滤掉"桌垫"、"地垫"等无关词语
+        after_cm = _RE_IRRELEVANT_SUFFIX.sub("", after_cm).strip()
 
         # 去掉赠品信息：找到最早的赠品关键词位置，然后向前找到分隔符
         # 处理"小垫子总共送3个"这种模式，把"小垫子"也去掉
@@ -255,8 +260,12 @@ def parse_remark(
 
     # 提取花型名称：从分号前的文本中提取（去掉材质和定制前缀后）
     pattern_name = ""
-    if ";" in body:
-        before_semicolon = body.split(";", 1)[0].strip()
+    # 同时支持中文分号和英文分号
+    semicolon_pos = body.find(";")
+    if semicolon_pos == -1:
+        semicolon_pos = body.find("；")
+    if semicolon_pos != -1:
+        before_semicolon = body[:semicolon_pos].strip()
         # 去掉材质名（先从静态映射表，再从启发式列表）
         for key in sorted(material_map.keys(), key=len, reverse=True):
             if key in before_semicolon:
@@ -270,8 +279,8 @@ def parse_remark(
             else:
                 pattern_name = before_semicolon.strip().strip("-;,")
 
-    # 去掉可能残留的"定制"前缀
-    if pattern_name.startswith("定制"):
+    # 去掉可能残留的"定制"前缀（循环处理多个"定制"）
+    while pattern_name.startswith("定制"):
         pattern_name = pattern_name[2:].strip()
 
     # 先检查是否匹配已知花型关键词（更健壮的方式）
@@ -424,6 +433,8 @@ def extract_multiple_remarks(
                 clean_remark = _RE_QTY_SUMMARY.sub("", trailing_remark).strip().strip("-;,、，")
                 # 过滤掉"到货返xx"这种无关备注
                 clean_remark = _RE_ARRIVAL_REFUND.sub("", clean_remark).strip().strip("-;,、，")
+                # 过滤掉"桌垫"、"地垫"等无关词语
+                clean_remark = _RE_IRRELEVANT_SUFFIX.sub("", clean_remark).strip().strip("-;,、，")
                 # 再清理一次可能的数量汇总残留
                 clean_remark = re.sub(r'共(?:计)?\d+[张个件套米]', '', clean_remark).strip().strip('，,、;；')
                 clean_remark = re.sub(r'共(?:计)?[一二两三四五六七八九十]+[张个件套米]', '', clean_remark).strip().strip('，,、;；')
@@ -615,6 +626,7 @@ def _parse_multi_size_direct(
         after_cm = re.sub(r"-\d+[张个件套米]", "", after_cm).strip()
         after_cm = _RE_QTY_SUMMARY.sub("", after_cm).strip()
         after_cm = _RE_ARRIVAL_REFUND.sub("", after_cm).strip()
+        after_cm = _RE_IRRELEVANT_SUFFIX.sub("", after_cm).strip()
         remark_after_size = after_cm.strip().strip(";，,、")
 
     # 尝试提取材质
@@ -903,10 +915,10 @@ def _extract_gift(text: str) -> tuple[str, int]:
 
 _HEURISTIC_MATERIALS = ["双面革", "吸水皮革", "镜面皮革", "双面格", "软玻璃", "丝圈", "防滑皮革", "仿皮"]
 
-_PATTERN_CLEAN_PREFIXES = ["颜色分类:", "颜色分类", "真", "无痕", "止滑", "规格"]
+_PATTERN_CLEAN_PREFIXES = ["颜色分类:", "颜色分类", "真", "无痕", "止滑", "规格", "桌垫", "地垫"]
 
 def _clean_pattern_name(pattern_name: str) -> str:
-    """清理花型名称中的冗余前缀"""
+    """清理花型名称中的冗余前缀和无关词语"""
     if not pattern_name:
         return pattern_name
     
@@ -915,6 +927,9 @@ def _clean_pattern_name(pattern_name: str) -> str:
     for prefix in _PATTERN_CLEAN_PREFIXES:
         if result.startswith(prefix):
             result = result[len(prefix):].strip().strip("-;,、")
+    
+    for word in ["桌垫", "地垫"]:
+        result = result.replace(word, "").strip().strip("-;,、")
     
     result = result.strip().strip("-;,、")
     
@@ -1279,6 +1294,7 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
                     if after_comma and not _RE_SIZE.search(after_comma) and not _RE_ROUND_SIZE.search(after_comma):
                         after_comma = _RE_QTY_SUMMARY.sub("", after_comma).strip().strip("-;,、，")
                         after_comma = _RE_ARRIVAL_REFUND.sub("", after_comma).strip().strip("-;,、，")
+                        after_comma = _RE_IRRELEVANT_SUFFIX.sub("", after_comma).strip().strip("-;,、，")
                         if after_comma:
                             if trailing_remark:
                                 trailing_remark = f"{trailing_remark}，{after_comma}"
@@ -1521,6 +1537,7 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
                     if not _RE_SIZE.search(after_comma) and not _RE_ROUND_SIZE.search(after_comma) and after_comma:
                         after_comma = _RE_QTY_SUMMARY.sub("", after_comma).strip().strip("-;,、，")
                         after_comma = _RE_ARRIVAL_REFUND.sub("", after_comma).strip().strip("-;,、，")
+                        after_comma = _RE_IRRELEVANT_SUFFIX.sub("", after_comma).strip().strip("-;,、，")
                         if after_comma:
                             trailing_remark = after_comma
     
