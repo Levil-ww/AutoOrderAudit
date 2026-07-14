@@ -98,8 +98,8 @@ _CHINESE_NUMBERS = r"(?:[一二两三四五六七八九十]|\d+)"
 # 数量汇总信息匹配（如"共计两张"、"共三张"、"共计5张"）
 _RE_QTY_SUMMARY = re.compile(rf"共(?:计)?{_CHINESE_NUMBERS}[张个件套米]")
 
-# 到货返信息匹配（如"到货返22"、"到货返50元"）
-_RE_ARRIVAL_REFUND = re.compile(r"到货返\d+[元]?")
+# 到货返信息匹配（如"到货返22"、"到货返50元"、"确认收货返差价0.3元"）
+_RE_ARRIVAL_REFUND = re.compile(r"(到货返|确认收货返差价|返差价)\d+(?:\.\d+)?[元]?")
 
 # 无关词语匹配（如"桌垫"、"地垫"等，作为后缀时应过滤）
 _RE_IRRELEVANT_SUFFIX = re.compile(r"(桌垫|地垫)[，,；;]?")
@@ -224,8 +224,8 @@ def parse_remark(
     cm_match = re.search(r"cm(.*)", text, re.IGNORECASE)
     if cm_match:
         after_cm = cm_match.group(1)
-        # 去掉数量标记（如-1张），但保留其他内容
-        after_cm = re.sub(r"-\d+[张个件套米]", "", after_cm).strip()
+        # 去掉数量标记（如-1张、*2张），但保留其他内容
+        after_cm = re.sub(r"[-*×]\d+[张个件套米]", "", after_cm).strip()
         # 去掉数量汇总信息（如"共计2张"、"共三张"）
         after_cm = _RE_QTY_SUMMARY.sub("", after_cm).strip()
         # 过滤掉"到货返xx"这种无关备注
@@ -623,7 +623,7 @@ def _parse_multi_size_direct(
     cm_match = re.search(r"cm(.*)", text, re.IGNORECASE)
     if cm_match:
         after_cm = cm_match.group(1)
-        after_cm = re.sub(r"-\d+[张个件套米]", "", after_cm).strip()
+        after_cm = re.sub(r"[-*×]\d+[张个件套米]", "", after_cm).strip()
         after_cm = _RE_QTY_SUMMARY.sub("", after_cm).strip()
         after_cm = _RE_ARRIVAL_REFUND.sub("", after_cm).strip()
         after_cm = _RE_IRRELEVANT_SUFFIX.sub("", after_cm).strip()
@@ -1046,7 +1046,7 @@ def _extract_size_specific_remark(text: str, start_pos: int, end_pos: int, idx: 
             # 逗号后面到当前尺寸之间的文本
             between_text = text[comma_after_prev + 1:start_pos].strip().strip("-;,、")
             # 去掉数量标记（如"1张"）
-            between_text = re.sub(r"-\d+[张个件套米]", "", between_text).strip()
+            between_text = re.sub(r"[-*×]\d+[张个件套米]", "", between_text).strip()
             between_text = re.sub(r"\d+[张个件套米]", "", between_text).strip()
             before_text = between_text
         else:
@@ -1075,10 +1075,10 @@ def _extract_size_specific_remark(text: str, start_pos: int, end_pos: int, idx: 
         after_text = text[end_pos:next_size_pos].strip().strip("-;,、")
     
     # 去掉数量标记（如"-1张"）
-    after_text = re.sub(r"-\d+[张个件套米]", "", after_text).strip().strip("-;,")
+    after_text = re.sub(r"[-*×]\d+[张个件套米]", "", after_text).strip().strip("-;,")
     
     # 去掉before_text中的数量标记
-    before_text = re.sub(r"-\d+[张个件套米]", "", before_text).strip().strip("-;,")
+    before_text = re.sub(r"[-*×]\d+[张个件套米]", "", before_text).strip().strip("-;,")
     before_text = re.sub(r"\d+[张个件套米]", "", before_text).strip().strip("-;,")
     
     # 合并前后描述：对于后续尺寸，before_text（如"竖版"）应该在尺寸前面
@@ -1124,7 +1124,7 @@ def _extract_global_remark_after_sizes(text: str) -> str:
     after_comma = text[comma_pos + 1:].strip().strip("-;,、")
     
     # 去掉数量标记
-    after_comma = re.sub(r"-\d+[张个件套米]", "", after_comma).strip().strip("-;,")
+    after_comma = re.sub(r"[-*×]\d+[张个件套米]", "", after_comma).strip().strip("-;,")
     
     return after_comma
 
@@ -1282,7 +1282,7 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
             
             if comma_pos != -1:
                 after_comma = text[comma_pos + 1:].strip().strip("-;,、")
-                after_comma = re.sub(r"-\d+[张个件套米]", "", after_comma).strip().strip("-;,")
+                after_comma = re.sub(r"[-*×]\d+[张个件套米]", "", after_comma).strip().strip("-;,")
                 
                 gift_pos = -1
                 for kw in _GIFT_KEYWORDS:
@@ -1474,7 +1474,7 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
                 # 提取该尺寸的完整描述（从尺寸开始到下一个尺寸开始）
                 size_desc = text[size_start:next_size_start].strip()
                 
-                size_desc = re.sub(r"-\d+[张个件套米]", "", size_desc).strip()
+                size_desc = re.sub(r"[-*×]\d+[张个件套米]", "", size_desc).strip()
                 size_desc = re.sub(r"\d+[张个件套米]", "", size_desc).strip()
                 
                 if i < len(all_sizes_pos) - 1:
@@ -1525,7 +1525,7 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
             
             if comma_pos != -1:
                 after_comma = text[comma_pos + 1:].strip().strip("-;,、")
-                after_comma = re.sub(r"-\d+[张个件套米]", "", after_comma).strip().strip("-;,")
+                after_comma = re.sub(r"[-*×]\d+[张个件套米]", "", after_comma).strip().strip("-;,")
                 
                 gift_pos = -1
                 for kw in _GIFT_KEYWORDS:
@@ -1557,7 +1557,7 @@ def _clean_segment(segment: str) -> str:
         segment = segment[:gift_pos].strip()
     
     # 去掉数量标记（如"-1张"）
-    segment = re.sub(r"-\d+[张个件套米]", "", segment).strip()
+    segment = re.sub(r"[-*×]\d+[张个件套米]", "", segment).strip()
     segment = re.sub(r"\d+[张个件套米]", "", segment).strip()
     
     # 去掉数量汇总信息（如"共计2张"、"共三张"）
