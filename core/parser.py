@@ -899,6 +899,10 @@ def _extract_gift(text: str) -> tuple[str, int]:
     gift_text = re.sub(r"[一二两三四五六七八九十]+[张个件套米]", "", gift_text).strip()
     gift_text = gift_text.strip().strip("-;,、，")
     
+    gift_text = re.sub(r"\*(\d+)[张个件套米]?", "", gift_text).strip()
+    gift_text = re.sub(r"[-××](\d+)[张个件套米]?", "", gift_text).strip()
+    gift_text = gift_text.strip().strip("-;,、，")
+    
     size_match = _RE_SIZE.search(gift_text)
     if size_match:
         gift_name = gift_text.strip()

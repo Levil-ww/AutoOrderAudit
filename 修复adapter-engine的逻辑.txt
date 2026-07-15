@@ -409,3 +409,15 @@ valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gif
     }]
     self._process_normal_order_logic(order, price_diff_updates)
     return
+
+七、合并订单赠品行使用合并订单号的问题
+在 _build_gift_item 方法中， orderId 、 tid 和 originTradeId 字段直接使用了 order.trade_id 和 order.tid ，而合并订单的这些字段包含"&"连接的多个订单号，导致赠品行使用了错误的订单号。
+  解决方案：
+    1.- 新增 original_tid 参数 ：用于合并订单场景，指定赠品所属的原始订单号
+    2.- 使用原始订单号 ：在构建赠品行时， orderId 、 tid 和 originTradeId 使用 original_tid （如果提供），否则回退到 order.trade_id 和 order.tid
+
+
+八、解决赠品硬编码问题
+赠品编码还是显示的为“吸水皮革-标准-赠品沥水垫小圆或小方-赠品沥水垫小圆或小方”【赠品沥水垫小圆或小方*1】
+  问题在于 _extract_gift 函数没有正确清理赠品名称中的 *1 数量标记。让我先恢复正确的赠品编码格式，然后修复赠品名称提取逻辑：
+

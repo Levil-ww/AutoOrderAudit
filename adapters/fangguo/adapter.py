@@ -472,10 +472,12 @@ class FangguoAdapter(ErpAdapter):
         gift_name = ""
         gift_num = 0
         material_code = ""
+        gift_original_tid = ""
         for p in effective_list:
             if p.gift_name:
                 gift_name = p.gift_name
                 gift_num = p.gift_num
+                gift_original_tid = p.original_tid
             if p.material_code:
                 material_code = p.material_code
 
@@ -489,16 +491,16 @@ class FangguoAdapter(ErpAdapter):
             
             if existing_gift_idx is not None:
                 # 更新现有赠品行
-                new_gift = self._build_gift_item(order.items[existing_gift_idx], order, material_code, gift_name, gift_num, is_new=False)
+                new_gift = self._build_gift_item(order.items[existing_gift_idx], order, material_code, gift_name, gift_num, is_new=False, original_tid=gift_original_tid)
                 order_items.append(new_gift)
             else:
                 # 创建新赠品行（标识字段置空，ERP会创建新行）
                 if template_item:
-                    new_gift = self._build_gift_item(template_item, order, material_code, gift_name, gift_num, is_new=True)
+                    new_gift = self._build_gift_item(template_item, order, material_code, gift_name, gift_num, is_new=True, original_tid=gift_original_tid)
                 else:
                     new_gift = self._build_gift_item(
                         OrderItem(id=order.trade_id, order_id=order.trade_id, oid=order.tid, num=1),
-                        order, material_code, gift_name, gift_num, is_new=True,
+                        order, material_code, gift_name, gift_num, is_new=True, original_tid=gift_original_tid,
                     )
                 order_items.append(new_gift)
 
@@ -781,12 +783,13 @@ class FangguoAdapter(ErpAdapter):
             order, parsed,
         )
 
-    def _build_gift_item(self, item: OrderItem, order: Order, material_code: str, gift_name: str, gift_num: int, is_new: bool = False) -> dict:
+    def _build_gift_item(self, item: OrderItem, order: Order, material_code: str, gift_name: str, gift_num: int, is_new: bool = False, original_tid: str = "") -> dict:
         """构建赠品商品行
         
         Args:
             is_new: 是否为创建新赠品行。如果为True，标识字段置空，ERP会创建新行；
                     如果为False，保留原商品行的标识字段，用于更新现有赠品行
+            original_tid: 赠品所属的原始订单号，用于合并订单场景
         """
         gift_material = "吸水皮革"
         if "圆垫" in gift_name:
@@ -880,7 +883,7 @@ class FangguoAdapter(ErpAdapter):
             "decorationGiftPicCode": None,
             "giftsWithOrder": [],
             "picChange": 0,
-            "orderId": order.trade_id,
+            "orderId": original_tid or order.trade_id,
             "originalSkuId": original_sku_id_field,
             "originalGoodsId": original_goods_id_field,
             "id": id_field,
@@ -908,8 +911,8 @@ class FangguoAdapter(ErpAdapter):
             "boxGiftCode": None,
             "shopRemark": order.shop_remark or "",
             "buyerRemark": order.buyer_remark or "",
-            "tid": order.tid,
-            "originTradeId": order.trade_id,
+            "tid": original_tid or order.tid,
+            "originTradeId": original_tid or order.trade_id,
             "oldSysTid": None,
             "magnifyingSelectPic": False,
             "copySortFlag": 1,
@@ -937,7 +940,7 @@ class FangguoAdapter(ErpAdapter):
 
     def _handle_gift_item(self, order_items: list, order: Order, material_code: str,
                           gift_name: str, gift_num: int, template_item: OrderItem,
-                          used_item_indices: set) -> int | None:
+                          used_item_indices: set, original_tid: str = "") -> int | None:
         """处理赠品：更新已有赠品行或创建新的"""
         gift_material = "吸水皮革"
         if "圆垫" in gift_name:
@@ -971,22 +974,26 @@ class FangguoAdapter(ErpAdapter):
                     cloned['filmGiftPicCode'] = gift_code
                     cloned['shopMappingSku'] = gift_sku
                     cloned['realModelCode'] = model_code
+                    if original_tid:
+                        cloned['orderId'] = original_tid
+                        cloned['tid'] = original_tid
+                        cloned['originTradeId'] = original_tid
                     order_items.append(cloned)
                     used_item_indices.add(idx)
                     return idx
                 else:
-                    new_gift = self._build_gift_item(item, order, material_code, gift_name, gift_num, is_new=False)
+                    new_gift = self._build_gift_item(item, order, material_code, gift_name, gift_num, is_new=False, original_tid=original_tid)
                     order_items.append(new_gift)
                     used_item_indices.add(idx)
                     return idx
 
         # 没有找到现有赠品，创建新的赠品行
         if template_item:
-            new_gift = self._build_gift_item(template_item, order, material_code, gift_name, gift_num, is_new=True)
+            new_gift = self._build_gift_item(template_item, order, material_code, gift_name, gift_num, is_new=True, original_tid=original_tid)
         else:
             new_gift = self._build_gift_item(
                 OrderItem(id=order.trade_id, order_id=order.trade_id, oid=order.tid, num=1),
-                order, material_code, gift_name, gift_num, is_new=True,
+                order, material_code, gift_name, gift_num, is_new=True, original_tid=original_tid,
             )
 
         order_items.append(new_gift)
