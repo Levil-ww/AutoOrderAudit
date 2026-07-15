@@ -777,15 +777,17 @@ class FangguoAdapter(ErpAdapter):
 
     def _build_default_item(self, order: Order, parsed: ParsedRemark) -> dict:
         """没有商品行时的默认构造（新建行，ERP会创建新行）"""
-        return self._build_order_item(
+        item = self._build_order_item(
             OrderItem(id=None, order_id=order.trade_id,
                       oid=None, sys_oid=None, num=parsed.num),
             order, parsed,
         )
+        item['shopMappingSku'] = f'<font color="red">{item["shopMappingSku"]}</font>'
+        return item
 
     def _build_new_item(self, order: Order, parsed: ParsedRemark) -> dict:
         """超出原订单商品行数时，构建新商品行（所有标识字段置空，ERP创建新行）"""
-        return self._build_order_item(
+        item = self._build_order_item(
             OrderItem(id=None, order_id=order.trade_id,
                       oid=None, sys_oid=None,
                       original_sku_id=None, original_goods_id=None,
@@ -793,6 +795,8 @@ class FangguoAdapter(ErpAdapter):
                       price=0, num=parsed.num),
             order, parsed,
         )
+        item['shopMappingSku'] = f'<font color="red">{item["shopMappingSku"]}</font>'
+        return item
 
     def _build_gift_item(self, item: OrderItem, order: Order, material_code: str, gift_name: str, gift_num: int, is_new: bool = False, original_tid: str = "") -> dict:
         """构建赠品商品行
@@ -909,7 +913,11 @@ class FangguoAdapter(ErpAdapter):
             "price": 0,
             "skuPropertiesName": sku_properties_name_field,
             "outerIid": "",
-            "shopMappingSku": f"{gift_material}-标准-{model_code}-{picture_code}",
+            "shopMappingSku": (
+                f'<font color="red">{gift_material}-标准-{model_code}-{picture_code}</font>'
+                if is_new else
+                f"{gift_material}-标准-{model_code}-{picture_code}"
+            ),
             "diyList": [{
                 "bg": "", "mask": "", "picName": "",
                 "isPicMove": 1, "sort": 1,
