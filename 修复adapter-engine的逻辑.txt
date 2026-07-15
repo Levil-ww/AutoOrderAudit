@@ -467,3 +467,22 @@ valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gif
     title → 设为 gift_name（如“圆垫”“方垫”），确保后续 _is_gift_item 仍能通过“price=0 且标题含垫”规则识别赠品行
   2. 在_handle_gift_item 中：
     对已有赠品行的 cloned 更新逻辑做同样处理
+
+
+十一、优化备注信息仅有赠品的逻辑（原逻辑是备注不含有商品信息则跳过）
+问题分析：
+  原程序在 extract_multiple_remarks 无法解析出商品定制信息时直接返回空列表，导致 _process_single_order 检测到空列表就跳过处理。
+  仅有赠品说明时，由于没有材质和尺寸信息，parse_remark 的 success=False，最终导致订单被跳过。
+
+修改内容：
+  1. core/parser.py - extract_multiple_remarks：
+    在无法解析商品信息时（segments 为空且 parse_remark 失败），检查是否有赠品信息
+    如果有赠品，返回一个 success=False 但包含 gift_name 和 gift_num 的 ParsedRemark
+  2. adapters/fangguo/adapter.py - update_merchant_code：
+    移除赠品处理的 material_code 条件限制
+    当没有 material_code 时，默认使用 "吸水皮革" 作为赠品质材
+  3. core/engine.py - _process_single_order：
+    根据 parsed.success 判断是否有商品定制信息
+    仅有赠品时不打印商品摘要
+    添加 has_product_info and not gift_name 的跳过条件（既无商品信息又无赠品才跳过）
+    在 dry_run、confirm_callback、成功消息中处理 success=False 的情况

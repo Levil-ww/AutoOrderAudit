@@ -381,6 +381,15 @@ def extract_multiple_remarks(
         parsed = parse_remark(text, material_map, material_matcher)
         if parsed.success:
             results.append(parsed)
+        else:
+            gift_name, gift_num = _extract_gift(remark_text)
+            if gift_name and gift_num > 0:
+                results.append(ParsedRemark(
+                    gift_name=gift_name,
+                    gift_num=gift_num,
+                    success=False,
+                    raw_text=remark_text,
+                ))
         return results
 
     # 为每个商品段独立解析，支持材质和花型继承
@@ -453,6 +462,15 @@ def extract_multiple_remarks(
             if not r.gift_name:
                 r.gift_name = gift_name
                 r.gift_num = gift_num
+    else:
+        gift_name, gift_num = _extract_gift(remark_text)
+        if gift_name and gift_num > 0:
+            results.append(ParsedRemark(
+                gift_name=gift_name,
+                gift_num=gift_num,
+                success=False,
+                raw_text=remark_text,
+            ))
 
     return results
 

@@ -491,7 +491,8 @@ class FangguoAdapter(ErpAdapter):
             if p.material_code:
                 material_code = p.material_code
 
-        if gift_name and gift_num > 0 and material_code:
+        if gift_name and gift_num > 0:
+            effective_material_code = material_code or "吸水皮革"
             # 查找现有赠品行
             existing_gift_idx = None
             for idx, item in enumerate(order.items):
@@ -501,16 +502,16 @@ class FangguoAdapter(ErpAdapter):
             
             if existing_gift_idx is not None:
                 # 更新现有赠品行
-                new_gift = self._build_gift_item(order.items[existing_gift_idx], order, material_code, gift_name, gift_num, is_new=False, original_tid=gift_original_tid)
+                new_gift = self._build_gift_item(order.items[existing_gift_idx], order, effective_material_code, gift_name, gift_num, is_new=False, original_tid=gift_original_tid)
                 order_items.append(new_gift)
             else:
                 # 创建新赠品行（标识字段置空，ERP会创建新行）
                 if template_item:
-                    new_gift = self._build_gift_item(template_item, order, material_code, gift_name, gift_num, is_new=True, original_tid=gift_original_tid)
+                    new_gift = self._build_gift_item(template_item, order, effective_material_code, gift_name, gift_num, is_new=True, original_tid=gift_original_tid)
                 else:
                     new_gift = self._build_gift_item(
                         OrderItem(id=order.trade_id, order_id=order.trade_id, oid=order.tid, num=1),
-                        order, material_code, gift_name, gift_num, is_new=True, original_tid=gift_original_tid,
+                        order, effective_material_code, gift_name, gift_num, is_new=True, original_tid=gift_original_tid,
                     )
                 order_items.append(new_gift)
 

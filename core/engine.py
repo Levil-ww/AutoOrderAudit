@@ -186,13 +186,19 @@ class AutoAuditEngine:
             return
 
         parsed = parsed_list[0]
-        summary = (
-            f"  ✅ 材质: {parsed.material_code}  "
-            f"|  颜色: {parsed.color_code}  "
-            f"|  尺寸: {parsed.model_code}  "
-            f"|  花型: {parsed.picture_code}"
-        )
-        print(summary)
+        
+        has_product_info = parsed.success
+        
+        if has_product_info:
+            summary = (
+                f"  ✅ 材质: {parsed.material_code}  "
+                f"|  颜色: {parsed.color_code}  "
+                f"|  尺寸: {parsed.model_code}  "
+                f"|  花型: {parsed.picture_code}"
+            )
+            print(summary)
+        else:
+            print(f"  ℹ️  无商品定制信息")
 
         gift_name = ""
         gift_num = 0
@@ -203,11 +209,17 @@ class AutoAuditEngine:
                 break
         if gift_name:
             print(f"  🎁 赠品: {gift_name} x {gift_num}")
+        
+        if not has_product_info and not gift_name:
+            print(f"  ⏭️  跳过：无商品定制信息且无赠品")
+            self.stats["skipped"] += 1
+            return
 
         if self.dry_run:
             print()
             for parsed in parsed_list:
-                print(f"  🔶 DRY RUN: 新编码 = {parsed.shop_mapping_sku}")
+                if parsed.success:
+                    print(f"  🔶 DRY RUN: 新编码 = {parsed.shop_mapping_sku}")
             if gift_name:
                 print(f"  🔶 DRY RUN: 将添加赠品商品行 = {gift_name} x {gift_num}")
             if price_diff_updates:
@@ -220,7 +232,8 @@ class AutoAuditEngine:
         if self.confirm_callback:
             changes = []
             for p in parsed_list:
-                changes.append(f"新编码: {p.shop_mapping_sku}")
+                if p.success:
+                    changes.append(f"新编码: {p.shop_mapping_sku}")
             if gift_name:
                 changes.append(f"赠品: {gift_name} x {gift_num}")
             if price_diff_updates:
@@ -230,7 +243,10 @@ class AutoAuditEngine:
 
             should_update = self.confirm_callback(order, parsed_list, changes)
             if not should_update:
-                print(f"  ⏭️  用户取消：新编码 {parsed_list[0].shop_mapping_sku}（未修改）")
+                if parsed_list[0].success:
+                    print(f"  ⏭️  用户取消：新编码 {parsed_list[0].shop_mapping_sku}（未修改）")
+                else:
+                    print(f"  ⏭️  用户取消（未修改）")
                 self.stats["cancelled"] += 1
                 return
 
@@ -240,9 +256,14 @@ class AutoAuditEngine:
                 print(f"  ⏭️  跳过：订单所有商品行已作废")
                 self.stats["skipped"] += 1
             elif ok:
-                print(f"  ✅ 修改成功！新编码: {parsed_list[0].shop_mapping_sku}")
-                if len(parsed_list) > 1:
-                    print(f"  📦 包含 {len(parsed_list)} 个尺寸，已拆分处理")
+                if parsed_list[0].success:
+                    print(f"  ✅ 修改成功！新编码: {parsed_list[0].shop_mapping_sku}")
+                    if len(parsed_list) > 1:
+                        print(f"  📦 包含 {len(parsed_list)} 个尺寸，已拆分处理")
+                else:
+                    print(f"  ✅ 修改成功！")
+                if gift_name:
+                    print(f"  🎁 赠品已添加: {gift_name} x {gift_num}")
                 if price_diff_updates:
                     print(f"  ✅ 补差价订单修改成功！")
                 self.stats["success"] += 1
