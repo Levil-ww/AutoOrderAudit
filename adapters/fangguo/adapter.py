@@ -821,7 +821,7 @@ class FangguoAdapter(ErpAdapter):
             oid_field = None
             original_sku_id_field = None
             original_goods_id_field = None
-            title_field = ""
+            title_field = gift_name or ""
             merchandise_pic_path_field = None
             sku_properties_name_field = ""
         else:
@@ -830,7 +830,7 @@ class FangguoAdapter(ErpAdapter):
             oid_field = item.oid
             original_sku_id_field = item.original_sku_id
             original_goods_id_field = item.original_goods_id
-            title_field = ""
+            title_field = gift_name or ""
             merchandise_pic_path_field = item.merchandise_pic_path
             sku_properties_name_field = ""
 
@@ -882,10 +882,10 @@ class FangguoAdapter(ErpAdapter):
             "giftBOList": [],
             "giftList": None,
             "giftMaterialList": None,
-            "giftCodeName": "",
+            "giftCodeName": None,
             "filmGiftCodeId": None,
-            "filmGiftCode": gift_code,
-            "filmGiftNum": gift_num,
+            "filmGiftCode": "",
+            "filmGiftNum": 0,
             "filmGiftPicCode": None,
             "decorationGiftCodeId": None,
             "decorationGiftCode": "",
@@ -979,12 +979,13 @@ class FangguoAdapter(ErpAdapter):
                     cloned['colorCode'] = "标准"
                     cloned['pictureCode'] = picture_code
                     cloned['picCode'] = picture_code
-                    cloned['giftCodeName'] = ""
-                    cloned['filmGiftCode'] = gift_code
+                    cloned['giftCodeName'] = None
+                    cloned['filmGiftCode'] = ""
+                    cloned['filmGiftNum'] = 0
                     cloned['filmGiftPicCode'] = None
                     cloned['shopMappingSku'] = gift_sku
                     cloned['realModelCode'] = model_code
-                    cloned['title'] = ""
+                    cloned['title'] = gift_name or ""
                     cloned['skuPropertiesName'] = ""
                     if original_tid:
                         cloned['orderId'] = original_tid

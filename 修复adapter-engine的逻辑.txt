@@ -444,7 +444,7 @@ valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gif
 问题二：新建商品行数量硬编码为
   在 adapter.py 的 _build_new_item 和 _build_default_item 方法中， num 被硬编码为1。
     新建商品行数量正确设置为解析值
-    
+
 修复内容
  1. 修改 is_already_correct 检查逻辑
     普通订单 （第394-397行）：从比较SKU集合改为比较 (SKU, 数量) 元组集合
@@ -453,3 +453,17 @@ valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gif
  2. 修改 _build_new_item 和 _build_default_item 方法
     将 num=1 改为 num=parsed.num ，使用解析结果中的数量。
 
+
+十、修复成功赠品编码额外后缀问题
+根因分析：
+  在 adapter.py 中，_build_gift_item 和 _handle_gift_item 方法此前给赠品行设置了 filmGiftCode 和 filmGiftNum。ERP 系统会将其识别为独立的“赠品编码”并拼接显示，导致你看到的额外后缀“ 赠品沥水垫小圆或小方*1”。
+
+修复内容（adapters/fangguo/adapter.py）：
+
+  1. 在_build_gift_item 中：
+    filmGiftCode → 清空为 ""
+    filmGiftNum → 置 0
+    giftCodeName → 置 None
+    title → 设为 gift_name（如“圆垫”“方垫”），确保后续 _is_gift_item 仍能通过“price=0 且标题含垫”规则识别赠品行
+  2. 在_handle_gift_item 中：
+    对已有赠品行的 cloned 更新逻辑做同样处理
