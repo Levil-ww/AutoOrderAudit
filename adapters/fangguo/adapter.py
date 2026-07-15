@@ -352,8 +352,9 @@ class FangguoAdapter(ErpAdapter):
         else:
             effective_list = parsed_list or [parsed]
 
-        # 获取期望的商品编码集合
+        # 获取期望的商品编码集合（包含数量）
         expected_skus_set = {p.shop_mapping_sku for p in effective_list}
+        expected_sku_num_set = {(p.shop_mapping_sku, p.num) for p in effective_list}
         
         # 调试日志：打印每个商品行的信息
         print(f"  📋 商品行详情 ({len(order.items)} 行):")
@@ -378,12 +379,12 @@ class FangguoAdapter(ErpAdapter):
         is_already_correct = False
         if len(valid_items) == len(effective_list):
             if is_merged_order:
-                # 合并订单：按 original_tid 验证每个商品行的 SKU 是否正确
+                # 合并订单：按 original_tid 验证每个商品行的 SKU 和数量是否正确
                 parsed_by_tid = {p.original_tid: p for p in effective_list if p.original_tid}
                 all_matched = True
                 for item in valid_items:
                     p = parsed_by_tid.get(item.original_tid)
-                    if p and item.shop_mapping_sku != p.shop_mapping_sku:
+                    if p and (item.shop_mapping_sku != p.shop_mapping_sku or item.num != p.num):
                         all_matched = False
                         break
                     if not p and item.shop_mapping_sku:
@@ -391,9 +392,9 @@ class FangguoAdapter(ErpAdapter):
                         break
                 is_already_correct = all_matched
             else:
-                # 普通订单：集合比较即可
-                current_non_gift_skus = {item.shop_mapping_sku for item in valid_items if item.shop_mapping_sku}
-                is_already_correct = current_non_gift_skus == expected_skus_set
+                # 普通订单：比较SKU和数量
+                current_sku_num_set = {(item.shop_mapping_sku, item.num) for item in valid_items if item.shop_mapping_sku}
+                is_already_correct = current_sku_num_set == expected_sku_num_set
         
         if is_already_correct:
             # 检查补差价商品行是否也已经正确
@@ -414,8 +415,17 @@ class FangguoAdapter(ErpAdapter):
                         break
             
             if price_diff_already_correct:
-                print(f"  ✅ 编码已正确，跳过修改")
-                return True
+                gift_name = ""
+                gift_num = 0
+                for p in effective_list:
+                    if p.gift_name:
+                        gift_name = p.gift_name
+                        gift_num = p.gift_num
+                        break
+                
+                if not gift_name:
+                    print(f"  ✅ 编码已正确，跳过修改")
+                    return True
 
         # 完全重建 orderItems，基于解析结果
         # 使用第一个有效商品行作为模板，保留必要的原始字段
@@ -768,7 +778,7 @@ class FangguoAdapter(ErpAdapter):
         """没有商品行时的默认构造（新建行，ERP会创建新行）"""
         return self._build_order_item(
             OrderItem(id=None, order_id=order.trade_id,
-                      oid=None, sys_oid=None, num=1),
+                      oid=None, sys_oid=None, num=parsed.num),
             order, parsed,
         )
 
@@ -779,7 +789,7 @@ class FangguoAdapter(ErpAdapter):
                       oid=None, sys_oid=None,
                       original_sku_id=None, original_goods_id=None,
                       title=None, merchandise_pic_path=None,
-                      price=0, num=1),
+                      price=0, num=parsed.num),
             order, parsed,
         )
 
@@ -811,7 +821,7 @@ class FangguoAdapter(ErpAdapter):
             oid_field = None
             original_sku_id_field = None
             original_goods_id_field = None
-            title_field = None
+            title_field = ""
             merchandise_pic_path_field = None
             sku_properties_name_field = ""
         else:
@@ -820,9 +830,9 @@ class FangguoAdapter(ErpAdapter):
             oid_field = item.oid
             original_sku_id_field = item.original_sku_id
             original_goods_id_field = item.original_goods_id
-            title_field = item.title
+            title_field = ""
             merchandise_pic_path_field = item.merchandise_pic_path
-            sku_properties_name_field = item.sku_properties_name
+            sku_properties_name_field = ""
 
         return {
             "materialId": None,
@@ -872,7 +882,7 @@ class FangguoAdapter(ErpAdapter):
             "giftBOList": [],
             "giftList": None,
             "giftMaterialList": None,
-            "giftCodeName": gift_code,
+            "giftCodeName": "",
             "filmGiftCodeId": None,
             "filmGiftCode": gift_code,
             "filmGiftNum": gift_num,
@@ -969,11 +979,13 @@ class FangguoAdapter(ErpAdapter):
                     cloned['colorCode'] = "标准"
                     cloned['pictureCode'] = picture_code
                     cloned['picCode'] = picture_code
-                    cloned['giftCodeName'] = gift_code
+                    cloned['giftCodeName'] = ""
                     cloned['filmGiftCode'] = gift_code
-                    cloned['filmGiftPicCode'] = gift_code
+                    cloned['filmGiftPicCode'] = None
                     cloned['shopMappingSku'] = gift_sku
                     cloned['realModelCode'] = model_code
+                    cloned['title'] = ""
+                    cloned['skuPropertiesName'] = ""
                     if original_tid:
                         cloned['orderId'] = original_tid
                         cloned['tid'] = original_tid

@@ -1246,8 +1246,12 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
         potential_trailing = []
         
         for seg, qty in segments:
-            # 跳过以"送"开头的赠品段
-            if seg.strip().startswith("送"):
+            has_gift = False
+            for kw in _GIFT_KEYWORDS:
+                if kw in seg:
+                    has_gift = True
+                    break
+            if has_gift:
                 continue
             
             if _RE_SIZE.search(seg) or _RE_ROUND_SIZE.search(seg):
