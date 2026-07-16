@@ -467,6 +467,11 @@ class AutoAuditGUI:
         self._make_button(
             btn_group, "🗑 清空日志", "#6b7280", "#ffffff",
             self._clear_log, 10,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        self._make_button(
+            btn_group, "🚚 快递配置", COLORS["warning"], "#ffffff",
+            self._open_express_config, 10,
         ).pack(side=tk.LEFT)
 
         # 右侧进度条
@@ -700,6 +705,10 @@ class AutoAuditGUI:
         print("✅ 自动审单完成")
         print("━" * 60)
 
+    def _open_express_config(self):
+        """打开快递配置对话框"""
+        ExpressConfigDialog(self.root)
+
     def _on_close(self):
         if self._running:
             if not messagebox.askyesno("确认退出", "审单正在运行，确定退出吗？"):
@@ -710,6 +719,248 @@ class AutoAuditGUI:
             pass
         sys.stdout = sys.__stdout__
         self.root.destroy()
+
+
+class ExpressConfigDialog:
+    """快递配置对话框"""
+
+    def __init__(self, parent):
+        self.parent = parent
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("快递配置")
+        self.dialog.geometry("680x600")
+        self.dialog.configure(bg=COLORS["card_bg"])
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+        self.dialog.resizable(True, True)
+
+        self._center()
+        self._build_ui()
+
+    def _center(self):
+        self.dialog.update_idletasks()
+        pw = self.parent.winfo_width()
+        ph = self.parent.winfo_height()
+        px = self.parent.winfo_x()
+        py = self.parent.winfo_y()
+        w, h = 680, 600
+        x = px + (pw - w) // 2
+        y = py + (ph - h) // 2
+        self.dialog.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _build_ui(self):
+        import express_config as ec
+
+        container = tk.Frame(self.dialog, bg=COLORS["card_bg"], padx=20, pady=16)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        # 标题
+        tk.Label(
+            container, text="🚚 快递配置",
+            font=(FONT, 16, "bold"),
+            bg=COLORS["card_bg"], fg=COLORS["header_fg"],
+        ).pack(anchor="w", pady=(0, 12))
+
+        # 说明文字
+        tk.Label(
+            container,
+            text="• 备注关键词优先级高于省份规则\\n• 下方可修改各省份默认快递，也可添加新的快递公司",
+            font=(FONT, 9),
+            bg=COLORS["card_bg"], fg=COLORS["label_fg"],
+            justify=tk.LEFT,
+        ).pack(anchor="w", pady=(0, 10))
+
+        # 使用Notebook分两个标签页
+        notebook = ttk.Notebook(container)
+        notebook.pack(fill=tk.BOTH, expand=True, pady=(0, 12))
+
+        # ========== 标签页1：省份规则 ==========
+        tab1 = tk.Frame(notebook, bg=COLORS["card_bg"])
+        notebook.add(tab1, text="省份规则")
+
+        self._build_province_tab(tab1, ec)
+
+        # ========== 标签页2：快递类型 ==========
+        tab2 = tk.Frame(notebook, bg=COLORS["card_bg"])
+        notebook.add(tab2, text="快递类型")
+
+        self._build_express_tab(tab2, ec)
+
+        # 底部按钮
+        btn_frame = tk.Frame(container, bg=COLORS["card_bg"])
+        btn_frame.pack(fill=tk.X, pady=(4, 0))
+
+        tk.Button(
+            btn_frame, text="💾 保存配置", font=(FONT, 11, "bold"),
+            bg=COLORS["success"], fg="#ffffff",
+            padx=20, pady=6, relief=tk.FLAT, bd=0,
+            cursor="hand2", command=self._save_config,
+        ).pack(side=tk.RIGHT)
+
+        tk.Button(
+            btn_frame, text="🔄 恢复默认", font=(FONT, 11),
+            bg=COLORS["warning_bg"], fg=COLORS["warning"],
+            padx=16, pady=6, relief=tk.FLAT, bd=0,
+            cursor="hand2", command=self._reset_default,
+        ).pack(side=tk.RIGHT, padx=(0, 10))
+
+        tk.Button(
+            btn_frame, text="关闭", font=(FONT, 11),
+            bg=COLORS["card_bg"], fg=COLORS["label_fg"],
+            padx=16, pady=6, relief=tk.FLAT, bd=0,
+            cursor="hand2", command=self.dialog.destroy,
+        ).pack(side=tk.RIGHT, padx=(0, 10))
+
+    def _build_province_tab(self, parent, ec):
+        """构建省份规则标签页"""
+        # 表头
+        header = tk.Frame(parent, bg=COLORS["card_bg"])
+        header.pack(fill=tk.X, pady=(8, 4))
+
+        tk.Label(header, text="省份", font=(FONT, 10, "bold"),
+                 bg=COLORS["card_bg"], fg=COLORS["header_fg"], width=12).pack(side=tk.LEFT)
+        tk.Label(header, text="默认快递", font=(FONT, 10, "bold"),
+                 bg=COLORS["card_bg"], fg=COLORS["header_fg"]).pack(side=tk.LEFT, padx=(20, 0))
+
+        # 滚动区域
+        canvas_frame = tk.Frame(parent, bg=COLORS["card_bg"])
+        canvas_frame.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(canvas_frame, bg=COLORS["card_bg"], highlightthickness=0)
+        scrollbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=canvas.yview)
+        scroll_frame = tk.Frame(canvas, bg=COLORS["card_bg"])
+
+        scroll_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 加载当前配置
+        self.province_vars = {}
+        rules = ec.get_all_province_rules()
+        express_names = ec.get_all_express_names()
+
+        row = 0
+        for province in sorted(rules.keys(), key=lambda x: (len(x), x)):
+            frame = tk.Frame(scroll_frame, bg=COLORS["card_bg"])
+            frame.pack(fill=tk.X, pady=2)
+
+            tk.Label(frame, text=province, font=(FONT, 10),
+                     bg=COLORS["card_bg"], fg=COLORS["text_fg"], width=12, anchor="w").pack(side=tk.LEFT)
+
+            var = tk.StringVar(value=rules.get(province, ""))
+            self.province_vars[province] = var
+
+            cb = ttk.Combobox(frame, textvariable=var, values=express_names,
+                              state="readonly", width=14, font=(FONT, 10))
+            cb.pack(side=tk.LEFT, padx=(20, 0))
+
+            row += 1
+
+    def _build_express_tab(self, parent, ec):
+        """构建快递类型标签页"""
+        # 当前列表
+        list_frame = tk.Frame(parent, bg=COLORS["card_bg"])
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 8))
+
+        tk.Label(list_frame, text="当前快递类型", font=(FONT, 11, "bold"),
+                 bg=COLORS["card_bg"], fg=COLORS["header_fg"]).pack(anchor="w")
+
+        self.express_tree = ttk.Treeview(list_frame, columns=("name", "code"), show="headings", height=10)
+        self.express_tree.heading("name", text="快递公司")
+        self.express_tree.heading("code", text="ERP编码")
+        self.express_tree.column("name", width=160, anchor="w")
+        self.express_tree.column("code", width=160, anchor="w")
+        self.express_tree.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+
+        self._refresh_express_list(ec)
+
+        # 添加区域
+        add_frame = tk.Frame(parent, bg=COLORS["card_bg"], pady=10)
+        add_frame.pack(fill=tk.X)
+
+        tk.Label(add_frame, text="添加快递:", font=(FONT, 10),
+                 bg=COLORS["card_bg"], fg=COLORS["text_fg"]).pack(side=tk.LEFT)
+
+        self.new_name_var = tk.StringVar()
+        tk.Entry(add_frame, textvariable=self.new_name_var, font=(FONT, 10),
+                 width=12, relief=tk.SOLID, bd=1).pack(side=tk.LEFT, padx=(6, 0))
+
+        tk.Label(add_frame, text="编码:", font=(FONT, 10),
+                 bg=COLORS["card_bg"], fg=COLORS["text_fg"]).pack(side=tk.LEFT, padx=(10, 0))
+
+        self.new_code_var = tk.StringVar()
+        tk.Entry(add_frame, textvariable=self.new_code_var, font=(FONT, 10),
+                 width=12, relief=tk.SOLID, bd=1).pack(side=tk.LEFT, padx=(6, 0))
+
+        tk.Button(
+            add_frame, text="➕ 添加", font=(FONT, 10),
+            bg=COLORS["accent"], fg="#ffffff",
+            padx=12, pady=3, relief=tk.FLAT, bd=0,
+            cursor="hand2", command=self._add_express_type,
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
+        tk.Button(
+            add_frame, text="🗑 删除选中", font=(FONT, 10),
+            bg=COLORS["danger_bg"], fg=COLORS["danger"],
+            padx=12, pady=3, relief=tk.FLAT, bd=0,
+            cursor="hand2", command=self._remove_selected_express,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
+    def _refresh_express_list(self, ec):
+        """刷新快递类型列表"""
+        for item in self.express_tree.get_children():
+            self.express_tree.delete(item)
+        config = ec.load_config()
+        for name, code in config.get("express_codes", {}).items():
+            self.express_tree.insert("", tk.END, values=(name, code))
+
+    def _add_express_type(self):
+        import express_config as ec
+        name = self.new_name_var.get().strip()
+        code = self.new_code_var.get().strip()
+        if not name or not code:
+            messagebox.showwarning("输入不完整", "请填写快递公司名称和编码", parent=self.dialog)
+            return
+        ec.add_express_type(name, code)
+        self._refresh_express_list(ec)
+        self.new_name_var.set("")
+        self.new_code_var.set("")
+        messagebox.showinfo("添加成功", f"已添加 {name} ({code})", parent=self.dialog)
+
+    def _remove_selected_express(self):
+        import express_config as ec
+        selected = self.express_tree.selection()
+        if not selected:
+            messagebox.showwarning("未选择", "请先选中要删除的快递类型", parent=self.dialog)
+            return
+        item = selected[0]
+        values = self.express_tree.item(item, "values")
+        name = values[0]
+        if messagebox.askyesno("确认删除", f"确定删除快递类型 '{name}' 吗？\\n（使用该快递的省份规则也会被清除）", parent=self.dialog):
+            ec.remove_express_type(name)
+            self._refresh_express_list(ec)
+            # 刷新省份页的下拉框需要重建，简单处理是提示用户重新打开
+            messagebox.showinfo("已删除", "快递类型已删除，请关闭窗口重新打开以刷新省份下拉框", parent=self.dialog)
+
+    def _save_config(self):
+        import express_config as ec
+        # 保存省份规则
+        for province, var in self.province_vars.items():
+            ec.update_province_rule(province, var.get())
+        messagebox.showinfo("保存成功", "快递配置已保存", parent=self.dialog)
+
+    def _reset_default(self):
+        import express_config as ec
+        if messagebox.askyesno("确认恢复", "确定恢复为默认配置吗？所有自定义修改将丢失。", parent=self.dialog):
+            ec.reset_to_default()
+            messagebox.showinfo("已恢复", "已恢复默认配置，请关闭窗口重新打开", parent=self.dialog)
+            self.dialog.destroy()
 
 
 def main():

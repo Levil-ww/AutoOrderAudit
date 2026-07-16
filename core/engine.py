@@ -313,6 +313,8 @@ class AutoAuditEngine:
 
             try:
                 self._process_order(order)
+                # 处理完商品编码后，统一处理快递
+                self._update_express_for_order(order)
             except Exception as e:
                 self.stats["failed"] += 1
                 self.stats["errors"].append(str(e))
@@ -548,6 +550,49 @@ class AutoAuditEngine:
             print(f"  ❌ 请求异常: {e}")
             self.stats["failed"] += 1
             self.stats["errors"].append(f"订单 {order.trade_id}: {e}")
+
+    def _update_express_for_order(self, order):
+        """
+        根据备注关键词或省份规则，自动更新订单快递信息
+        优先级：备注关键词 > 省份规则
+        """
+        from express_config import get_express_by_remark, get_express_for_province, get_express_code
+
+        remark = order.shop_remark or ""
+        province = order.receiver_province or ""
+
+        # 1. 优先检测备注关键词
+        express_name = get_express_by_remark(remark)
+        match_source = "备注关键词"
+
+        # 2. 如果没有匹配到关键词，使用省份规则
+        if not express_name and province:
+            express_name = get_express_for_province(province)
+            match_source = f"省份规则({province})"
+
+        if not express_name:
+            return
+
+        express_code = get_express_code(express_name)
+        if not express_code:
+            print(f"  ⚠️  快递编码未找到: {express_name}")
+            return
+
+        if self.dry_run:
+            print(f"  🔶 DRY RUN: 将更新快递为 {express_name}({express_code})，来源: {match_source}")
+            return
+
+        # 检查适配器是否支持更新快递
+        if not hasattr(self.adapter, 'update_express'):
+            return
+
+        try:
+            ok = self.adapter.update_express(order, express_code)
+            if ok:
+                print(f"  ✅ 快递已更新: {express_name}({express_code})，来源: {match_source}")
+            # 失败日志由 adapter.update_express 内部打印
+        except Exception as e:
+            print(f"  ❌ 快递更新异常: {e}")
 
     def _print_summary(self):
         print("\n" + "=" * 60)

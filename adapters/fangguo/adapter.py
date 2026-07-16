@@ -169,6 +169,23 @@ class FangguoAdapter(ErpAdapter):
             "买家留言", "buyer_remark",
         ])
 
+        # 提取省份和地址信息（尝试多种可能的字段名）
+        receiver_province = self._extract_field(raw, [
+            "receiverProvinceName", "receiverProvince", "province",
+            "receiverProvinceCode", "provinceName", "省",
+        ])
+        receiver_address = self._extract_field(raw, [
+            "receiverAddress", "address", "receiverAddressStrs",
+            "receiverAddressDetail", "详细地址",
+        ])
+        # 如果省份为空，尝试从地址中解析省份
+        if not receiver_province and receiver_address:
+            receiver_province = self._extract_province_from_address(receiver_address)
+
+        # 调试日志：打印原始省份和地址字段（方便排查）
+        if receiver_province or receiver_address:
+            print(f"  📍 收件地址: 省份={receiver_province or '未知'}, 地址={receiver_address[:30] if receiver_address else ''}...")
+
         order = Order(
             id=str(raw.get("id") or ""),
             trade_id=str(raw.get("tradeId") or raw.get("id") or ""),
@@ -179,6 +196,8 @@ class FangguoAdapter(ErpAdapter):
             tid=str(raw.get("tid") or raw.get("tradeId") or ""),
             store_name=str(raw.get("storeName") or ""),
             raw=raw,
+            receiver_province=receiver_province,
+            receiver_address=receiver_address,
         )
 
         # 如果订单级没取到备注，尝试从商品行取
@@ -1082,6 +1101,34 @@ class FangguoAdapter(ErpAdapter):
                 return str(val).strip()
         return ""
 
+    def _extract_province_from_address(self, address: str) -> str:
+        """从地址字符串中解析省份"""
+        if not address:
+            return ""
+        address = str(address).strip()
+
+        # 中国省级行政区列表（用于匹配）
+        provinces = [
+            "北京", "上海", "天津", "重庆",
+            "内蒙古", "广西", "西藏", "宁夏", "新疆",
+            "黑龙江", "吉林", "辽宁", "河北", "山西", "陕西", "甘肃", "青海",
+            "山东", "江苏", "安徽", "浙江", "江西", "福建", "台湾",
+            "河南", "湖北", "湖南", "广东", "海南", "香港", "澳门",
+            "四川", "贵州", "云南",
+        ]
+
+        # 优先匹配开头（最常见格式：省份+城市+...）
+        for prov in sorted(provinces, key=len, reverse=True):
+            if address.startswith(prov):
+                return prov
+
+        # 如果开头没匹配到，尝试在地址中查找省份名称
+        for prov in sorted(provinces, key=len, reverse=True):
+            if prov in address:
+                return prov
+
+        return ""
+
     def get_material_matcher(self):
         """返回材质自动匹配回调"""
         return self._material_source.auto_match if hasattr(self._material_source, 'auto_match') else None
@@ -1437,3 +1484,35 @@ class FangguoAdapter(ErpAdapter):
             "check": True,
             "loaded": True,
         }
+    # -------------------------------------------------------------------
+    # 4. 更新快递信息
+    # -------------------------------------------------------------------
+
+    def update_express(self, order, express_code):
+        """
+        调用 logistics/update 接口修改订单快递信息
+        """
+        payload = {
+            "tradeIdList": [order.trade_id],
+            "modifyCpCode": express_code,
+            "isOne": True,
+            "channelFlag": False,
+            "shopId": "",
+        }
+
+        try:
+            print(f"  📤 更新快递: tradeId={order.trade_id}, cpCode={express_code}")
+            resp = self._session.post(fg_config.API_UPDATE_LOGISTICS, json=payload, timeout=30)
+            resp.raise_for_status()
+            result = resp.json()
+
+            if result.get("code") == 0 and result.get("data") is True:
+                print(f"  ✅ 快递更新成功: {express_code}")
+                return True
+            else:
+                error_msg = result.get("msg", "未知错误")
+                print(f"  ❌ 快递更新失败: code={result.get('code')}, msg={error_msg}")
+                return False
+        except Exception as e:
+            print(f"  ❌ 快递更新请求异常: {e}")
+            return False

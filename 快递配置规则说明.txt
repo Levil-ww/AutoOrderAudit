@@ -1,0 +1,129 @@
+2026.7.15
+方案一、 由于不知道确切的字段名，我需要在_to_order方法中提取可能的省份字段，并提供一个合理的回退机制（比如从receiverAddress中解析省份）。
+
+一、设计整体方案：
+1、数据结构设计：
+    在Order类中添加receiver_province和receiver_address字段
+    在adapter.py中提取省份信息
+
+2、快递配置模块：
+    1.创建express_config.py模块
+    2.使用JSON文件存储配置：express_config.json
+    3.默认配置从Excel导入
+    4.支持人工修改和添加快递
+
+3、快递选择逻辑：
+    - 优先级1：备注关键词匹配（"发申通"、"发极兔"等）
+    - 优先级2：人工配置覆盖
+    - 优先级3：默认省份规则
+
+4、API接口：
+    1.用户提供了更换快递的接口：/fgapp/order/shop/trade/logistics/update
+    2.参数：tradeIdList, modifyCpCode, isOne, channelFlag, shopId
+    3.编码：HTKY=极兔, ZTO=中通, 还需要申通=STO, 顺丰=SF, 圆通=YTO, 韵达=YD
+
+5、GUI修改：
+    - 在gui.py底部添加"快递配置"按钮
+    - 打开新窗口显示可编辑的表格
+
+确定快递编码映射：
+    极兔 = HTKY
+    中通 = ZTO
+    申通 = STO
+    顺丰 = SF
+    圆通 = YTO
+    韵达 = YD
+
+二、设计具体实现模块
+    1、读取Excel获取默认规则
+    2、创建express_config模块
+    3、修改adapter_base添加地址字段
+    4、修改adapter.py提取省份
+    5、在engine.py中添加快递处理逻辑
+    6、在gui.py中添加配置按钮和界面
+    7、在adapter.py中添加修改快递的API调用
+
+
+方案二、设计快递配置模块（数据结构和存储）
+1、设计实现模块
+    1.创建 express_config.py - 快递配置管理模块
+    2.修改 core/adapter_base.py - 添加地址字段到Order
+    3.修改 adapters/fangguo/adapter.py - 提取省份，添加快递更新接口
+    4.修改 core/engine.py - 在审单流程中添加快递处理
+    5.修改 gui.py - 添加快递配置按钮和配置
+
+2、修改核心模块功能实现过程
+    1.修改 core/adapter_base.py - 在Order类中添加receiver_province和receiver_address字段
+
+    2.修改 adapters/fangguo/adapter.py - 在_to_order中提取省份信息，添加更新快递的API接口
+
+    3.在config.py中添加API_UPDATE_LOGISTICS地址
+
+    4.修改 core/engine.py - 在审单流程中添加快递处理逻辑
+        4.1 在 _process_order 或相关方法中：
+            - 检测备注中是否包含快递关键词
+            - 如果没有，根据省份获取默认快递
+            - 调用adapter的update_express方法更新快递
+        4.2 快递处理逻辑
+            因为处理订单调用的是saveProduct接口，而快递更新是通过logistics/update接口，所以需要分开调用。
+            最高效的方案： 创建一个新的 _update_express_for_order 方法，然后在 _run_audit 的循环中，每个订单处理完后调用它。
+            - 在 _process_order 之后调用快递更新逻辑，将其放在 _run_audit 的 try 块中。这样每个订单处理完后都会尝试更新快递。
+
+    5.修改 gui.py - 添加快递配置按钮和配置界面
+
+方案三、实现自动根据省份选择快递功能
+
+方案四、实现关键词备注匹配修改快递选择功能
+
+方案五、在GUI界面添加快递配置按钮和界面
+    1、.修改 gui.py - 添加快递配置按钮和配置界面
+        1.1 快递配置按钮
+            点击后出现一个弹窗，能够允许用户：
+                1.查看和修改省份-快递映射
+                2.添加新的快递类型
+                3.重置为默认配置
+
+三、新增 / 修改文件说明
+         文件	                                            说明
+express_config.py	                新增 - 快递配置核心模块，管理省份规则、快递编码、备注关键词
+express_config.json	                新增 - 配置文件（首次运行时自动生成），保存自定义规则
+core/adapter_base.py	            修改 - Order 类新增 receiver_province、receiver_address 字段
+adapters/fangguo/adapter.py	        修改 - 提取订单省份/地址；新增 update_express() 快递更新接口
+adapters/fangguo/config.py	        修改 - 新增 API_UPDATE_LOGISTICS 接口地址
+core/engine.py	                    修改 - 审单流程中自动调用快递选择逻辑
+gui.py	                            修改 - 底部新增 "快递配置" 按钮及配置对话框
+
+四、实现的功能
+1、自动按省份选择快递
+    1.从订单的收件人地址中自动提取省份
+    2.根据 “快递规则2026.xlsx” 中的默认规则自动匹配快递（极兔/中通）
+    3.支持地址中包含省份名或直辖市名的多种格式
+
+2、备注关键词自动匹配
+    1.检测备注中的"发申通"、"发极兔"、"发顺丰"等关键词
+    2.关键词优先级高于省份规则，即备注要求优先满足
+
+3、人工修改省份规则
+    1.GUI 点击 "快递配置" 按钮，打开配置窗口
+    2."省份规则"标签页中，每个省份都有下拉框，可自由切换快递
+    3.保存后立即生效，下次审单自动按新规则执行
+
+4、添加快递类型
+    1."快递类型"标签页中，可添加新的快递公司及对应 ERP 编码
+    2.支持删除已添加的快递（会同步清理使用该快递的省份规则）
+
+
+优化：
+    1.字段优先级调整 - 将 receiverProvinceName 放在第一位，因为方果API返回的数据可能优先使用这个字段名
+    2.添加调试日志 - 处理订单时会打印收件地址信息，方便排查省份提取是否正确
+程序运行时，会打印输出类似这样的日志：
+    [1/10] 处理订单 2077569625203650562
+  📍 收件地址: 省份=浙江, 地址=浙江省杭州市西湖区文三路...
+  卖家备注: 定制吸水皮革花幔;40x60
+  ✅ 快递已更新: 极兔(HTKY)，来源: 省份规则(浙江)
+
+接口调用说明：
+    功能	        接口	                                参数
+    更新快递	    /logistics/update	    tradeIdList, modifyCpCode, isOne, channelFlag, shopId
+    查询订单	    /queryForPageForTrade	pageNo, pageSize, queryStatus 等
+

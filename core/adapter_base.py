@@ -42,6 +42,8 @@ class Order:
     items: list[OrderItem] = field(default_factory=list)
     store_name: str = ""
     raw: dict = field(default_factory=dict)
+    receiver_province: str = ""       # 收件人省份
+    receiver_address: str = ""        # 收件人完整地址
 
 
 class ErpAdapter(ABC):

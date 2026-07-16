@@ -28,6 +28,7 @@ API_QUERY_ORDER  = f"{BASE_URL}/fgapp/order/shop/trade/queryForPageForTrade"
 API_SAVE_PRODUCT = f"{BASE_URL}/fgapp/order/shop/trade/order/saveProduct"
 API_ORDER_DETAIL = f"{BASE_URL}/fgapp/order/shop/trade/getDetailsByPage"
 API_MATERIAL_LIST = f"{BASE_URL}/fgapp/order/shop/trade/order/materialColorsNew"
+API_UPDATE_LOGISTICS = f"{BASE_URL}/fgapp/order/shop/trade/logistics/update"
 
 # ========== 查询配置 ==========
 QUERY_STATUS = 1       # 1=待整理
