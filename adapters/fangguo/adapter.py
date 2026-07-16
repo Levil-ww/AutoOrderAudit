@@ -352,9 +352,13 @@ class FangguoAdapter(ErpAdapter):
         else:
             effective_list = parsed_list or [parsed]
 
+        # 只保留解析成功的商品行（success=True）
+        # 对于只有赠品信息、没有有效商品解析的情况，不修改商品编码
+        product_parsed_list = [p for p in effective_list if p.success]
+
         # 获取期望的商品编码集合（包含数量）
-        expected_skus_set = {p.shop_mapping_sku for p in effective_list}
-        expected_sku_num_set = {(p.shop_mapping_sku, p.num) for p in effective_list}
+        expected_skus_set = {p.shop_mapping_sku for p in product_parsed_list}
+        expected_sku_num_set = {(p.shop_mapping_sku, p.num) for p in product_parsed_list}
         
         # 调试日志：打印每个商品行的信息
         print(f"  📋 商品行详情 ({len(order.items)} 行):")
@@ -377,10 +381,10 @@ class FangguoAdapter(ErpAdapter):
         # 检查当前订单是否已经完全正确
         # 合并订单需要验证每个商品行的 original_tid 和 SKU 是否都匹配
         is_already_correct = False
-        if len(valid_items) == len(effective_list):
+        if product_parsed_list and len(valid_items) == len(product_parsed_list):
             if is_merged_order:
                 # 合并订单：按 original_tid 验证每个商品行的 SKU 和数量是否正确
-                parsed_by_tid = {p.original_tid: p for p in effective_list if p.original_tid}
+                parsed_by_tid = {p.original_tid: p for p in product_parsed_list if p.original_tid}
                 all_matched = True
                 for item in valid_items:
                     p = parsed_by_tid.get(item.original_tid)
@@ -437,46 +441,52 @@ class FangguoAdapter(ErpAdapter):
         # 获取所有非赠品、非补差价、非作废的有效商品行索引
         valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gift_item(item) and not self._is_price_difference_item(item) and not item.is_void]
 
-        # 第一步：为每个解析结果创建商品行（按 original_tid 匹配）
-        for p in effective_list:
-            matched_item_idx = None
-            match_method = "unknown"
-            
-            # 如果解析结果有 original_tid，按 original_tid 匹配商品行
-            if p.original_tid:
-                for idx in valid_indices:
-                    if idx not in used_item_indices:
-                        item = order.items[idx]
-                        if item.original_tid == p.original_tid:
+        # 第一步：为每个解析成功的商品行创建/更新商品行
+        # 如果没有解析成功的商品行（只有赠品），则保留所有原商品行不变
+        if product_parsed_list:
+            for p in product_parsed_list:
+                matched_item_idx = None
+                match_method = "unknown"
+                
+                # 如果解析结果有 original_tid，按 original_tid 匹配商品行
+                if p.original_tid:
+                    for idx in valid_indices:
+                        if idx not in used_item_indices:
+                            item = order.items[idx]
+                            if item.original_tid == p.original_tid:
+                                matched_item_idx = idx
+                                match_method = "original_tid"
+                                break
+                
+                # 如果没有匹配到，按顺序使用未使用的有效商品行
+                if matched_item_idx is None:
+                    for idx in valid_indices:
+                        if idx not in used_item_indices:
                             matched_item_idx = idx
-                            match_method = "original_tid"
+                            match_method = "sequential"
                             break
-            
-            # 如果没有匹配到，按顺序使用未使用的有效商品行
-            if matched_item_idx is None:
-                for idx in valid_indices:
-                    if idx not in used_item_indices:
-                        matched_item_idx = idx
-                        match_method = "sequential"
-                        break
-            
-            if matched_item_idx is not None:
-                matched_item = order.items[matched_item_idx]
-                print(f"    匹配: 解析结果[{p.shop_mapping_sku[:30]}...] -> 商品行[{matched_item_idx}] original_tid={matched_item.original_tid[:10]}... 方法={match_method}")
-                # 使用现有有效行作为基础，替换编码信息
-                new_item = self._build_order_item(matched_item, order, p)
-                # 确保普通商品行不是赠品
-                new_item['filmGiftCode'] = ''
-                new_item['giftCodeName'] = None
-                new_item['filmGiftNum'] = 0
-                used_item_indices.add(matched_item_idx)
-            elif template_item:
-                # 超出原有效行数，创建新商品行
-                new_item = self._build_new_item(order, p)
-            else:
-                # 没有模板，使用默认构造
-                new_item = self._build_default_item(order, p)
-            order_items.append(new_item)
+                
+                if matched_item_idx is not None:
+                    matched_item = order.items[matched_item_idx]
+                    print(f"    匹配: 解析结果[{p.shop_mapping_sku[:30]}...] -> 商品行[{matched_item_idx}] original_tid={matched_item.original_tid[:10]}... 方法={match_method}")
+                    # 使用现有有效行作为基础，替换编码信息
+                    new_item = self._build_order_item(matched_item, order, p)
+                    # 确保普通商品行不是赠品
+                    new_item['filmGiftCode'] = ''
+                    new_item['giftCodeName'] = None
+                    new_item['filmGiftNum'] = 0
+                    used_item_indices.add(matched_item_idx)
+                elif template_item:
+                    # 超出原有效行数，创建新商品行
+                    new_item = self._build_new_item(order, p)
+                else:
+                    # 没有模板，使用默认构造
+                    new_item = self._build_default_item(order, p)
+                order_items.append(new_item)
+        else:
+            # 没有解析成功的商品行（只有赠品或备注无法解析）
+            # 保留所有原商品行不变，只处理赠品部分
+            print(f"    ℹ️  无有效商品解析信息，保留原商品编码不变")
 
         # 第二步：处理赠品（如果有）
         gift_name = ""
