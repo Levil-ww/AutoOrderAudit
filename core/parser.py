@@ -29,6 +29,7 @@ class ParsedRemark:
             gift_name: str = "",
             gift_num: int = 0,
             original_tid: str = "",
+            shop_remark: str = "",
     ):
         self.material_code = material_code
         self.color_code = color_code
@@ -41,6 +42,7 @@ class ParsedRemark:
         self.gift_name = gift_name
         self.gift_num = gift_num
         self.original_tid = original_tid
+        self.shop_remark = shop_remark
 
     @property
     def shop_mapping_sku(self) -> str:
@@ -56,7 +58,8 @@ class ParsedRemark:
             f"picture='{self.picture_code}', num={self.num}, "
             f"sku='{self.shop_mapping_sku}', raw='{self.raw_text}', "
             f"gift='{self.gift_name}'x{self.gift_num}, "
-            f"original_tid='{self.original_tid[:10]}'...)"
+            f"original_tid='{self.original_tid[:10]}'..., "
+            f"shop_remark='{self.shop_remark[:20]}'...)"
         )
 
     def to_dict(self) -> dict:
@@ -73,6 +76,7 @@ class ParsedRemark:
             "gift_name": self.gift_name,
             "gift_num": self.gift_num,
             "original_tid": self.original_tid,
+            "shop_remark": self.shop_remark,
         }
 
 

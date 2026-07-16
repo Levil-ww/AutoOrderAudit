@@ -386,12 +386,22 @@ class FangguoAdapter(ErpAdapter):
             film_gift_code = item.raw.get('filmGiftCode', '') if item.raw else ''
             print(f"    [{idx}] id={item.id[:10]}..., title={item.title[:30]}..., is_void={item.is_void}, is_gift={is_gift}, filmGiftCode='{film_gift_code}', original_tid='{item.original_tid[:10]}'...")
         
-        # 获取所有非赠品、非补差价、非作废的有效商品行
-        valid_items = [item for item in order.items if not self._is_gift_item(item) and not self._is_price_difference_item(item) and not item.is_void]
-        valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gift_item(item) and not self._is_price_difference_item(item) and not item.is_void]
-        
+        # 判断是否为"只有补差价但应作为普通订单处理"的情况
+        price_diff_items_count = sum(1 for item in order.items if self._is_price_difference_item(item))
+        has_only_price_diff = price_diff_items_count > 0 and price_diff_items_count == len(order.items)
+        treat_as_normal = has_only_price_diff and not price_diff_updates
+
+        # 获取有效商品行（普通订单排除补差价；只有补差价且按普通处理时包含补差价）
+        if treat_as_normal:
+            valid_items = [item for item in order.items if not self._is_gift_item(item) and not item.is_void]
+            valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gift_item(item) and not item.is_void]
+            non_gift_non_price_diff_items = [item for item in order.items if not self._is_gift_item(item)]
+        else:
+            valid_items = [item for item in order.items if not self._is_gift_item(item) and not self._is_price_difference_item(item) and not item.is_void]
+            valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gift_item(item) and not self._is_price_difference_item(item) and not item.is_void]
+            non_gift_non_price_diff_items = [item for item in order.items if not self._is_gift_item(item) and not self._is_price_difference_item(item)]
+
         # 检查是否存在任何已作废或已退款的非赠品、非补差价商品行
-        non_gift_non_price_diff_items = [item for item in order.items if not self._is_gift_item(item) and not self._is_price_difference_item(item)]
         void_non_gift_items = [item for item in non_gift_non_price_diff_items if item.is_void]
         if void_non_gift_items:
             print(f"  ⏭️  跳过：存在已作废或已退款的商品行")
@@ -512,11 +522,13 @@ class FangguoAdapter(ErpAdapter):
         gift_num = 0
         material_code = ""
         gift_original_tid = ""
+        gift_shop_remark = ""
         for p in effective_list:
             if p.gift_name:
                 gift_name = p.gift_name
                 gift_num = p.gift_num
                 gift_original_tid = p.original_tid
+                gift_shop_remark = p.shop_remark
             if p.material_code:
                 material_code = p.material_code
 
@@ -528,19 +540,19 @@ class FangguoAdapter(ErpAdapter):
                 if idx not in used_item_indices and self._is_gift_item(item):
                     existing_gift_idx = idx
                     break
-            
+
             if existing_gift_idx is not None:
                 # 更新现有赠品行
-                new_gift = self._build_gift_item(order.items[existing_gift_idx], order, effective_material_code, gift_name, gift_num, is_new=False, original_tid=gift_original_tid)
+                new_gift = self._build_gift_item(order.items[existing_gift_idx], order, effective_material_code, gift_name, gift_num, is_new=False, original_tid=gift_original_tid, shop_remark=gift_shop_remark)
                 order_items.append(new_gift)
             else:
                 # 创建新赠品行（标识字段置空，ERP会创建新行）
                 if template_item:
-                    new_gift = self._build_gift_item(template_item, order, effective_material_code, gift_name, gift_num, is_new=True, original_tid=gift_original_tid)
+                    new_gift = self._build_gift_item(template_item, order, effective_material_code, gift_name, gift_num, is_new=True, original_tid=gift_original_tid, shop_remark=gift_shop_remark)
                 else:
                     new_gift = self._build_gift_item(
                         OrderItem(id=order.trade_id, order_id=order.trade_id, oid=order.tid, num=1),
-                        order, effective_material_code, gift_name, gift_num, is_new=True, original_tid=gift_original_tid,
+                        order, effective_material_code, gift_name, gift_num, is_new=True, original_tid=gift_original_tid, shop_remark=gift_shop_remark,
                     )
                 order_items.append(new_gift)
 
@@ -690,6 +702,16 @@ class FangguoAdapter(ErpAdapter):
         return [parsed]
 
     def _build_order_item(self, item: OrderItem, order: Order, parsed: ParsedRemark) -> dict:
+        # 合并订单优先使用子订单号（item.oid）和子订单备注
+        tid = item.oid or order.tid
+        origin_trade_id = item.order_id or order.trade_id
+        if parsed and parsed.shop_remark:
+            shop_remark = parsed.shop_remark
+        elif item.shop_remark:
+            shop_remark = item.shop_remark
+        else:
+            shop_remark = order.shop_remark or ""
+
         return {
             "materialId": None,
             "materialCode": parsed.material_code,
@@ -749,12 +771,12 @@ class FangguoAdapter(ErpAdapter):
             "decorationGiftPicCode": None,
             "giftsWithOrder": [],
             "picChange": 0,
-            "orderId": item.order_id,
+            "orderId": origin_trade_id,
             "originalSkuId": item.original_sku_id,
             "originalGoodsId": item.original_goods_id,
             "id": item.id,
             "sysOid": item.sys_oid,
-            "oid": item.oid,
+            "oid": tid,
             "title": item.title,
             "merchandisePicPath": item.merchandise_pic_path,
             "workUrl": None,
@@ -775,10 +797,10 @@ class FangguoAdapter(ErpAdapter):
             "productType": 0,
             "productSn": None,
             "boxGiftCode": None,
-            "shopRemark": order.shop_remark or "",
+            "shopRemark": shop_remark,
             "buyerRemark": order.buyer_remark or "",
-            "tid": order.tid,
-            "originTradeId": order.trade_id,
+            "tid": tid,
+            "originTradeId": origin_trade_id,
             "oldSysTid": None,
             "magnifyingSelectPic": False,
             "copySortFlag": 1,
@@ -806,9 +828,10 @@ class FangguoAdapter(ErpAdapter):
 
     def _build_default_item(self, order: Order, parsed: ParsedRemark) -> dict:
         """没有商品行时的默认构造（新建行，ERP会创建新行）"""
+        original_tid = parsed.original_tid if parsed else ""
         item = self._build_order_item(
-            OrderItem(id=None, order_id=order.trade_id,
-                      oid=None, sys_oid=None, num=parsed.num),
+            OrderItem(id=None, order_id=original_tid or order.trade_id,
+                      oid=original_tid or order.tid, sys_oid=None, num=parsed.num),
             order, parsed,
         )
         item['shopMappingSku'] = f'<font color="red">{item["shopMappingSku"]}</font>'
@@ -816,9 +839,10 @@ class FangguoAdapter(ErpAdapter):
 
     def _build_new_item(self, order: Order, parsed: ParsedRemark) -> dict:
         """超出原订单商品行数时，构建新商品行（所有标识字段置空，ERP创建新行）"""
+        original_tid = parsed.original_tid if parsed else ""
         item = self._build_order_item(
-            OrderItem(id=None, order_id=order.trade_id,
-                      oid=None, sys_oid=None,
+            OrderItem(id=None, order_id=original_tid or order.trade_id,
+                      oid=original_tid or order.tid, sys_oid=None,
                       original_sku_id=None, original_goods_id=None,
                       title=None, merchandise_pic_path=None,
                       price=0, num=parsed.num),
@@ -827,13 +851,14 @@ class FangguoAdapter(ErpAdapter):
         item['shopMappingSku'] = f'<font color="red">{item["shopMappingSku"]}</font>'
         return item
 
-    def _build_gift_item(self, item: OrderItem, order: Order, material_code: str, gift_name: str, gift_num: int, is_new: bool = False, original_tid: str = "") -> dict:
+    def _build_gift_item(self, item: OrderItem, order: Order, material_code: str, gift_name: str, gift_num: int, is_new: bool = False, original_tid: str = "", shop_remark: str = "") -> dict:
         """构建赠品商品行
-        
+
         Args:
             is_new: 是否为创建新赠品行。如果为True，标识字段置空，ERP会创建新行；
                     如果为False，保留原商品行的标识字段，用于更新现有赠品行
             original_tid: 赠品所属的原始订单号，用于合并订单场景
+            shop_remark: 赠品商品行的备注，合并订单时使用子订单备注
         """
         gift_material = "吸水皮革"
         if "圆垫" in gift_name:
@@ -867,6 +892,10 @@ class FangguoAdapter(ErpAdapter):
             title_field = gift_name or ""
             merchandise_pic_path_field = item.merchandise_pic_path
             sku_properties_name_field = ""
+
+        tid = original_tid or item.oid or order.tid
+        trade_id = original_tid or item.order_id or order.trade_id
+        remark = shop_remark or item.shop_remark or order.shop_remark or ""
 
         return {
             "materialId": None,
@@ -927,7 +956,7 @@ class FangguoAdapter(ErpAdapter):
             "decorationGiftPicCode": None,
             "giftsWithOrder": [],
             "picChange": 0,
-            "orderId": original_tid or order.trade_id,
+            "orderId": trade_id,
             "originalSkuId": original_sku_id_field,
             "originalGoodsId": original_goods_id_field,
             "id": id_field,
@@ -957,10 +986,10 @@ class FangguoAdapter(ErpAdapter):
             "productType": 0,
             "productSn": None,
             "boxGiftCode": None,
-            "shopRemark": order.shop_remark or "",
+            "shopRemark": remark,
             "buyerRemark": order.buyer_remark or "",
-            "tid": original_tid or order.tid,
-            "originTradeId": original_tid or order.trade_id,
+            "tid": tid,
+            "originTradeId": trade_id,
             "oldSysTid": None,
             "magnifyingSelectPic": False,
             "copySortFlag": 1,
@@ -988,7 +1017,7 @@ class FangguoAdapter(ErpAdapter):
 
     def _handle_gift_item(self, order_items: list, order: Order, material_code: str,
                           gift_name: str, gift_num: int, template_item: OrderItem,
-                          used_item_indices: set, original_tid: str = "") -> int | None:
+                          used_item_indices: set, original_tid: str = "", shop_remark: str = "") -> int | None:
         """处理赠品：更新已有赠品行或创建新的"""
         gift_material = "吸水皮革"
         if "圆垫" in gift_name:
@@ -1004,13 +1033,15 @@ class FangguoAdapter(ErpAdapter):
             picture_code = "赠品沥水垫小圆或小方"
             gift_code = "赠品沥水垫小圆或小方"
         gift_sku = f"{gift_material}-标准-{model_code}-{picture_code}"
-        
+
+        remark = shop_remark or order.shop_remark or ""
+
         for idx, item in enumerate(order.items):
             if idx not in used_item_indices and self._is_gift_item(item):
                 cloned = item.raw.copy() if item.raw else {}
                 if cloned:
                     cloned['filmGiftNum'] = gift_num
-                    cloned['shopRemark'] = order.shop_remark or ""
+                    cloned['shopRemark'] = remark
                     cloned['buyerRemark'] = order.buyer_remark or ""
                     cloned['materialCode'] = gift_material
                     cloned['modelCode'] = model_code
@@ -1033,18 +1064,18 @@ class FangguoAdapter(ErpAdapter):
                     used_item_indices.add(idx)
                     return idx
                 else:
-                    new_gift = self._build_gift_item(item, order, material_code, gift_name, gift_num, is_new=False, original_tid=original_tid)
+                    new_gift = self._build_gift_item(item, order, material_code, gift_name, gift_num, is_new=False, original_tid=original_tid, shop_remark=shop_remark)
                     order_items.append(new_gift)
                     used_item_indices.add(idx)
                     return idx
 
         # 没有找到现有赠品，创建新的赠品行
         if template_item:
-            new_gift = self._build_gift_item(template_item, order, material_code, gift_name, gift_num, is_new=True, original_tid=original_tid)
+            new_gift = self._build_gift_item(template_item, order, material_code, gift_name, gift_num, is_new=True, original_tid=original_tid, shop_remark=shop_remark)
         else:
             new_gift = self._build_gift_item(
                 OrderItem(id=order.trade_id, order_id=order.trade_id, oid=order.tid, num=1),
-                order, material_code, gift_name, gift_num, is_new=True, original_tid=original_tid,
+                order, material_code, gift_name, gift_num, is_new=True, original_tid=original_tid, shop_remark=shop_remark,
             )
 
         order_items.append(new_gift)
@@ -1247,6 +1278,10 @@ class FangguoAdapter(ErpAdapter):
         """
         构建商品行，保持原有商家编码不变，仅修改数量
         """
+        tid = item.oid or order.tid
+        origin_trade_id = item.order_id or order.trade_id
+        shop_remark = item.shop_remark or order.shop_remark or ""
+
         return {
             "materialId": None,
             "materialCode": item.raw.get("materialCode", "") if item.raw else "",
@@ -1306,12 +1341,12 @@ class FangguoAdapter(ErpAdapter):
             "decorationGiftPicCode": None,
             "giftsWithOrder": [],
             "picChange": 0,
-            "orderId": item.order_id,
+            "orderId": origin_trade_id,
             "originalSkuId": item.original_sku_id,
             "originalGoodsId": item.original_goods_id,
             "id": item.id,
             "sysOid": item.sys_oid,
-            "oid": item.oid,
+            "oid": tid,
             "title": item.title,
             "merchandisePicPath": item.merchandise_pic_path,
             "workUrl": None,
@@ -1332,10 +1367,10 @@ class FangguoAdapter(ErpAdapter):
             "productType": 0,
             "productSn": None,
             "boxGiftCode": None,
-            "shopRemark": order.shop_remark or "",
+            "shopRemark": shop_remark,
             "buyerRemark": order.buyer_remark or "",
-            "tid": order.tid,
-            "originTradeId": order.trade_id,
+            "tid": tid,
+            "originTradeId": origin_trade_id,
             "oldSysTid": None,
             "magnifyingSelectPic": False,
             "copySortFlag": 1,
@@ -1370,7 +1405,11 @@ class FangguoAdapter(ErpAdapter):
         model_code = "补差价"
         picture_code = "不打印"
         shop_mapping_sku = f"{material_code}-{color_code}-{model_code}-{picture_code}"
-        
+
+        tid = item.oid or order.tid
+        origin_trade_id = item.order_id or order.trade_id
+        shop_remark = item.shop_remark or order.shop_remark or ""
+
         return {
             "materialId": None,
             "materialCode": material_code,
@@ -1430,12 +1469,12 @@ class FangguoAdapter(ErpAdapter):
             "decorationGiftPicCode": None,
             "giftsWithOrder": [],
             "picChange": 0,
-            "orderId": item.order_id,
+            "orderId": origin_trade_id,
             "originalSkuId": item.original_sku_id,
             "originalGoodsId": item.original_goods_id,
             "id": item.id,
             "sysOid": item.sys_oid,
-            "oid": item.oid,
+            "oid": tid,
             "title": item.title,
             "merchandisePicPath": item.merchandise_pic_path,
             "workUrl": None,
@@ -1456,10 +1495,10 @@ class FangguoAdapter(ErpAdapter):
             "productType": 0,
             "productSn": None,
             "boxGiftCode": None,
-            "shopRemark": order.shop_remark or "",
+            "shopRemark": shop_remark,
             "buyerRemark": order.buyer_remark or "",
-            "tid": order.tid,
-            "originTradeId": order.trade_id,
+            "tid": tid,
+            "originTradeId": origin_trade_id,
             "oldSysTid": None,
             "magnifyingSelectPic": False,
             "copySortFlag": 1,

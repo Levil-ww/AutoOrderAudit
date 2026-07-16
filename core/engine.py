@@ -94,12 +94,12 @@ class AutoAuditEngine:
         
         if "差价不发货" in remark:
             print(f"  📝 差价不发货：修改编码为'定制-定制-补差价-不打印'，数量改为1")
-            
+
             if self.dry_run:
                 print(f"  🔶 DRY RUN: 修改编码为'定制-定制-补差价-不打印'")
                 self.stats["success"] += 1
                 return
-            
+
             try:
                 ok = self.adapter.update_price_difference_order(order, price_diff_items, ship=False)
                 if ok is None:
@@ -115,7 +115,13 @@ class AutoAuditEngine:
                 print(f"  ❌ 请求异常: {e}")
                 self.stats["failed"] += 1
             return
-        
+
+        if only_price_diff and remark.strip():
+            # 只有补差价商品且备注含定制信息，直接按普通订单解析修改编码
+            print(f"  📝 只有补差价商品，备注含信息，直接解析修改编码")
+            self._process_normal_order_logic(order)
+            return
+
         if remark.strip():
             print(f"  📝 备注含信息，按正常解析逻辑处理")
             price_diff_updates = [{
@@ -126,7 +132,7 @@ class AutoAuditEngine:
             }]
             self._process_normal_order_logic(order, price_diff_updates)
             return
-        
+
         print(f"  📝 备注为空，仅修改补差价商品行数量为1")
         if self.dry_run:
             print(f"  🔶 DRY RUN: 仅修改数量为1")
@@ -473,13 +479,14 @@ class AutoAuditEngine:
                 
                 for p in parsed_list:
                     p.original_tid = tid
-                
+                    p.shop_remark = group['remark']
+
                 all_parsed_list.extend(parsed_list)
-                
+
                 for p in parsed_list:
                     if p.gift_name and p.gift_num > 0:
                         all_gifts.append((p.gift_name, p.gift_num))
-        
+
         if not all_parsed_list and not price_diff_updates:
             print(f"  ⏭️  跳过：所有分组均无法解析")
             self.stats["skipped"] += 1

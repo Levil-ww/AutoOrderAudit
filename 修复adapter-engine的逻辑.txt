@@ -527,3 +527,27 @@ valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gif
     正常定制备注（无赠品）	                    修改为新编码	                            -
     正常定制备注 + 赠品	                    修改为新编码	                        添加赠品行
     合并订单（一个子订单正常发+赠品，另一个定制）	定制的子订单修改，正常发的子订单不变	    添加赠品行
+
+
+十三、优化问题
+一、问题一：补差价专拍订单备注解析
+修改文件：
+    - engine.py — 第119行附近
+    - adapter.py — update_merchant_code
+核心逻辑：
+    - 当订单只有补差价商品且备注包含定制信息时，直接调用 _process_normal_order_logic(order)（不传 price_diff_updates），不再创建新手工单
+    - update_merchant_code 中新增 treat_as_normal 判断：若订单只有补差价且没有 price_diff_updates，则把补差价商品行也纳入有效商品行进行匹配，解析结果直接修改原商品行的编码和数量
+    - 若备注为空，仍然跳过不处理
+
+二、问题二：合并订单新手工单/赠品行使用子订单号和子订单备注
+修改文件：
+    - parser.py — ParsedRemark 新增 shop_remark 字段
+    - engine.py — _process_merged_order 中赋值 parsed.shop_remark = group['remark']
+    - adapter.py — 多处构建方法
+核心逻辑：
+    1. _build_order_item：优先使用 item.oid（子订单号）作为 tid，优先使用 item.shop_remark 或 parsed.shop_remark 作为备注
+    2. _build_new_item / _build_default_item：新建商品行使用 parsed.original_tid 作为 orderId / tid / originTradeId
+    3. _build_gift_item：新增 shop_remark 参数，新赠品行同样使用子订单号和子订单备注
+    4. _build_order_item_keep_sku / _build_price_diff_no_ship_item：统一修复为使用商品行级别的 oid 和 shop_remark
+
+
