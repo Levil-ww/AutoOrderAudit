@@ -674,22 +674,74 @@ class FangguoAdapter(ErpAdapter):
                     })
 
         # 第五步：处理补差价商品行
+        # 支持 parsed_list 字段：当补差价行有备注定制信息时，按解析结果覆盖编码和数量
+        # - 一条解析结果：覆盖原补差价行的编码和数量
+        # - 多条解析结果：覆盖一个，其余创建新手工单
+        # - 无解析结果：ship=True 仅修改数量为1，ship=False 编码改为不打印
         if price_diff_updates:
             for update in price_diff_updates:
-                for item in update['items']:
-                    item_idx = None
-                    for idx, ord_item in enumerate(order.items):
-                        if ord_item.id == item.id:
-                            item_idx = idx
-                            break
-                    
-                    if item_idx is not None and item_idx not in used_item_indices:
-                        if update['ship']:
-                            new_item = self._build_order_item_keep_sku(item, order, num=1)
+                extra_parsed_list = update.get('parsed_list', [])
+                diff_items = update['items']
+
+                if extra_parsed_list:
+                    # 有解析结果分配给补差价行：按补差价单一逻辑处理
+                    # 逐个匹配补差价行到解析结果
+                    diff_matched = 0
+                    for p in extra_parsed_list:
+                        # 尝试找到一个未使用的补差价行来覆盖
+                        matched_diff_idx = None
+                        for item in diff_items:
+                            item_idx = None
+                            for idx, ord_item in enumerate(order.items):
+                                if ord_item.id == item.id:
+                                    item_idx = idx
+                                    break
+                            if item_idx is not None and item_idx not in used_item_indices:
+                                matched_diff_idx = item_idx
+                                matched_item = item
+                                break
+
+                        if matched_diff_idx is not None:
+                            # 覆盖原补差价行：使用解析结果修改编码和数量
+                            new_item = self._build_order_item(matched_item, order, p)
+                            new_item['filmGiftCode'] = ''
+                            new_item['giftCodeName'] = None
+                            new_item['filmGiftNum'] = 0
+                            order_items.append(new_item)
+                            used_item_indices.add(matched_diff_idx)
+                            diff_matched += 1
                         else:
-                            new_item = self._build_price_diff_no_ship_item(item, order)
-                        order_items.append(new_item)
-                        used_item_indices.add(item_idx)
+                            # 没有可覆盖的补差价行，创建新手工单
+                            new_item = self._build_new_item(order, p)
+                            order_items.append(new_item)
+
+                    # 剩余未匹配的补差价行：仅修改数量为1
+                    for item in diff_items:
+                        item_idx = None
+                        for idx, ord_item in enumerate(order.items):
+                            if ord_item.id == item.id:
+                                item_idx = idx
+                                break
+                        if item_idx is not None and item_idx not in used_item_indices:
+                            new_item = self._build_order_item_keep_sku(item, order, num=1)
+                            order_items.append(new_item)
+                            used_item_indices.add(item_idx)
+                else:
+                    # 无解析结果：按原有逻辑处理
+                    for item in diff_items:
+                        item_idx = None
+                        for idx, ord_item in enumerate(order.items):
+                            if ord_item.id == item.id:
+                                item_idx = idx
+                                break
+
+                        if item_idx is not None and item_idx not in used_item_indices:
+                            if update['ship']:
+                                new_item = self._build_order_item_keep_sku(item, order, num=1)
+                            else:
+                                new_item = self._build_price_diff_no_ship_item(item, order)
+                            order_items.append(new_item)
+                            used_item_indices.add(item_idx)
 
         payload = {
             "orderType": 0,

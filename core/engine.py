@@ -73,27 +73,41 @@ class AutoAuditEngine:
                         return True
         return False
 
+    @staticmethod
+    def _is_no_ship_remark(remark: str) -> bool:
+        """判断备注是否表示补差价不发货/不打印"""
+        return "差价不发货" in remark or "不打印" in remark
+
     def _process_price_difference_order(self, order: Order):
         """
         处理补差价订单的逻辑：
         1. 如果订单只有补差价商品行且备注为空，跳过不处理
-        2. 如果备注包含"差价不发货"，将编码修改为"定制-定制-补差价-不打印"，数量改为1
-        3. 如果备注非空且不包含"差价不发货"，按正常解析逻辑处理
-        4. 如果订单有其他商品行且备注为空，仅修改补差价商品行数量为1
+        2. 如果备注包含"差价不发货"或"不打印"，将编码修改为"定制-定制-补差价-不打印"，数量改为1
+        3. 如果订单只有补差价商品且备注含定制信息，按正常解析逻辑修改编码和数量
+           - 一条备注：覆盖原补差价行的编码和数量
+           - 多条备注：覆盖一个，其余创建新手工单
+        4. 如果订单有其他商品行且备注非空：
+           - 补差价行按备注信息修改编码和数量（与仅有补差价行的逻辑一致）
+           - 一条备注则覆盖原补差价行，多条则覆盖一个、其余创建新的
+           - 若无剩余解析结果则仅修改数量为1
+        5. 如果订单有其他商品行且备注为空，仅修改补差价商品行数量为1
         """
         remark = order.shop_remark or ""
         print(f"  💰 补差价订单处理")
-        
+
         price_diff_items = [item for item in order.items if self._is_price_difference_item(item)]
         only_price_diff = len(price_diff_items) == len(order.items)
-        
+
+        # 场景1：仅有补差价行 + 备注空白 → 跳过
         if only_price_diff and not remark.strip():
             print(f"  ⏭️  跳过：只有补差价订单且备注为空")
             self.stats["skipped"] += 1
             return
-        
-        if "差价不发货" in remark:
-            print(f"  📝 差价不发货：修改编码为'定制-定制-补差价-不打印'，数量改为1")
+
+        # 场景2：备注包含"差价不发货"或"不打印" → 编码改为"定制-定制-补差价-不打印"
+        if self._is_no_ship_remark(remark):
+            reason = "差价不发货" if "差价不发货" in remark else "不打印"
+            print(f"  📝 检测到'{reason}'：修改编码为'定制-定制-补差价-不打印'，数量改为1")
 
             if self.dry_run:
                 print(f"  🔶 DRY RUN: 修改编码为'定制-定制-补差价-不打印'")
@@ -116,29 +130,63 @@ class AutoAuditEngine:
                 self.stats["failed"] += 1
             return
 
+        # 场景3：仅有补差价行 + 备注含定制信息 → 按正常解析修改编码和数量
         if only_price_diff and remark.strip():
-            # 只有补差价商品且备注含定制信息，直接按普通订单解析修改编码
             print(f"  📝 只有补差价商品，备注含信息，直接解析修改编码")
             self._process_normal_order_logic(order)
             return
 
+        # 场景4：混合订单（有普通商品行 + 补差价行）+ 备注非空
         if remark.strip():
-            print(f"  📝 备注含信息，按正常解析逻辑处理")
-            price_diff_updates = [{
-                'tid': order.tid,
-                'items': price_diff_items,
-                'remark': remark,
-                'ship': True,
-            }]
+            print(f"  📝 混合订单备注含信息，解析备注并按补差价逻辑处理补差价行")
+            # 解析备注，判断是否有剩余解析结果可分配给补差价行
+            material_map = getattr(self.adapter, 'material_map', None)
+            material_matcher = getattr(self.adapter, 'get_material_matcher', lambda: None)()
+            parsed_list = extract_multiple_remarks(
+                remark, material_map=material_map, material_matcher=material_matcher,
+            )
+
+            # 统计普通商品行数量（非赠品、非补差价、非作废）
+            regular_item_count = sum(
+                1 for item in order.items
+                if not self._is_price_difference_item(item)
+                and not self.adapter._is_gift_item(item)
+                and not item.is_void
+            )
+
+            # 统计解析成功的条目数
+            successful_parsed = [p for p in parsed_list if p.success]
+
+            # 如果有剩余解析结果（超出普通商品行数量），分配给补差价行
+            extra_parsed = successful_parsed[regular_item_count:] if len(successful_parsed) > regular_item_count else []
+
+            if extra_parsed:
+                print(f"  📝 有 {len(extra_parsed)} 条额外解析结果分配给补差价行（覆盖1个，多余创建新手工单）")
+                price_diff_updates = [{
+                    'tid': order.tid,
+                    'items': price_diff_items,
+                    'remark': remark,
+                    'ship': True,  # 未分配到解析结果的补差价行仅修改数量为1
+                    'parsed_list': extra_parsed,  # 分配给补差价行的解析结果
+                }]
+            else:
+                price_diff_updates = [{
+                    'tid': order.tid,
+                    'items': price_diff_items,
+                    'remark': remark,
+                    'ship': True,
+                }]
+
             self._process_normal_order_logic(order, price_diff_updates)
             return
 
+        # 场景5：混合订单 + 备注为空 → 仅修改补差价商品行数量为1
         print(f"  📝 备注为空，仅修改补差价商品行数量为1")
         if self.dry_run:
             print(f"  🔶 DRY RUN: 仅修改数量为1")
             self.stats["success"] += 1
             return
-        
+
         try:
             ok = self.adapter.update_price_difference_order(order, price_diff_items, ship=True)
             if ok is None:
@@ -421,19 +469,26 @@ class AutoAuditEngine:
                 gift_no_ship_tids.append(tid)
             
             if is_price_diff:
+                # 分离补差价商品行和普通商品行
+                diff_items = [item for item in group['items'] if self._is_price_difference_item(item)]
+                regular_items_in_group = [item for item in group['items'] if not self._is_price_difference_item(item)]
+
                 if not group_remark.strip():
+                    # 仅补差价行且备注为空 → 仅修改数量为1
                     print(f"      📝 补差价订单备注为空，仅修改数量为1")
                     price_diff_updates.append({
                         'tid': tid,
-                        'items': group['items'],
+                        'items': diff_items,
                         'remark': group_remark,
                         'ship': True,
                     })
-                elif "差价不发货" in group_remark:
-                    print(f"      📝 差价不发货：修改编码为'定制-定制-补差价-不打印'，数量改为1")
+                elif self._is_no_ship_remark(group_remark):
+                    # 检测到"差价不发货"或"不打印" → 编码改为"定制-定制-补差价-不打印"
+                    reason = "差价不发货" if "差价不发货" in group_remark else "不打印"
+                    print(f"      📝 检测到'{reason}'：修改编码为'定制-定制-补差价-不打印'，数量改为1")
                     price_diff_updates.append({
                         'tid': tid,
-                        'items': group['items'],
+                        'items': diff_items,
                         'remark': group_remark,
                         'ship': False,
                     })
@@ -461,7 +516,34 @@ class AutoAuditEngine:
                     
                     for p in parsed_list:
                         p.original_tid = tid
-                    
+
+                    # 如果分组内同时有普通商品行和补差价行（混合分组）
+                    if regular_items_in_group:
+                        non_gift_regular_count = sum(
+                            1 for item in regular_items_in_group
+                            if not self.adapter._is_gift_item(item) and not item.is_void
+                        )
+                        successful_parsed = [p for p in parsed_list if p.success]
+                        extra_parsed = successful_parsed[non_gift_regular_count:] if len(successful_parsed) > non_gift_regular_count else []
+
+                        if extra_parsed:
+                            print(f"        📝 有 {len(extra_parsed)} 条额外解析结果分配给补差价行")
+                            price_diff_updates.append({
+                                'tid': tid,
+                                'items': diff_items,
+                                'remark': group_remark,
+                                'ship': True,
+                                'parsed_list': extra_parsed,
+                            })
+                        else:
+                            # 无剩余解析结果，补差价行仅修改数量为1
+                            price_diff_updates.append({
+                                'tid': tid,
+                                'items': diff_items,
+                                'remark': group_remark,
+                                'ship': True,
+                            })
+
                     all_parsed_list.extend(parsed_list)
                     
                     for p in parsed_list:

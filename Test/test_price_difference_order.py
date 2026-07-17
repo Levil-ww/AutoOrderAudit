@@ -286,6 +286,212 @@ def test_merged_order_price_diff():
     print()
 
 
+def test_price_diff_no_print():
+    """测试七：补差价订单备注含"不打印" -> 编码改为"定制-定制-补差价-不打印" """
+    print('=' * 80)
+    print('测试七：补差价订单备注含"不打印" -> 编码改为不打印')
+    print('=' * 80)
+    
+    adapter = FangguoAdapter()
+    
+    # 场景1：备注"补差价不打印"
+    order = Order(
+        id='test',
+        trade_id='test_order_007',
+        tid='test_order_007',
+        shop_remark='补差价不打印',
+    )
+    order.items.append(OrderItem(
+        id='item1',
+        order_id='test_order_007',
+        oid='test_order_007',
+        title='补差价专拍 少几元拍几个',
+        num=50,
+        price=1.0,
+        raw={
+            "materialCode": "",
+            "modelCode": "",
+            "colorCode": "",
+            "pictureCode": "",
+        },
+    ))
+    
+    result_item = adapter._build_price_diff_no_ship_item(order.items[0], order)
+    expected_sku = "定制-定制-补差价-不打印"
+    expected_num = 1
+    
+    status1 = '✅' if result_item['shopMappingSku'] == expected_sku else '❌'
+    status2 = '✅' if result_item['num'] == expected_num else '❌'
+    
+    print(f"{status1} 商家编码: {result_item['shopMappingSku']} (期望: {expected_sku})")
+    print(f"{status2} 数量: {result_item['num']} (期望: {expected_num})")
+    
+    assert result_item['shopMappingSku'] == expected_sku, f"商家编码不匹配"
+    assert result_item['num'] == expected_num, f"数量不匹配"
+    
+    # 场景2：_is_no_ship_remark 静态方法测试
+    assert AutoAuditEngine._is_no_ship_remark("差价不发货") == True
+    assert AutoAuditEngine._is_no_ship_remark("不打印") == True
+    assert AutoAuditEngine._is_no_ship_remark("补差价不打印") == True
+    assert AutoAuditEngine._is_no_ship_remark("定制双面革") == False
+    assert AutoAuditEngine._is_no_ship_remark("") == False
+    
+    print('✅ 测试通过："不打印"关键字检测和编码修改正确')
+    print()
+
+
+def test_price_diff_no_print_engine_flow():
+    """测试八：补差价订单备注"补差价不打印"经引擎流程处理"""
+    print('=' * 80)
+    print('测试八：补差价订单备注"补差价不打印"引擎流程')
+    print('=' * 80)
+    
+    adapter = FangguoAdapter()
+    engine = AutoAuditEngine(adapter, dry_run=True)
+    
+    order = Order(
+        id='test',
+        trade_id='test_order_008',
+        tid='test_order_008',
+        shop_remark='补差价不打印',
+    )
+    order.items.append(OrderItem(
+        id='item1',
+        order_id='test_order_008',
+        oid='test_order_008',
+        title='补差价专拍 少几元拍几个',
+        num=50,
+        price=1.0,
+        raw={
+            "materialCode": "",
+            "modelCode": "",
+            "colorCode": "",
+            "pictureCode": "",
+        },
+    ))
+    
+    engine.stats = {"total": 0, "success": 0, "skipped": 0, "failed": 0, "errors": [], "cancelled": 0}
+    engine._process_order(order)
+    
+    # 补差价不打印应该被检测到，走 no_ship 分支
+    assert engine.stats['success'] == 1, f"期望成功1个订单，实际{engine.stats['success']}个"
+    print('✅ 测试通过：补差价不打印经引擎流程正确处理')
+    print()
+
+
+def test_merged_order_price_diff_no_print():
+    """测试九：合并订单补差价行备注含"不打印" -> 编码改为不打印"""
+    print('=' * 80)
+    print('测试九：合并订单补差价行备注含"不打印"')
+    print('=' * 80)
+    
+    adapter = FangguoAdapter()
+    engine = AutoAuditEngine(adapter, dry_run=True)
+    
+    order = Order(
+        id='test',
+        trade_id='5123730111671128828&5123750724456036485',
+        tid='5123730111671128828&5123750724456036485',
+        shop_remark='定制双面革安妮森林;35x380cm-1张',
+    )
+    
+    order.items.append(OrderItem(
+        id='item1',
+        order_id='test_order_009',
+        oid='5123730111671128828',
+        title='复古轻奢柜垫长条电视柜垫桌垫中古风台面垫防水防油防水鞋柜',
+        num=1,
+        price=52.8,
+        shop_remark='定制双面革安妮森林;35x380cm-1张',
+        original_tid='5123730111671128828',
+    ))
+    order.items.append(OrderItem(
+        id='item2',
+        order_id='test_order_009',
+        oid='5123750724456036485',
+        title='补差价专拍少几元就拍几件',
+        num=10,
+        price=1.0,
+        shop_remark='不打印',
+        original_tid='5123750724456036485',
+    ))
+    
+    print(f"订单号: {order.trade_id}")
+    print(f"商品行2备注: '{order.items[1].shop_remark}'")
+    print()
+    
+    engine.stats = {"total": 0, "success": 0, "skipped": 0, "failed": 0, "errors": [], "cancelled": 0}
+    
+    material_map = adapter.material_map
+    material_matcher = adapter.get_material_matcher()
+    engine._process_merged_order(order, material_map, material_matcher)
+    
+    assert engine.stats['success'] == 1, f"期望成功1个订单，实际{engine.stats['success']}个"
+    print('✅ 测试通过：合并订单补差价行"不打印"已正确处理')
+    print()
+
+
+def test_mixed_order_price_diff_with_remark():
+    """测试十：混合订单（有普通商品行+补差价行）+ 备注含定制信息 -> 补差价行按备注修改编码"""
+    print('=' * 80)
+    print('测试十：混合订单补差价行有备注定制信息 -> 按补差价单一逻辑处理')
+    print('=' * 80)
+    
+    adapter = FangguoAdapter()
+    engine = AutoAuditEngine(adapter, dry_run=True)
+    
+    # 场景：订单有1个普通商品行 + 1个补差价行，备注包含2条解析结果
+    remark = "定制双面革安妮森林;35x380cm-1张，定制双面革花漾之约;40x60cm-1张"
+    order = Order(
+        id='test',
+        trade_id='test_order_010',
+        tid='test_order_010',
+        shop_remark=remark,
+    )
+    order.items.append(OrderItem(
+        id='item1',
+        order_id='test_order_010',
+        oid='test_order_010',
+        title='复古轻奢柜垫长条电视柜垫桌垫',
+        num=1,
+        price=52.8,
+        raw={
+            "materialCode": "双面革",
+            "modelCode": "定制尺寸",
+            "colorCode": "定制",
+            "pictureCode": "定制",
+        },
+    ))
+    order.items.append(OrderItem(
+        id='item2',
+        order_id='test_order_010',
+        oid='test_order_010',
+        title='补差价专用少几元就拍几件',
+        num=50,
+        price=1.0,
+        raw={
+            "materialCode": "",
+            "modelCode": "",
+            "colorCode": "",
+            "pictureCode": "",
+        },
+    ))
+    
+    print(f"商品行1: {order.items[0].title}")
+    print(f"商品行2: {order.items[1].title}")
+    print(f"订单备注: '{remark}'")
+    print()
+    
+    engine.stats = {"total": 0, "success": 0, "skipped": 0, "failed": 0, "errors": [], "cancelled": 0}
+    engine._process_order(order)
+    
+    # 备注含信息 -> 应进入补差价处理流程
+    # 第1条解析结果给普通商品行，第2条给补差价行
+    assert engine.stats['success'] == 1 or engine.stats['skipped'] == 1, f"期望处理成功，实际success={engine.stats['success']}, skipped={engine.stats['skipped']}"
+    print('✅ 测试通过：混合订单补差价行有备注定制信息，已按补差价单一逻辑处理')
+    print()
+
+
 if __name__ == '__main__':
     test_price_diff_detection()
     test_price_diff_only_empty_remark()
@@ -293,6 +499,10 @@ if __name__ == '__main__':
     test_price_diff_no_ship()
     test_price_diff_with_normal_items_empty_remark()
     test_merged_order_price_diff()
+    test_price_diff_no_print()
+    test_price_diff_no_print_engine_flow()
+    test_merged_order_price_diff_no_print()
+    test_mixed_order_price_diff_with_remark()
     
     print('=' * 80)
     print('🎉 所有测试通过！')

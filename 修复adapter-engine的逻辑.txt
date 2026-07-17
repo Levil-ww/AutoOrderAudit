@@ -658,3 +658,35 @@ valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gif
         - is_already_correct 检查：新增赠品不送状态的验证，已修改为"定制-定制-补差价-不打印"的赠品行不会重复触发修改
         - 赠品行处理（第二步.5）：当 all_gifts 为空时，检测赠品行所属 original_tid 是否在 gift_no_ship_tids 中，或 gift_no_ship 是否为 True；命中则调用 _build_price_diff_no_ship_item 将编码改为 "定制-定制-补差价-不打印"，同时保留原有数量；未命中则保持原样不变
         - 防御性修复：处理 parsed 为 None 或 effective_list 含 None 的情况，避免 AttributeError
+
+十八、   优化补差价订单的处理逻辑
+1、 engine.py — 补差价订单处理逻辑增强
+新增 _is_no_ship_remark 静态方法 (第76-79行)
+    - 统一检测"差价不发货"和"不打印"关键字，之前只检测"差价不发货"
+    1.1 改进 _process_price_difference_order 方法 (第81-203行) — 5个场景完整覆盖：
+                场景	                原逻辑	                新逻辑
+        仅有补差价行+备注空白	    跳过	                跳过 (不变)
+        "差价不发货"	            编码改不打印	        编码改不打印 (不变)
+        "不打印"	                未检测	            编码改为"定制-定制-补差价-不打印"
+        仅有补差价行+有备注	    覆盖编码数量	        覆盖编码数量 (不变)
+        混合订单+有备注	        补差价行仅改数量为1	解析备注，剩余结果分配给补差价行（覆盖1个，多余创建新手工单）
+        混合订单+备注空白	        数量改为1	        数量改为1 (不变)
+
+    1.2 改进 _process_merged_order 方法 (第471-553行)：
+        - 补差价分组添加"不打印"检测（之前只有"差价不发货"）
+        - 合并订单的补差价分组内如果同时有普通商品行和补差价行（混合分组），支持将剩余解析结果分配给补差价行
+
+2、adapter.py — 补差价行支持 parsed_list
+改进 update_merchant_code 第五步 (第676-744行)：
+    - price_diff_updates 条目支持新增 parsed_list 字段
+    - 有 parsed_list 时：逐个将解析结果覆盖到补差价行（一条覆盖编码+数量，多条覆盖一个+创建新手工单），剩余补差价行仅改数量为1
+    - 无 parsed_list 时：保持原有 ship=True/False 逻辑不变
+
+3. test_price_difference_order.py — 新增4个测试
+    - 测试七：_is_no_ship_remark "不打印"关键字检测
+    - 测试八：补差价订单备注"补差价不打印"引擎流程
+    - 测试九：合并订单补差价行"不打印"处理
+    - 测试十：混合订单补差价行有备注定制信息
+
+
+
