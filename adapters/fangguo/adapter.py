@@ -338,12 +338,13 @@ class FangguoAdapter(ErpAdapter):
     # -------------------------------------------------------------------
     # 3. 修改商家编码（带详细错误日志）
     # -------------------------------------------------------------------
-    def update_merchant_code(self, order: Order, parsed: ParsedRemark, parsed_list: list = None, price_diff_updates: list = None) -> bool:
+    def update_merchant_code(self, order: Order, parsed: ParsedRemark, parsed_list: list = None, price_diff_updates: list = None, gift_no_ship_tids: list = None, gift_no_ship: bool = False) -> bool:
         """
         调用 saveProduct 接口更新商家编码
         支持多尺寸：如果备注中有多个尺寸，会拆分成多个商品行
         支持赠品：检测已有赠品行并更新数量，或创建新的赠品行
         支持补差价订单：通过 price_diff_updates 参数处理补差价商品行
+        支持赠品不送：通过 gift_no_ship_tids / gift_no_ship 参数将赠品行编码改为不发货编码
         
         强制修复逻辑：
         1. 即使订单被标记为"解码失败"也能强制重新修改
@@ -359,9 +360,11 @@ class FangguoAdapter(ErpAdapter):
             price_diff_updates: 补差价商品行更新列表，每个元素包含 {'items': [...], 'ship': True/False}
                                - ship=True: 仅修改数量为1
                                - ship=False: 修改编码为"定制-定制-补差价-不打印"，数量改为1
+            gift_no_ship_tids: 合并订单中需要"赠品不送"处理的子订单tid列表
+            gift_no_ship: 普通订单是否需要"赠品不送"处理
         """
-        # 检测是否为合并订单（解析结果带有 original_tid）
-        is_merged_order = any(p.original_tid for p in (parsed_list or []))
+        # 检测是否为合并订单（解析结果带有 original_tid，或 gift_no_ship_tids 不为空）
+        is_merged_order = any(p.original_tid for p in (parsed_list or [])) or (gift_no_ship_tids and len(gift_no_ship_tids) > 0)
         
         # 合并订单跳过 _split_parsed_by_sizes，因为解析结果已经按分组处理过了
         if parsed_list and len(parsed_list) > 1:
@@ -373,7 +376,7 @@ class FangguoAdapter(ErpAdapter):
 
         # 只保留解析成功的商品行（success=True）
         # 对于只有赠品信息、没有有效商品解析的情况，不修改商品编码
-        product_parsed_list = [p for p in effective_list if p.success]
+        product_parsed_list = [p for p in effective_list if p and p.success]
 
         # 获取期望的商品编码集合（包含数量）
         expected_skus_set = {p.shop_mapping_sku for p in product_parsed_list}
@@ -448,15 +451,33 @@ class FangguoAdapter(ErpAdapter):
                         break
             
             if price_diff_already_correct:
-                has_gift = False
-                for p in effective_list:
-                    if p.gifts or (p.gift_name and p.gift_num > 0):
-                        has_gift = True
-                        break
+                # 检查赠品不送是否已处理
+                gift_no_ship_already_correct = True
+                if gift_no_ship_tids:
+                    for item in order.items:
+                        if self._is_gift_item(item):
+                            item_tid = item.original_tid or ""
+                            if item_tid in gift_no_ship_tids:
+                                if item.shop_mapping_sku != "定制-定制-补差价-不打印":
+                                    gift_no_ship_already_correct = False
+                                    break
+                elif gift_no_ship:
+                    for item in order.items:
+                        if self._is_gift_item(item):
+                            if item.shop_mapping_sku != "定制-定制-补差价-不打印":
+                                gift_no_ship_already_correct = False
+                                break
                 
-                if not has_gift:
-                    print(f"  ✅ 编码已正确，跳过修改")
-                    return True
+                if gift_no_ship_already_correct:
+                    has_gift = False
+                    for p in effective_list:
+                        if p and (p.gifts or (p.gift_name and p.gift_num > 0)):
+                            has_gift = True
+                            break
+                    
+                    if not has_gift:
+                        print(f"  ✅ 编码已正确，跳过修改")
+                        return True
 
         # 完全重建 orderItems，基于解析结果
         # 使用第一个有效商品行作为模板，保留必要的原始字段
@@ -519,6 +540,8 @@ class FangguoAdapter(ErpAdapter):
         # 合并订单场景：按 original_tid 分组处理赠品，避免跨子订单合并
         gifts_by_tid = {}  # {original_tid: {'gifts': [(name, num)], 'material_code': '', 'shop_remark': ''}}
         for p in effective_list:
+            if not p:
+                continue
             if p.gifts:
                 tid = p.original_tid or ""
                 if tid not in gifts_by_tid:
@@ -578,22 +601,36 @@ class FangguoAdapter(ErpAdapter):
 
         # 第二步.5：如果备注中没有赠品信息，但订单中存在赠品行，保留现有赠品行不变
         # 这确保赠品行在没有备注说明时保持原样，不会被误修改或删除
+        # 特殊处理：如果备注包含"赠品不送"，将对应赠品行编码改为不发货编码
         if not all_gifts:
             for idx, item in enumerate(order.items):
                 if idx not in used_item_indices and self._is_gift_item(item):
-                    if item.raw:
-                        order_items.append(item.raw)
+                    item_tid = item.original_tid or ""
+                    should_no_ship = False
+                    if gift_no_ship_tids and item_tid in gift_no_ship_tids:
+                        should_no_ship = True
+                    elif gift_no_ship and not gift_no_ship_tids:
+                        should_no_ship = True
+                    
+                    if should_no_ship:
+                        new_item = self._build_price_diff_no_ship_item(item, order)
+                        new_item['num'] = item.num
+                        order_items.append(new_item)
+                        used_item_indices.add(idx)
                     else:
-                        order_items.append({
-                            "id": item.id,
-                            "orderId": item.order_id,
-                            "sysOid": item.sys_oid,
-                            "oid": item.oid,
-                            "title": item.title,
-                            "shopMappingSku": item.shop_mapping_sku,
-                            "num": item.num,
-                            "price": item.price,
-                        })
+                        if item.raw:
+                            order_items.append(item.raw)
+                        else:
+                            order_items.append({
+                                "id": item.id,
+                                "orderId": item.order_id,
+                                "sysOid": item.sys_oid,
+                                "oid": item.oid,
+                                "title": item.title,
+                                "shopMappingSku": item.shop_mapping_sku,
+                                "num": item.num,
+                                "price": item.price,
+                            })
 
         # 第三步：保留未匹配的非作废、非赠品、非补差价商品行（保持原样，不修改）
         # 这对于合并订单非常重要：被跳过的子订单的商品行需要保留
@@ -706,7 +743,7 @@ class FangguoAdapter(ErpAdapter):
         """如果备注中包含多个尺寸，拆成多个 ParsedRemark"""
         remark = order.shop_remark or ""
         if not remark:
-            return [parsed]
+            return [parsed] if parsed else []
 
         multi_parsed = extract_multiple_remarks(
             remark,
@@ -716,10 +753,11 @@ class FangguoAdapter(ErpAdapter):
 
         if len(multi_parsed) > 1:
             for p in multi_parsed:
-                p.original_tid = parsed.original_tid
+                if parsed:
+                    p.original_tid = parsed.original_tid
             return multi_parsed
 
-        return [parsed]
+        return [parsed] if parsed else []
 
     def _build_order_item(self, item: OrderItem, order: Order, parsed: ParsedRemark) -> dict:
         # 合并订单优先使用子订单号（item.oid）和子订单备注

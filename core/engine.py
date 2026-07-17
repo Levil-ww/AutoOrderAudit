@@ -170,6 +170,7 @@ class AutoAuditEngine:
             price_diff_updates: 补差价商品行更新列表，用于合并订单或混合订单的一次性处理
         """
         remark = order.shop_remark or ""
+        gift_no_ship = "赠品不送" in remark
         
         for keyword in _SKIP_KEYWORDS:
             if keyword in remark:
@@ -187,13 +188,16 @@ class AutoAuditEngine:
         )
 
         if not parsed_list:
-            print(f"  ⏭️  跳过：无法解析备注")
-            self.stats["skipped"] += 1
-            return
+            if gift_no_ship:
+                parsed_list = []
+            else:
+                print(f"  ⏭️  跳过：无法解析备注")
+                self.stats["skipped"] += 1
+                return
 
-        parsed = parsed_list[0]
+        parsed = parsed_list[0] if parsed_list else None
         
-        has_product_info = parsed.success
+        has_product_info = parsed.success if parsed else False
         
         if has_product_info:
             summary = (
@@ -218,7 +222,7 @@ class AutoAuditEngine:
         for gift_name, gift_num in all_gifts:
             print(f"  🎁 赠品: {gift_name} x {gift_num}")
         
-        if not has_product_info and not all_gifts:
+        if not has_product_info and not all_gifts and not gift_no_ship:
             print(f"  ⏭️  跳过：无商品定制信息且无赠品")
             self.stats["skipped"] += 1
             return
@@ -234,6 +238,8 @@ class AutoAuditEngine:
                 for update in price_diff_updates:
                     action = "修改编码为'定制-定制-补差价-不打印'" if not update['ship'] else "仅修改数量为1"
                     print(f"  🔶 DRY RUN: 补差价订单 -> {action}")
+            if gift_no_ship:
+                print(f"  🔶 DRY RUN: 赠品不发货 -> 修改赠品行编码为'定制-定制-补差价-不打印'")
             self.stats["success"] += 1
             return
 
@@ -248,10 +254,12 @@ class AutoAuditEngine:
                 for update in price_diff_updates:
                     action = "修改编码为'定制-定制-补差价-不打印'" if not update['ship'] else "仅修改数量为1"
                     changes.append(f"补差价订单: {action}")
+            if gift_no_ship:
+                changes.append(f"赠品不发货: 修改赠品行编码为'定制-定制-补差价-不打印'")
 
             should_update = self.confirm_callback(order, parsed_list, changes)
             if not should_update:
-                if parsed_list[0].success:
+                if parsed_list and parsed_list[0].success:
                     print(f"  ⏭️  用户取消：新编码 {parsed_list[0].shop_mapping_sku}（未修改）")
                 else:
                     print(f"  ⏭️  用户取消（未修改）")
@@ -259,7 +267,7 @@ class AutoAuditEngine:
                 return
 
         try:
-            ok = self.adapter.update_merchant_code(order, parsed_list[0], parsed_list, price_diff_updates)
+            ok = self.adapter.update_merchant_code(order, parsed_list[0] if parsed_list else None, parsed_list, price_diff_updates, gift_no_ship=gift_no_ship)
             if ok is None:
                 print(f"  ⏭️  跳过：订单所有商品行已作废")
                 self.stats["skipped"] += 1
@@ -402,11 +410,15 @@ class AutoAuditEngine:
         all_parsed_list = []
         all_gifts = []
         price_diff_updates = []
+        gift_no_ship_tids = []
         
         for tid, group in groups.items():
             group_remark = group['remark']
             is_price_diff = group['is_price_diff']
             print(f"    原始订单 {tid[:16]}...: 备注='{group_remark[:40]}...' {'(补差价)' if is_price_diff else ''}")
+            
+            if "赠品不送" in group_remark:
+                gift_no_ship_tids.append(tid)
             
             if is_price_diff:
                 if not group_remark.strip():
@@ -495,7 +507,7 @@ class AutoAuditEngine:
 
         all_gifts = list(dict.fromkeys(all_gifts))
 
-        if not all_parsed_list and not price_diff_updates:
+        if not all_parsed_list and not price_diff_updates and not gift_no_ship_tids:
             print(f"  ⏭️  跳过：所有分组均无法解析")
             self.stats["skipped"] += 1
             return
@@ -520,10 +532,12 @@ class AutoAuditEngine:
             for update in price_diff_updates:
                 action = "修改编码为'定制-定制-补差价-不打印'" if not update['ship'] else "仅修改数量为1"
                 print(f"  🔶 DRY RUN: 补差价订单 {update['tid'][:16]}... -> {action}")
+            for tid in gift_no_ship_tids:
+                print(f"  🔶 DRY RUN: 赠品不发货 {tid[:16]}... -> 修改赠品行编码为'定制-定制-补差价-不打印'")
             self.stats["success"] += 1
             return
         
-        if self.confirm_callback and all_parsed_list:
+        if self.confirm_callback and (all_parsed_list or gift_no_ship_tids):
             changes = []
             for p in all_parsed_list:
                 changes.append(f"新编码: {p.shop_mapping_sku}")
@@ -532,6 +546,8 @@ class AutoAuditEngine:
             for update in price_diff_updates:
                 action = "修改编码为'定制-定制-补差价-不打印'" if not update['ship'] else "仅修改数量为1"
                 changes.append(f"补差价订单: {action}")
+            for tid in gift_no_ship_tids:
+                changes.append(f"赠品不发货: 修改赠品行编码为'定制-定制-补差价-不打印'")
             
             should_update = self.confirm_callback(order, all_parsed_list, changes)
             if not should_update:
@@ -540,19 +556,23 @@ class AutoAuditEngine:
                 return
         
         try:
-            if all_parsed_list or price_diff_updates:
+            if all_parsed_list or price_diff_updates or gift_no_ship_tids:
                 ok = self.adapter.update_merchant_code(order, 
                     all_parsed_list[0] if all_parsed_list else None, 
                     all_parsed_list,
-                    price_diff_updates
+                    price_diff_updates,
+                    gift_no_ship_tids=gift_no_ship_tids,
                 )
                 if ok is None:
                     print(f"  ⏭️  跳过：订单所有商品行已作废")
                     self.stats["skipped"] += 1
                 elif ok:
-                    print(f"  ✅ 修改成功！共 {len(all_parsed_list)} 个编码")
+                    if all_parsed_list:
+                        print(f"  ✅ 修改成功！共 {len(all_parsed_list)} 个编码")
                     if price_diff_updates:
                         print(f"  ✅ 补差价订单修改成功！")
+                    if gift_no_ship_tids:
+                        print(f"  ✅ 赠品不发货修改成功！")
                     self.stats["success"] += 1
                 else:
                     print(f"  ❌ 修改失败")

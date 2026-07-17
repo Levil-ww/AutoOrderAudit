@@ -634,3 +634,27 @@ valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gif
     不同子订单有相同赠品	    分别创建独立的赠品行，不合并
     同一子订单内有相同商品	  合并为1个商品行，数量累加
     不同子订单有相同商品	    保留独立的商品行，不合并
+
+十七、优化备注中“赠品不送”的逻辑
+1、逻辑梳理
+    1.1 处理流程
+        - 检测"赠品不送"：在 engine 层面，解析备注前检测是否包含"赠品不送"关键词
+        - 允许空解析继续：原先备注无法解析会直接跳过订单；现在如果检测到"赠品不送"，即使无商品定制信息也会继续处理
+        - 赠品行匹配修改：在 adapter 重建 orderItems 时，对原有赠品行判断是否需要改为不发货编码
+        - 无赠品行则跳过：如果订单中不存在任何赠品行，used_item_indices 不会增加，is_already_correct 也能正确识别，不会误创建新行
+        - "正常发"逻辑保持不变
+
+    1.2 "正常发"逻辑保持不变
+        1. 备注中不含"赠品不送"时，所有原有逻辑完全不变
+        2. 含"赠品不送"时，仅修改赠品行编码，普通商品编码不受任何影响
+
+2、修改文件
+    2.1 core/engine.py
+        - 合并订单 _process_merged_order：按 original_tid 分组收集 gift_no_ship_tids，跳过条件增加 or gift_no_ship_tids，adapter 调用传入该参数
+        - 普通订单 _process_normal_order_logic：检测 gift_no_ship = "赠品不送" in remark，允许 parsed_list 为空时继续处理，adapter 调用传入 gift_no_ship
+    2.2 adapters/fangguo/adapter.py
+        - update_merchant_code 签名：新增 gift_no_ship_tids（合并订单）和 gift_no_ship（普通订单）参数
+        - is_merged_order 检测：增加 gift_no_ship_tids 判断，确保合并订单走合并订单分支
+        - is_already_correct 检查：新增赠品不送状态的验证，已修改为"定制-定制-补差价-不打印"的赠品行不会重复触发修改
+        - 赠品行处理（第二步.5）：当 all_gifts 为空时，检测赠品行所属 original_tid 是否在 gift_no_ship_tids 中，或 gift_no_ship 是否为 True；命中则调用 _build_price_diff_no_ship_item 将编码改为 "定制-定制-补差价-不打印"，同时保留原有数量；未命中则保持原样不变
+        - 防御性修复：处理 parsed 为 None 或 effective_list 含 None 的情况，避免 AttributeError
