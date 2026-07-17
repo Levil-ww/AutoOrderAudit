@@ -235,6 +235,9 @@ class AutoAuditEngine:
         if not parsed_list:
             if gift_no_ship:
                 parsed_list = []
+            elif any(self._is_price_difference_item(item) for item in order.items):
+                # 订单中有补差价行，即使备注为空也要继续处理
+                parsed_list = []
             else:
                 print(f"  ⏭️  跳过：无法解析备注")
                 self.stats["skipped"] += 1
@@ -268,9 +271,49 @@ class AutoAuditEngine:
             print(f"  🎁 赠品: {gift_name} x {gift_num}")
         
         if not has_product_info and not all_gifts and not gift_no_ship:
-            print(f"  ⏭️  跳过：无商品定制信息且无赠品")
-            self.stats["skipped"] += 1
-            return
+            # 如果订单中有补差价行，不跳过（补差价行需要处理）
+            if not any(self._is_price_difference_item(item) for item in order.items):
+                print(f"  ⏭️  跳过：无商品定制信息且无赠品")
+                self.stats["skipped"] += 1
+                return
+
+        # 混合订单补差价行处理：当外部未传入 price_diff_updates 时，自行构建
+        if price_diff_updates is None:
+            price_diff_items = [item for item in order.items if self._is_price_difference_item(item)]
+            if price_diff_items:
+                no_print_reason = self._get_no_print_reason(remark)
+                if no_print_reason:
+                    price_diff_updates = [{
+                        'tid': order.tid,
+                        'items': price_diff_items,
+                        'remark': remark,
+                        'ship': False,
+                    }]
+                else:
+                    # 备注有定制信息，计算剩余解析结果分配给补差价行
+                    regular_item_count = sum(
+                        1 for item in order.items
+                        if not self._is_price_difference_item(item)
+                        and not self.adapter._is_gift_item(item)
+                        and not item.is_void
+                    )
+                    successful_parsed = [p for p in parsed_list if p.success]
+                    extra_parsed = successful_parsed[regular_item_count:] if len(successful_parsed) > regular_item_count else []
+                    if extra_parsed:
+                        price_diff_updates = [{
+                            'tid': order.tid,
+                            'items': price_diff_items,
+                            'remark': remark,
+                            'ship': True,
+                            'parsed_list': extra_parsed,
+                        }]
+                    else:
+                        price_diff_updates = [{
+                            'tid': order.tid,
+                            'items': price_diff_items,
+                            'remark': remark,
+                            'ship': True,
+                        }]
 
         if self.dry_run:
             print()
@@ -415,12 +458,18 @@ class AutoAuditEngine:
             return
 
         # ===== 普通订单处理 =====
+        # 混合订单（有普通商品行 + 补差价行）：即使备注为空，也要处理补差价行
+        price_diff_items = [item for item in order.items if self._is_price_difference_item(item)]
         if not remark.strip():
-            print("  ⏭️  跳过：卖家备注为空")
-            self.stats["skipped"] += 1
-            return
-
-        self._process_normal_order_logic(order)
+            if price_diff_items:
+                # 备注为空但有补差价行 → 编码改为不打印
+                self._process_normal_order_logic(order)
+            else:
+                print("  ⏭️  跳过：卖家备注为空")
+                self.stats["skipped"] += 1
+                return
+        else:
+            self._process_normal_order_logic(order)
 
     def _process_merged_order(self, order, material_map, material_matcher):
         """
