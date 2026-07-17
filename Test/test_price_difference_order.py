@@ -48,12 +48,12 @@ def test_price_diff_detection():
 
 def test_price_diff_only_empty_remark():
     print('=' * 80)
-    print('测试二：只有补差价订单且备注为空 -> 跳过')
+    print('测试二：只有补差价订单且备注为空 -> 编码改为不打印、数量1')
     print('=' * 80)
-    
+
     adapter = FangguoAdapter()
     engine = AutoAuditEngine(adapter, dry_run=True)
-    
+
     order = Order(
         id='test',
         trade_id='test_order_001',
@@ -68,16 +68,16 @@ def test_price_diff_only_empty_remark():
         num=26,
         price=1.0,
     ))
-    
+
     print(f"订单标题: {order.items[0].title}")
     print(f"订单备注: '{order.shop_remark}'")
     print(f"商品数量: {order.items[0].num}")
     print()
-    
+
     engine._process_order(order)
-    
-    assert engine.stats['skipped'] == 1, f"期望跳过1个订单，实际跳过{engine.stats['skipped']}个"
-    print('✅ 测试通过：只有补差价订单且备注为空，已跳过')
+
+    assert engine.stats['success'] == 1, f"期望成功1个订单（编码改为不打印），实际success={engine.stats['success']}, skipped={engine.stats['skipped']}"
+    print('✅ 测试通过：只有补差价订单且备注为空，编码已改为不打印、数量1')
     print()
 
 
@@ -170,11 +170,11 @@ def test_price_diff_no_ship():
 
 def test_price_diff_with_normal_items_empty_remark():
     print('=' * 80)
-    print('测试五：订单有多个商品行，补差价商品行备注为空 -> 仅修改数量为1')
+    print('测试五：混合订单补差价商品行备注为空 -> 编码改为不打印、数量1')
     print('=' * 80)
-    
+
     adapter = FangguoAdapter()
-    
+
     order = Order(
         id='test',
         trade_id='test_order_004',
@@ -209,24 +209,28 @@ def test_price_diff_with_normal_items_empty_remark():
             "pictureCode": "",
         },
     ))
-    
+
     print(f"商品行1标题: {order.items[0].title}")
     print(f"商品行1数量: {order.items[0].num}")
     print(f"商品行2标题: {order.items[1].title}")
     print(f"商品行2数量: {order.items[1].num}")
     print(f"订单备注: '{order.shop_remark}'")
     print()
-    
-    result_item = adapter._build_order_item_keep_sku(order.items[1], order, num=1)
-    
+
+    # 备注为空时，补差价行编码应改为"定制-定制-补差价-不打印"，数量改为1
+    result_item = adapter._build_price_diff_no_ship_item(order.items[1], order)
+
+    expected_sku = "定制-定制-补差价-不打印"
     expected_num = 1
-    
-    status = '✅' if result_item['num'] == expected_num else '❌'
-    print(f"{status} 补差价商品行数量: {result_item['num']} (期望: {expected_num})")
-    print(f"✅ 商家编码保持不变: {result_item['shopMappingSku']}")
-    
+
+    status1 = '✅' if result_item['shopMappingSku'] == expected_sku else '❌'
+    status2 = '✅' if result_item['num'] == expected_num else '❌'
+    print(f"{status1} 补差价商品行编码: {result_item['shopMappingSku']} (期望: {expected_sku})")
+    print(f"{status2} 补差价商品行数量: {result_item['num']} (期望: {expected_num})")
+
+    assert result_item['shopMappingSku'] == expected_sku, f"商家编码不匹配"
     assert result_item['num'] == expected_num, f"数量不匹配"
-    print('✅ 测试通过：补差价商品行仅修改数量为1')
+    print('✅ 测试通过：补差价商品行编码已改为不打印、数量1')
     print()
 
 
@@ -335,7 +339,22 @@ def test_price_diff_no_print():
     assert AutoAuditEngine._is_no_ship_remark("补差价不打印") == True
     assert AutoAuditEngine._is_no_ship_remark("定制双面革") == False
     assert AutoAuditEngine._is_no_ship_remark("") == False
-    
+
+    # 场景3：_get_no_print_reason 静态方法测试
+    # 备注为空 → 返回"备注为空"
+    assert AutoAuditEngine._get_no_print_reason("") == "备注为空"
+    assert AutoAuditEngine._get_no_print_reason("   ") == "备注为空"
+    # 备注为"补差价" → 返回"备注为'补差价'"
+    assert AutoAuditEngine._get_no_print_reason("补差价") == "备注为'补差价'"
+    assert AutoAuditEngine._get_no_print_reason(" 补差价 ") == "备注为'补差价'"
+    # 包含"差价不发货" → 返回"差价不发货"
+    assert AutoAuditEngine._get_no_print_reason("差价不发货") == "差价不发货"
+    # 包含"不打印" → 返回"不打印"
+    assert AutoAuditEngine._get_no_print_reason("补差价不打印") == "不打印"
+    # 有定制信息 → 返回 None
+    assert AutoAuditEngine._get_no_print_reason("定制双面革安妮森林") is None
+    assert AutoAuditEngine._get_no_print_reason("补差价 定制双面革") is None
+
     print('✅ 测试通过："不打印"关键字检测和编码修改正确')
     print()
 
