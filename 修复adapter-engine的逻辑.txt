@@ -551,3 +551,16 @@ valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gif
     4. _build_order_item_keep_sku / _build_price_diff_no_ship_item：统一修复为使用商品行级别的 oid 和 shop_remark
 
 
+十四、优化改造备注中的多赠品问题
+如送赠品圆垫-2张，赠品方垫-1张
+问题根因分析：
+  1.当前 _extract_gift() 函数（parser.py:822-939）只返回单个赠品 (gift_name, gift_num)，但备注"正常发，送赠品圆垫-2张，赠品方垫-1张"包含两个赠品
+  2.update_merchant_code() 中的赠品处理逻辑（adapter.py:520-557）只处理单个赠品，循环创建多行的逻辑缺失
+  3.需要改造多个层面的代码来支持多赠品
+
+解决方案：
+  1.改造 ParsedRemark 类，添加 gifts 属性支持多个赠品
+  2.改造 _extract_gift() 函数，返回多个赠品列表
+  3.改造 extract_multiple_remarks() 和 parse_remark() 中的赠品处理逻辑
+  4.改造 engine.py 中合并订单处理的赠品收集逻辑
+  5.改造 adapter.py update_merchant_code() 中的赠品循环处理逻辑

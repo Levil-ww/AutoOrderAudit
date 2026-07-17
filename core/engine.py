@@ -206,17 +206,19 @@ class AutoAuditEngine:
         else:
             print(f"  ℹ️  无商品定制信息")
 
-        gift_name = ""
-        gift_num = 0
+        all_gifts = []
         for p in parsed_list:
-            if p.gift_name:
-                gift_name = p.gift_name
-                gift_num = p.gift_num
-                break
-        if gift_name:
+            if p.gifts:
+                all_gifts.extend(p.gifts)
+            elif p.gift_name and p.gift_num > 0:
+                all_gifts.append((p.gift_name, p.gift_num))
+        
+        all_gifts = list(dict.fromkeys(all_gifts))
+        
+        for gift_name, gift_num in all_gifts:
             print(f"  🎁 赠品: {gift_name} x {gift_num}")
         
-        if not has_product_info and not gift_name:
+        if not has_product_info and not all_gifts:
             print(f"  ⏭️  跳过：无商品定制信息且无赠品")
             self.stats["skipped"] += 1
             return
@@ -226,7 +228,7 @@ class AutoAuditEngine:
             for parsed in parsed_list:
                 if parsed.success:
                     print(f"  🔶 DRY RUN: 新编码 = {parsed.shop_mapping_sku}")
-            if gift_name:
+            for gift_name, gift_num in all_gifts:
                 print(f"  🔶 DRY RUN: 将添加赠品商品行 = {gift_name} x {gift_num}")
             if price_diff_updates:
                 for update in price_diff_updates:
@@ -240,7 +242,7 @@ class AutoAuditEngine:
             for p in parsed_list:
                 if p.success:
                     changes.append(f"新编码: {p.shop_mapping_sku}")
-            if gift_name:
+            for gift_name, gift_num in all_gifts:
                 changes.append(f"赠品: {gift_name} x {gift_num}")
             if price_diff_updates:
                 for update in price_diff_updates:
@@ -268,7 +270,7 @@ class AutoAuditEngine:
                         print(f"  📦 包含 {len(parsed_list)} 个尺寸，已拆分处理")
                 else:
                     print(f"  ✅ 修改成功！")
-                if gift_name:
+                for gift_name, gift_num in all_gifts:
                     print(f"  🎁 赠品已添加: {gift_name} x {gift_num}")
                 if price_diff_updates:
                     print(f"  ✅ 补差价订单修改成功！")
@@ -451,7 +453,9 @@ class AutoAuditEngine:
                     all_parsed_list.extend(parsed_list)
                     
                     for p in parsed_list:
-                        if p.gift_name and p.gift_num > 0:
+                        if p.gifts:
+                            all_gifts.extend(p.gifts)
+                        elif p.gift_name and p.gift_num > 0:
                             all_gifts.append((p.gift_name, p.gift_num))
             else:
                 skip_reason = None
@@ -484,8 +488,12 @@ class AutoAuditEngine:
                 all_parsed_list.extend(parsed_list)
 
                 for p in parsed_list:
-                    if p.gift_name and p.gift_num > 0:
+                    if p.gifts:
+                        all_gifts.extend(p.gifts)
+                    elif p.gift_name and p.gift_num > 0:
                         all_gifts.append((p.gift_name, p.gift_num))
+
+        all_gifts = list(dict.fromkeys(all_gifts))
 
         if not all_parsed_list and not price_diff_updates:
             print(f"  ⏭️  跳过：所有分组均无法解析")

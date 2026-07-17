@@ -448,15 +448,13 @@ class FangguoAdapter(ErpAdapter):
                         break
             
             if price_diff_already_correct:
-                gift_name = ""
-                gift_num = 0
+                has_gift = False
                 for p in effective_list:
-                    if p.gift_name:
-                        gift_name = p.gift_name
-                        gift_num = p.gift_num
+                    if p.gifts or (p.gift_name and p.gift_num > 0):
+                        has_gift = True
                         break
                 
-                if not gift_name:
+                if not has_gift:
                     print(f"  ✅ 编码已正确，跳过修改")
                     return True
 
@@ -518,47 +516,52 @@ class FangguoAdapter(ErpAdapter):
             print(f"    ℹ️  无有效商品解析信息，保留原商品编码不变")
 
         # 第二步：处理赠品（如果有）
-        gift_name = ""
-        gift_num = 0
+        all_gifts = []
         material_code = ""
         gift_original_tid = ""
         gift_shop_remark = ""
         for p in effective_list:
-            if p.gift_name:
-                gift_name = p.gift_name
-                gift_num = p.gift_num
-                gift_original_tid = p.original_tid
-                gift_shop_remark = p.shop_remark
+            if p.gifts:
+                all_gifts.extend(p.gifts)
+            elif p.gift_name and p.gift_num > 0:
+                all_gifts.append((p.gift_name, p.gift_num))
             if p.material_code:
                 material_code = p.material_code
+            if p.original_tid and not gift_original_tid:
+                gift_original_tid = p.original_tid
+            if p.shop_remark and not gift_shop_remark:
+                gift_shop_remark = p.shop_remark
+        
+        all_gifts = list(dict.fromkeys(all_gifts))
 
-        if gift_name and gift_num > 0:
+        if all_gifts:
             effective_material_code = material_code or "吸水皮革"
-            # 查找现有赠品行
-            existing_gift_idx = None
+            existing_gift_indices = []
             for idx, item in enumerate(order.items):
                 if idx not in used_item_indices and self._is_gift_item(item):
-                    existing_gift_idx = idx
-                    break
+                    existing_gift_indices.append(idx)
 
-            if existing_gift_idx is not None:
-                # 更新现有赠品行
-                new_gift = self._build_gift_item(order.items[existing_gift_idx], order, effective_material_code, gift_name, gift_num, is_new=False, original_tid=gift_original_tid, shop_remark=gift_shop_remark)
-                order_items.append(new_gift)
-            else:
-                # 创建新赠品行（标识字段置空，ERP会创建新行）
-                if template_item:
-                    new_gift = self._build_gift_item(template_item, order, effective_material_code, gift_name, gift_num, is_new=True, original_tid=gift_original_tid, shop_remark=gift_shop_remark)
+            existing_idx = 0
+            for gift_name, gift_num in all_gifts:
+                if existing_idx < len(existing_gift_indices):
+                    existing_gift_idx = existing_gift_indices[existing_idx]
+                    new_gift = self._build_gift_item(order.items[existing_gift_idx], order, effective_material_code, gift_name, gift_num, is_new=False, original_tid=gift_original_tid, shop_remark=gift_shop_remark)
+                    order_items.append(new_gift)
+                    used_item_indices.add(existing_gift_idx)
+                    existing_idx += 1
                 else:
-                    new_gift = self._build_gift_item(
-                        OrderItem(id=order.trade_id, order_id=order.trade_id, oid=order.tid, num=1),
-                        order, effective_material_code, gift_name, gift_num, is_new=True, original_tid=gift_original_tid, shop_remark=gift_shop_remark,
-                    )
-                order_items.append(new_gift)
+                    if template_item:
+                        new_gift = self._build_gift_item(template_item, order, effective_material_code, gift_name, gift_num, is_new=True, original_tid=gift_original_tid, shop_remark=gift_shop_remark)
+                    else:
+                        new_gift = self._build_gift_item(
+                            OrderItem(id=order.trade_id, order_id=order.trade_id, oid=order.tid, num=1),
+                            order, effective_material_code, gift_name, gift_num, is_new=True, original_tid=gift_original_tid, shop_remark=gift_shop_remark,
+                        )
+                    order_items.append(new_gift)
 
         # 第二步.5：如果备注中没有赠品信息，但订单中存在赠品行，保留现有赠品行不变
         # 这确保赠品行在没有备注说明时保持原样，不会被误修改或删除
-        if not gift_name:
+        if not all_gifts:
             for idx, item in enumerate(order.items):
                 if idx not in used_item_indices and self._is_gift_item(item):
                     if item.raw:

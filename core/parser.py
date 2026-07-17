@@ -28,6 +28,7 @@ class ParsedRemark:
             material_source: str = "",
             gift_name: str = "",
             gift_num: int = 0,
+            gifts: list[tuple[str, int]] = None,
             original_tid: str = "",
             shop_remark: str = "",
     ):
@@ -41,6 +42,7 @@ class ParsedRemark:
         self.material_source = material_source
         self.gift_name = gift_name
         self.gift_num = gift_num
+        self.gifts = gifts or []
         self.original_tid = original_tid
         self.shop_remark = shop_remark
 
@@ -51,13 +53,14 @@ class ParsedRemark:
         return "-".join(parts)
 
     def __repr__(self) -> str:
+        gifts_str = ", ".join([f"'{g[0]}'x{g[1]}" for g in self.gifts]) if self.gifts else f"'{self.gift_name}'x{self.gift_num}"
         return (
             f"ParsedRemark(success={self.success}, "
             f"material='{self.material_code}'[{self.material_source}], "
             f"color='{self.color_code}', model='{self.model_code}', "
             f"picture='{self.picture_code}', num={self.num}, "
             f"sku='{self.shop_mapping_sku}', raw='{self.raw_text}', "
-            f"gift='{self.gift_name}'x{self.gift_num}, "
+            f"gifts=[{gifts_str}], "
             f"original_tid='{self.original_tid[:10]}'..., "
             f"shop_remark='{self.shop_remark[:20]}'...)"
         )
@@ -75,6 +78,7 @@ class ParsedRemark:
             "material_source": self.material_source,
             "gift_name": self.gift_name,
             "gift_num": self.gift_num,
+            "gifts": self.gifts,
             "original_tid": self.original_tid,
             "shop_remark": self.shop_remark,
         }
@@ -184,8 +188,17 @@ def parse_remark(
     all_sizes = _extract_all_sizes(body)
 
     if not all_sizes:
-        # 没有尺寸，尝试作为简单模式解析
-        return _parse_simple(body, result, is_custom, material_map, material_matcher)
+        _parse_simple(body, result, is_custom, material_map, material_matcher)
+        gifts = _extract_multiple_gifts(text)
+        if gifts:
+            result.gift_name = gifts[0][0]
+            result.gift_num = gifts[0][1]
+            result.gifts = gifts
+        else:
+            result.gift_name = ""
+            result.gift_num = 0
+            result.gifts = []
+        return result
 
     # 取第一个尺寸作为主尺寸（用于构建编码）
     # 同时提取尺寸前面的描述文本（如"竖版53x60"中的"竖版"）
@@ -328,9 +341,15 @@ def parse_remark(
     if result.material_code and actual_size:
         result.success = True
 
-    gift_name, gift_num = _extract_gift(text)
-    result.gift_name = gift_name
-    result.gift_num = gift_num
+    gifts = _extract_multiple_gifts(text)
+    if gifts:
+        result.gift_name = gifts[0][0]
+        result.gift_num = gifts[0][1]
+        result.gifts = gifts
+    else:
+        result.gift_name = ""
+        result.gift_num = 0
+        result.gifts = []
 
     return result
 
@@ -386,11 +405,12 @@ def extract_multiple_remarks(
         if parsed.success:
             results.append(parsed)
         else:
-            gift_name, gift_num = _extract_gift(remark_text)
-            if gift_name and gift_num > 0:
+            gifts = _extract_multiple_gifts(remark_text)
+            if gifts:
                 results.append(ParsedRemark(
-                    gift_name=gift_name,
-                    gift_num=gift_num,
+                    gift_name=gifts[0][0],
+                    gift_num=gifts[0][1],
+                    gifts=gifts,
                     success=False,
                     raw_text=remark_text,
                 ))
@@ -461,20 +481,25 @@ def extract_multiple_remarks(
             results.append(parsed)
 
     if results:
-        gift_name, gift_num = _extract_gift(remark_text)
+        gifts = _extract_multiple_gifts(remark_text)
         for r in results:
-            if not r.gift_name:
-                r.gift_name = gift_name
-                r.gift_num = gift_num
+            if gifts:
+                if not r.gift_name:
+                    r.gift_name = gifts[0][0]
+                    r.gift_num = gifts[0][1]
+                if not r.gifts:
+                    r.gifts = gifts
     else:
-        gift_name, gift_num = _extract_gift(remark_text)
-        if gift_name and gift_num > 0:
-            results.append(ParsedRemark(
-                gift_name=gift_name,
-                gift_num=gift_num,
+        gifts = _extract_multiple_gifts(remark_text)
+        if gifts:
+            result = ParsedRemark(
+                gift_name=gifts[0][0],
+                gift_num=gifts[0][1],
+                gifts=gifts,
                 success=False,
                 raw_text=remark_text,
-            ))
+            )
+            results.append(result)
 
     return results
 
@@ -832,8 +857,113 @@ def _extract_gift(text: str) -> tuple[str, int]:
     - "小垫子总共送2个" → ("小垫子", 2)
     - "总共送2个小垫子" → ("小垫子", 2)
     """
-    gift_name = ""
-    gift_num = 0
+    gifts = _extract_multiple_gifts(text)
+    if gifts:
+        return gifts[0][0], gifts[0][1]
+    return "", 0
+
+
+def _extract_multiple_gifts(text: str) -> list[tuple[str, int]]:
+    """
+    从文本中提取多个赠品信息，返回 [(gift_name, gift_num), ...]
+    
+    支持的格式：
+    - "送防滑垫一张" → [("防滑垫", 1)]
+    - "送沥水垫25cm-1张" → [("沥水垫25cm", 1)]
+    - "送防滑垫一张，送抹布一块" → [("防滑垫", 1), ("抹布", 1)]
+    - "正常发，送赠品圆垫-2张，赠品方垫-1张" → [("圆垫", 2), ("方垫", 1)]
+    - "赠品：防滑垫" → [("防滑垫", 1)]
+    - "附赠收纳袋" → [("收纳袋", 1)]
+    - "小垫子总共送2个" → [("小垫子", 2)]
+    - "总共送2个小垫子" → [("小垫子", 2)]
+    """
+    gifts = []
+    
+    gift_pattern = re.compile(r"(送|赠品|附赠|加送)\s*([^，,；;\n]*?)[张个件套米]")
+    
+    for match in gift_pattern.finditer(text):
+        keyword = match.group(1)
+        content = match.group(2).strip()
+        
+        if keyword == "送":
+            prev_pos = match.start() - 1
+            if prev_pos >= 0:
+                prev_char = text[prev_pos]
+                if prev_char in "发送达放":
+                    continue
+            
+            next_pos = match.start() + 1
+            if next_pos < len(text):
+                next_char = text[next_pos]
+                if next_char in "达发":
+                    continue
+        
+        if not content:
+            continue
+        
+        qty_match = re.search(r"-(\d+)$", content)
+        if qty_match:
+            gift_num = int(qty_match.group(1))
+            gift_text = content[:qty_match.start()].strip()
+        else:
+            qty_match2 = re.search(r"(\d+)$", content)
+            if qty_match2:
+                gift_num = int(qty_match2.group(1))
+                gift_text = content[:qty_match2.start()].strip()
+            else:
+                qty_match3 = re.search(r"([一二两三四五六七八九十]+)$", content)
+                if qty_match3:
+                    chinese_num = qty_match3.group(1)
+                    gift_num = _CHINESE_NUM_MAP.get(chinese_num, 1)
+                    gift_text = content[:qty_match3.start()].strip()
+                else:
+                    gift_num = 1
+                    gift_text = content
+        
+        gift_text = gift_text.strip().strip("-;,、，：")
+        
+        if gift_text and keyword == "送":
+            qty_before_match = re.search(r"(\d+)$", content)
+            if qty_before_match:
+                prev_sep_pos = match.start() - 1
+                start_pos = prev_sep_pos
+                while start_pos >= 0 and text[start_pos] not in "，,；;、":
+                    start_pos -= 1
+                start_pos += 1
+                if start_pos < prev_sep_pos:
+                    before_text = text[start_pos:prev_sep_pos].strip()
+                    before_text = re.sub(r"[一二两三四五六七八九十]+[张个件套米]", "", before_text).strip()
+                    before_text = re.sub(r"\d+[张个件套米]", "", before_text).strip()
+                    before_text = before_text.replace("总共", "").strip()
+                    if before_text and before_text not in ["送", keyword]:
+                        gift_text = before_text
+        
+        gift_text = re.sub(r"\d+[张个件套米]", "", gift_text).strip()
+        gift_text = re.sub(r"[一二两三四五六七八九十]+[张个件套米]", "", gift_text).strip()
+        gift_text = gift_text.replace("总共", "").strip()
+        gift_text = re.sub(r"\*(\d+)[张个件套米]?", "", gift_text).strip()
+        gift_text = re.sub(r"[-××](\d+)[张个件套米]?", "", gift_text).strip()
+        gift_text = gift_text.strip().strip("-;,、，")
+        
+        if gift_text:
+            gift_text = gift_text[:30]
+            if gift_text.startswith("赠品") and len(gift_text) > 2:
+                gift_text = gift_text[2:].strip()
+            
+            if gift_text and gift_text not in ["一", "二", "两", "三", "四", "五", "六", "七", "八", "九", "十", "赠品"]:
+                gifts.append((gift_text, gift_num))
+    
+    if not gifts:
+        gifts = _extract_gifts_fallback(text)
+    
+    return gifts
+
+
+def _extract_gifts_fallback(text: str) -> list[tuple[str, int]]:
+    """
+    备用提取逻辑：当正则匹配失败时使用
+    """
+    gifts = []
     
     gift_start_pos = -1
     matched_keyword = ""
@@ -844,18 +974,18 @@ def _extract_gift(text: str) -> tuple[str, int]:
             matched_keyword = kw
     
     if gift_start_pos == -1:
-        return gift_name, gift_num
+        return gifts
     
     if matched_keyword == "送":
         prev_char = text[gift_start_pos - 1] if gift_start_pos > 0 else ""
         if prev_char and prev_char in "发送达放":
-            return gift_name, gift_num
+            return gifts
         
         next_pos = gift_start_pos + 1
         if next_pos < len(text):
             next_char = text[next_pos]
             if next_char in "达发":
-                return gift_name, gift_num
+                return gifts
     
     keyword_len = len(matched_keyword)
     after_keyword = text[gift_start_pos + keyword_len:].strip()
@@ -881,62 +1011,54 @@ def _extract_gift(text: str) -> tuple[str, int]:
                 gift_name_candidate = gift_name_candidate.strip("-;,、，")
                 if gift_name_candidate:
                     gift_name = gift_name_candidate[:30]
-                    return gift_name, gift_num
+                    gifts.append((gift_name, gift_num))
+                    return gifts
         
-        return gift_name, gift_num
+        return gifts
     
     gift_text = after_keyword.strip("-;,、，：")
     
-    comma_pos = gift_text.find("，")
-    if comma_pos == -1:
-        comma_pos = gift_text.find(",")
-    if comma_pos == -1:
-        comma_pos = gift_text.find("；")
-    if comma_pos == -1:
-        comma_pos = gift_text.find(";")
+    parts = re.split(r"[，,；;]", gift_text)
     
-    if comma_pos != -1:
-        gift_text = gift_text[:comma_pos].strip()
-    
-    qty_match = re.search(r"-(\d+)[张个件套米]", gift_text)
-    if qty_match:
-        gift_num = int(qty_match.group(1))
-        gift_text = gift_text[:qty_match.start()].strip()
-    else:
-        qty_match2 = re.search(r"(\d+)[张个件套米]", gift_text)
-        if qty_match2:
-            gift_num = int(qty_match2.group(1))
-            gift_text = gift_text[:qty_match2.start()].strip()
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        
+        qty_match = re.search(r"-(\d+)[张个件套米]", part)
+        if qty_match:
+            gift_num = int(qty_match.group(1))
+            gift_name = part[:qty_match.start()].strip()
         else:
-            qty_match3 = re.search(r"([一二两三四五六七八九十]+)[张个件套米]", gift_text)
-            if qty_match3:
-                chinese_num = qty_match3.group(1)
-                gift_num = _CHINESE_NUM_MAP.get(chinese_num, 1)
-                gift_text = gift_text[:qty_match3.start()].strip()
+            qty_match2 = re.search(r"(\d+)[张个件套米]", part)
+            if qty_match2:
+                gift_num = int(qty_match2.group(1))
+                gift_name = part[:qty_match2.start()].strip()
             else:
-                gift_num = 1
+                qty_match3 = re.search(r"([一二两三四五六七八九十]+)[张个件套米]", part)
+                if qty_match3:
+                    chinese_num = qty_match3.group(1)
+                    gift_num = _CHINESE_NUM_MAP.get(chinese_num, 1)
+                    gift_name = part[:qty_match3.start()].strip()
+                else:
+                    gift_num = 1
+                    gift_name = part
+        
+        gift_name = gift_name.strip().strip("-;,、，")
+        gift_name = re.sub(r"[一二两三四五六七八九十]+[张个件套米]", "", gift_name).strip()
+        gift_name = gift_name.strip().strip("-;,、，")
+        gift_name = re.sub(r"\*(\d+)[张个件套米]?", "", gift_name).strip()
+        gift_name = re.sub(r"[-××](\d+)[张个件套米]?", "", gift_name).strip()
+        gift_name = gift_name.strip().strip("-;,、，")
+        
+        if gift_name:
+            gift_name = gift_name[:30]
+            if gift_name.startswith("赠品") and len(gift_name) > 2:
+                gift_name = gift_name[2:].strip()
+            
+            gifts.append((gift_name, gift_num))
     
-    gift_text = gift_text.strip().strip("-;,、，")
-    
-    gift_text = re.sub(r"[一二两三四五六七八九十]+[张个件套米]", "", gift_text).strip()
-    gift_text = gift_text.strip().strip("-;,、，")
-    
-    gift_text = re.sub(r"\*(\d+)[张个件套米]?", "", gift_text).strip()
-    gift_text = re.sub(r"[-××](\d+)[张个件套米]?", "", gift_text).strip()
-    gift_text = gift_text.strip().strip("-;,、，")
-    
-    size_match = _RE_SIZE.search(gift_text)
-    if size_match:
-        gift_name = gift_text.strip()
-    else:
-        gift_name = gift_text.strip()
-    
-    if gift_name:
-        gift_name = gift_name[:30]
-        if gift_name.startswith("赠品") and len(gift_name) > 2:
-            gift_name = gift_name[2:].strip()
-    
-    return gift_name, gift_num
+    return gifts
 
 
 _HEURISTIC_MATERIALS = ["双面革", "吸水皮革", "镜面皮革", "双面格", "软玻璃", "丝圈", "防滑皮革", "仿皮"]
