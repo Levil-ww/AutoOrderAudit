@@ -486,16 +486,30 @@ class FangguoAdapter(ErpAdapter):
         order_items = []
         used_item_indices = set()
 
-        # 获取所有非赠品、非补差价、非作废的有效商品行索引
-        valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gift_item(item) and not self._is_price_difference_item(item) and not item.is_void]
+        # 获取所有非赠品、非作废的有效商品行索引
+        # treat_as_normal=True 时（仅有补差价行按普通订单处理），包含补差价行以便匹配覆盖
+        if treat_as_normal:
+            valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gift_item(item) and not item.is_void]
+        else:
+            valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gift_item(item) and not self._is_price_difference_item(item) and not item.is_void]
+
+        # 收集已分配给补差价行的解析结果（避免第一步重复创建）
+        price_diff_parsed_ids = set()
+        for update in (price_diff_updates or []):
+            for ep in update.get('parsed_list', []):
+                price_diff_parsed_ids.add(id(ep))
 
         # 第一步：为每个解析成功的商品行创建/更新商品行
         # 如果没有解析成功的商品行（只有赠品），则保留所有原商品行不变
         if product_parsed_list:
             for p in product_parsed_list:
+                # 跳过已分配给补差价行的解析结果（由第五步处理）
+                if id(p) in price_diff_parsed_ids:
+                    continue
+
                 matched_item_idx = None
                 match_method = "unknown"
-                
+
                 # 如果解析结果有 original_tid，按 original_tid 匹配商品行
                 if p.original_tid:
                     for idx in valid_indices:
@@ -505,7 +519,7 @@ class FangguoAdapter(ErpAdapter):
                                 matched_item_idx = idx
                                 match_method = "original_tid"
                                 break
-                
+
                 # 如果没有匹配到，按顺序使用未使用的有效商品行
                 if matched_item_idx is None:
                     for idx in valid_indices:
@@ -513,7 +527,7 @@ class FangguoAdapter(ErpAdapter):
                             matched_item_idx = idx
                             match_method = "sequential"
                             break
-                
+
                 if matched_item_idx is not None:
                     matched_item = order.items[matched_item_idx]
                     print(f"    匹配: 解析结果[{p.shop_mapping_sku[:30]}...] -> 商品行[{matched_item_idx}] original_tid={matched_item.original_tid[:10]}... 方法={match_method}")
@@ -632,28 +646,37 @@ class FangguoAdapter(ErpAdapter):
                                 "price": item.price,
                             })
 
-        # 第三步：保留未匹配的非作废、非赠品、非补差价商品行（保持原样，不修改）
+        # 第三步：保留未匹配的非作废、非赠品商品行（保持原样，不修改）
         # 这对于合并订单非常重要：被跳过的子订单的商品行需要保留
+        # treat_as_normal=True 时（仅有补差价行），未匹配的补差价行数量改为1
         for idx, item in enumerate(order.items):
-            if idx not in used_item_indices and not item.is_void and not self._is_gift_item(item) and not self._is_price_difference_item(item):
-                if item.raw:
-                    order_items.append(item.raw)
+            if idx not in used_item_indices and not item.is_void and not self._is_gift_item(item):
+                if self._is_price_difference_item(item):
+                    if treat_as_normal:
+                        # 仅有补差价行场景：未匹配的补差价行数量改为1
+                        new_item = self._build_order_item_keep_sku(item, order, num=1)
+                        order_items.append(new_item)
+                        used_item_indices.add(idx)
+                    # treat_as_normal=False 时：补差价行由第五步处理，此处跳过
                 else:
-                    order_items.append({
-                        "id": item.id,
-                        "orderId": item.order_id,
-                        "sysOid": item.sys_oid,
-                        "oid": item.oid,
-                        "title": item.title,
-                        "skuPropertiesName": item.sku_properties_name,
-                        "shopMappingSku": item.shop_mapping_sku,
-                        "originalSkuId": item.original_sku_id,
-                        "originalGoodsId": item.original_goods_id,
-                        "merchandisePicPath": item.merchandise_pic_path,
-                        "num": item.num,
-                        "price": item.price,
-                        "shopRemark": item.shop_remark or "",
-                    })
+                    if item.raw:
+                        order_items.append(item.raw)
+                    else:
+                        order_items.append({
+                            "id": item.id,
+                            "orderId": item.order_id,
+                            "sysOid": item.sys_oid,
+                            "oid": item.oid,
+                            "title": item.title,
+                            "skuPropertiesName": item.sku_properties_name,
+                            "shopMappingSku": item.shop_mapping_sku,
+                            "originalSkuId": item.original_sku_id,
+                            "originalGoodsId": item.original_goods_id,
+                            "merchandisePicPath": item.merchandise_pic_path,
+                            "num": item.num,
+                            "price": item.price,
+                            "shopRemark": item.shop_remark or "",
+                        })
 
         # 第四步：保留作废商品行（保持原样，不修改）
         for idx, item in enumerate(order.items):
