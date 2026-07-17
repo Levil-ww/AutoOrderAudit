@@ -1007,7 +1007,8 @@ class FangguoAdapter(ErpAdapter):
             model_code = "赠品沥水垫小圆或小方"
             picture_code = "赠品沥水垫小圆或小方"
             gift_code = "赠品沥水垫小圆或小方"
-        elif "方垫" in gift_name:
+        elif "方垫" in gift_name or re.search(r"30\s*[xX×]\s*50", gift_name):
+            # 包含"方垫"或"30x50"尺寸的赠品都视为30x50规格，使用方垫编码
             model_code = "30x50"
             picture_code = "随机发；30x50"
             gift_code = "30x50-随机发；30x50"
@@ -1166,7 +1167,7 @@ class FangguoAdapter(ErpAdapter):
             model_code = "赠品沥水垫小圆或小方"
             picture_code = "赠品沥水垫小圆或小方"
             gift_code = "赠品沥水垫小圆或小方"
-        elif "方垫" in gift_name:
+        elif "方垫" in gift_name or re.search(r"30\s*[xX×]\s*50", gift_name):
             model_code = "30x50"
             picture_code = "随机发；30x50"
             gift_code = "30x50-随机发；30x50"

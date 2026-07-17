@@ -568,13 +568,14 @@ def extract_multiple_remarks(
 
     if results:
         gifts = _extract_multiple_gifts(remark_text)
-        for r in results:
-            if gifts:
-                if not r.gift_name:
-                    r.gift_name = gifts[0][0]
-                    r.gift_num = gifts[0][1]
-                if not r.gifts:
-                    r.gifts = gifts
+        if gifts:
+            # 赠品仅附加到第一个解析结果，避免多尺寸拆分后赠品数量被重复累加
+            first = results[0]
+            if not first.gift_name:
+                first.gift_name = gifts[0][0]
+                first.gift_num = gifts[0][1]
+            if not first.gifts:
+                first.gifts = gifts
     else:
         gifts = _extract_multiple_gifts(remark_text)
         if gifts:
@@ -1061,9 +1062,14 @@ def _extract_multiple_gifts(text: str) -> list[tuple[str, int]]:
         
         if gift_text:
             gift_text = gift_text[:30]
+            # 清理"换赠品..."这种"换"前缀（"换"表示替换/更换，噪声词）
+            if gift_text.startswith("换赠品") and len(gift_text) > 3:
+                gift_text = gift_text[3:].strip()
+            elif gift_text.startswith("换") and len(gift_text) > 1 and "赠品" in gift_text[:5]:
+                gift_text = gift_text[1:].strip()
             if gift_text.startswith("赠品") and len(gift_text) > 2:
                 gift_text = gift_text[2:].strip()
-            
+
             if gift_text and gift_text not in ["一", "二", "两", "三", "四", "五", "六", "七", "八", "九", "十", "赠品"]:
                 gifts.append((gift_text, gift_num))
     
