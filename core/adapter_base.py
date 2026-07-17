@@ -44,6 +44,7 @@ class Order:
     raw: dict = field(default_factory=dict)
     receiver_province: str = ""       # 收件人省份
     receiver_address: str = ""        # 收件人完整地址
+    current_cp_code: str = ""         # 当前快递编码
 
 
 class ErpAdapter(ABC):

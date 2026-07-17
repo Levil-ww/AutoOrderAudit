@@ -733,6 +733,11 @@ class AutoAuditEngine:
             print(f"  ⚠️  快递编码未找到: {express_name}")
             return
 
+        # 检查当前快递是否已经正确，避免重复修改
+        if order.current_cp_code == express_code:
+            print(f"  ⏭️  跳过：快递已正确 [{express_name}({express_code})]")
+            return
+
         if self.dry_run:
             print(f"  🔶 DRY RUN: 将更新快递为 {express_name}({express_code})，来源: {match_source}")
             return

@@ -186,6 +186,8 @@ class FangguoAdapter(ErpAdapter):
         if receiver_province or receiver_address:
             print(f"  📍 收件地址: 省份={receiver_province or '未知'}, 地址={receiver_address[:30] if receiver_address else ''}...")
 
+        current_cp_code = str(raw.get("cpCode") or raw.get("logisticsCpCode") or "")
+
         order = Order(
             id=str(raw.get("id") or ""),
             trade_id=str(raw.get("tradeId") or raw.get("id") or ""),
@@ -198,6 +200,7 @@ class FangguoAdapter(ErpAdapter):
             raw=raw,
             receiver_province=receiver_province,
             receiver_address=receiver_address,
+            current_cp_code=current_cp_code,
         )
 
         # 如果订单级没取到备注，尝试从商品行取
@@ -279,7 +282,7 @@ class FangguoAdapter(ErpAdapter):
         return {}
 
     def _enrich_order_with_detail(self, order: Order) -> Order:
-        if order.shop_remark and order.items:
+        if order.shop_remark and order.items and order.current_cp_code:
             return order
         detail = self.fetch_order_detail(
             order_id=order.trade_id or order.id,
@@ -294,6 +297,10 @@ class FangguoAdapter(ErpAdapter):
                 "shopRemark", "sellerRemark", "remark",
                 "备注", "卖家备注", "shop_remark",
             ])
+
+        # 补充当前快递编码（如果缺失）
+        if not order.current_cp_code:
+            order.current_cp_code = str(detail.get("cpCode") or detail.get("logisticsCpCode") or "")
 
         # 补充商品行（如果缺失）
         if not order.items:
@@ -1680,12 +1687,12 @@ class FangguoAdapter(ErpAdapter):
             resp.raise_for_status()
             result = resp.json()
 
-            if result.get("code") == 0 and result.get("data") is True:
-                print(f"  ✅ 快递更新成功: {express_code}")
+            if result.get("code") == 0:
+                print(f"  ✅ 快递更新成功: {express_code}, data={result.get('data')}")
                 return True
             else:
                 error_msg = result.get("msg", "未知错误")
-                print(f"  ❌ 快递更新失败: code={result.get('code')}, msg={error_msg}")
+                print(f"  ❌ 快递更新失败: code={result.get('code')}, msg={error_msg}, data={result.get('data')}")
                 return False
         except Exception as e:
             print(f"  ❌ 快递更新请求异常: {e}")
