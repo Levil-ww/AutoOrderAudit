@@ -31,6 +31,7 @@ class ParsedRemark:
             gifts: list[tuple[str, int]] = None,
             original_tid: str = "",
             shop_remark: str = "",
+            is_stock: bool = False,
     ):
         self.material_code = material_code
         self.color_code = color_code
@@ -45,6 +46,8 @@ class ParsedRemark:
         self.gifts = gifts or []
         self.original_tid = original_tid
         self.shop_remark = shop_remark
+        # 是否现货：现货编码格式为 材质-标准-尺寸-花型;尺寸（无cm/CM单位）
+        self.is_stock = is_stock
 
     @property
     def shop_mapping_sku(self) -> str:
@@ -59,7 +62,7 @@ class ParsedRemark:
             f"material='{self.material_code}'[{self.material_source}], "
             f"color='{self.color_code}', model='{self.model_code}', "
             f"picture='{self.picture_code}', num={self.num}, "
-            f"sku='{self.shop_mapping_sku}', raw='{self.raw_text}', "
+            f"sku='{self.shop_mapping_sku}', is_stock={self.is_stock}, raw='{self.raw_text}', "
             f"gifts=[{gifts_str}], "
             f"original_tid='{self.original_tid[:10]}'..., "
             f"shop_remark='{self.shop_remark[:20]}'...)"
@@ -81,6 +84,7 @@ class ParsedRemark:
             "gifts": self.gifts,
             "original_tid": self.original_tid,
             "shop_remark": self.shop_remark,
+            "is_stock": self.is_stock,
         }
 
 
@@ -107,7 +111,7 @@ _CHINESE_NUMBERS = r"(?:[一二两三四五六七八九十]|\d+)"
 _RE_QTY_SUMMARY = re.compile(rf"共(?:计)?{_CHINESE_NUMBERS}[张个件套米]")
 
 # 到货返信息匹配（如"到货返22"、"到货返50元"、"确认收货返差价0.3元"、“返现10 /0.2元”）
-_RE_ARRIVAL_REFUND = re.compile(r"(到货返|确认收货返差价|返差价|返现)\d+(?:\.\d+)?[元]?")
+_RE_ARRIVAL_REFUND = re.compile(r"(到货返|到货退差价|确认收货返差价|返差价|返现)\d+(?:\.\d+)?[元]?")
 
 # 无关词语匹配（如"桌垫"、"地垫"等，作为后缀时应过滤）
 _RE_IRRELEVANT_SUFFIX = re.compile(r"(桌垫|地垫)[，,；;]?")
@@ -148,7 +152,9 @@ def parse_remark(
     """
     解析卖家备注文本，提取编码字段。
 
-    编码格式: 材质-标准/定制-尺寸/定制尺寸or裁剪有图-花型；实际尺寸
+    编码格式:
+        定制: 材质-定制-定制尺寸/裁剪有图-花型;尺寸CM
+        现货: 材质-标准-尺寸-花型;尺寸（无cm/CM单位）
 
     参数:
         remark_text:     卖家备注原文
@@ -163,8 +169,8 @@ def parse_remark(
 
     text = remark_text.strip()
 
-    # 情况1：已经是编码格式 "材质-标准/定制-尺寸-花型;尺寸"
-    if "-" in text and not text.startswith("定制"):
+    # 情况1：已经是编码格式 "材质-标准/定制-尺寸-花型;尺寸" 或 现货编码 "材质-标准-尺寸-花型;尺寸"
+    if "-" in text and not text.startswith("定制") and not text.startswith("现货"):
         parts = text.split("-")
         if len(parts) >= 4:
             result.material_code = _map_material(parts[0], material_map)
@@ -173,13 +179,32 @@ def parse_remark(
             result.picture_code = "-".join(parts[3:])
             result.num = _extract_qty(text)
             result.success = True
+            # 现货编码特征：color="标准" 且 model为纯尺寸（数字x数字），无cm/CM
+            if result.color_code == "标准" and re.match(r"^[\d.]+[xX×*][\d.]+(?:[圆直径圆形].*)?$", result.model_code):
+                result.is_stock = True
             return result
 
     # 情况2：解析备注
-    # 在整个文本中搜索"定制"关键字（处理"等通知发 定制..."这种情况）
+    # 检测"定制"或"现货"关键字（处理"等通知发 定制..."这种情况）
     custom_pos = text.find("定制")
     is_custom = custom_pos != -1
-    body = text[custom_pos:] if is_custom else text
+
+    stock_pos = text.find("现货")
+    is_stock = stock_pos != -1
+
+    # 优先级：定制优先于现货（如果同时存在，视为定制）
+    if is_custom and is_stock:
+        is_stock = False
+
+    if is_custom:
+        body = text[custom_pos:]
+    elif is_stock:
+        body = text[stock_pos:]
+    else:
+        body = text
+
+    # 现货标志
+    result.is_stock = is_stock
 
     # 提取数量（取所有匹配中的最大值）
     result.num = _extract_qty(body)
@@ -189,6 +214,10 @@ def parse_remark(
 
     if not all_sizes:
         _parse_simple(body, result, is_custom, material_map, material_matcher)
+        # 现货使用"标准"色
+        if is_stock:
+            result.color_code = "标准"
+            result.is_stock = True
         gifts = _extract_multiple_gifts(text)
         if gifts:
             result.gift_name = gifts[0][0]
@@ -203,7 +232,7 @@ def parse_remark(
     # 取第一个尺寸作为主尺寸（用于构建编码）
     # 同时提取尺寸前面的描述文本（如"竖版53x60"中的"竖版"）
     first_size = all_sizes[0]
-    
+
     size_prefix = ""
     sizes_with_pos = _extract_all_sizes_with_position(body)
     if sizes_with_pos:
@@ -215,67 +244,77 @@ def parse_remark(
             last_semi = before_size.rfind(";")
             if last_semi != -1:
                 size_prefix = before_size[last_semi + 1:].strip().strip("-;,、")
-    
+
     # 去掉尺寸前缀中的"规格"
     if size_prefix.startswith("规格"):
         size_prefix = size_prefix[2:].strip().strip("-;,、")
-    
-    actual_size = f"{first_size[0]}x{first_size[1]}CM" if first_size[1] not in ["圆", "圆直径", "直径", "圆形"] else f"{first_size[1]}{first_size[0]}CM"
+
+    # 现货尺寸不带 cm/CM 单位；定制尺寸带 CM 单位
+    if is_stock:
+        # 现货：尺寸不带单位
+        if first_size[1] in ["圆", "圆直径", "直径", "圆形"]:
+            actual_size = f"{first_size[1]}{first_size[0]}"
+        else:
+            actual_size = f"{first_size[0]}x{first_size[1]}"
+    else:
+        actual_size = f"{first_size[0]}x{first_size[1]}CM" if first_size[1] not in ["圆", "圆直径", "直径", "圆形"] else f"{first_size[1]}{first_size[0]}CM"
     # 如果有尺寸前缀，添加到实际尺寸前面
     if size_prefix:
         actual_size = f"{size_prefix}{actual_size}"
 
-    # 提取裁剪类型（裁剪有图/裁剪无图）
+    # 提取裁剪类型（裁剪有图/裁剪无图），现货忽略这些类型
     # ERP系统没有"裁剪无图"选项，所以将其映射为"定制尺寸"
     cut_type = ""
     cut_type_text = ""
-    if "裁剪有图" in text or "剪裁有图" in text:
-        cut_type = "裁剪有图"
-        cut_type_text = "裁剪有图"
-    elif "裁剪无图" in text or "剪裁无图" in text:
-        cut_type = "定制尺寸"
-        cut_type_text = "裁剪无图"
+    if not is_stock:
+        if "裁剪有图" in text or "剪裁有图" in text:
+            cut_type = "裁剪有图"
+            cut_type_text = "裁剪有图"
+        elif "裁剪无图" in text or "剪裁无图" in text:
+            cut_type = "定制尺寸"
+            cut_type_text = "裁剪无图"
 
-    # 提取cm后面的备注内容（包含裁剪类型和额外备注，但去掉数量标记如-1张）
+    # 提取cm后面的备注内容（仅定制有效，现货不带单位）
     remark_after_size = ""
-    cm_match = re.search(r"cm(.*)", text, re.IGNORECASE)
-    if cm_match:
-        after_cm = cm_match.group(1)
-        # 去掉数量标记（如-1张、*2张），但保留其他内容
-        after_cm = re.sub(r"[-*×]\d+[张个件套米]", "", after_cm).strip()
-        # 去掉数量汇总信息（如"共计2张"、"共三张"）
-        after_cm = _RE_QTY_SUMMARY.sub("", after_cm).strip()
-        # 过滤掉"到货返xx"这种无关备注
-        after_cm = _RE_ARRIVAL_REFUND.sub("", after_cm).strip()
-        # 过滤掉"桌垫"、"地垫"等无关词语
-        after_cm = _RE_IRRELEVANT_SUFFIX.sub("", after_cm).strip()
+    if not is_stock:
+        cm_match = re.search(r"cm(.*)", text, re.IGNORECASE)
+        if cm_match:
+            after_cm = cm_match.group(1)
+            # 去掉数量标记（如-1张、*2张），但保留其他内容
+            after_cm = re.sub(r"[-*×]\d+[张个件套米]", "", after_cm).strip()
+            # 去掉数量汇总信息（如"共计2张"、"共三张"）
+            after_cm = _RE_QTY_SUMMARY.sub("", after_cm).strip()
+            # 过滤掉"到货返xx"这种无关备注
+            after_cm = _RE_ARRIVAL_REFUND.sub("", after_cm).strip()
+            # 过滤掉"桌垫"、"地垫"等无关词语
+            after_cm = _RE_IRRELEVANT_SUFFIX.sub("", after_cm).strip()
 
-        # 去掉赠品信息：找到最早的赠品关键词位置，然后向前找到分隔符
-        # 处理"小垫子总共送3个"这种模式，把"小垫子"也去掉
-        gift_pos = -1
-        for kw in _GIFT_KEYWORDS:
-            pos = after_cm.find(kw)
-            if pos != -1:
-                if gift_pos == -1 or pos < gift_pos:
-                    gift_pos = pos
-        
-        if gift_pos != -1:
-            # 向前找到逗号、分号或数量标记
-            separator_pos = -1
-            for sep in ["，", ",", "；", ";", "-", " "]:
-                pos = after_cm.rfind(sep, 0, gift_pos)
-                if pos > separator_pos:
-                    separator_pos = pos
-            
-            # 从分隔符位置截断，或者从开头截断（如果没有分隔符）
-            if separator_pos != -1:
-                after_cm = after_cm[:separator_pos].strip()
-            else:
-                after_cm = ""
+            # 去掉赠品信息：找到最早的赠品关键词位置，然后向前找到分隔符
+            # 处理"小垫子总共送3个"这种模式，把"小垫子"也去掉
+            gift_pos = -1
+            for kw in _GIFT_KEYWORDS:
+                pos = after_cm.find(kw)
+                if pos != -1:
+                    if gift_pos == -1 or pos < gift_pos:
+                        gift_pos = pos
 
-        remark_after_size = after_cm.strip().strip(";，,、")
+            if gift_pos != -1:
+                # 向前找到逗号、分号或数量标记
+                separator_pos = -1
+                for sep in ["，", ",", "；", ";", "-", " "]:
+                    pos = after_cm.rfind(sep, 0, gift_pos)
+                    if pos > separator_pos:
+                        separator_pos = pos
 
-    # 提取花型名称：从分号前的文本中提取（去掉材质和定制前缀后）
+                # 从分隔符位置截断，或者从开头截断（如果没有分隔符）
+                if separator_pos != -1:
+                    after_cm = after_cm[:separator_pos].strip()
+                else:
+                    after_cm = ""
+
+            remark_after_size = after_cm.strip().strip(";，,、")
+
+    # 提取花型名称：从分号前的文本中提取（去掉材质和定制/现货前缀后）
     pattern_name = ""
     # 同时支持中文分号和英文分号
     semicolon_pos = body.find(";")
@@ -296,9 +335,12 @@ def parse_remark(
             else:
                 pattern_name = before_semicolon.strip().strip("-;,")
 
-    # 去掉可能残留的"定制"前缀（循环处理多个"定制"）
-    while pattern_name.startswith("定制"):
-        pattern_name = pattern_name[2:].strip()
+    # 去掉可能残留的"定制"或"现货"前缀（循环处理）
+    while pattern_name.startswith("定制") or pattern_name.startswith("现货"):
+        if pattern_name.startswith("定制"):
+            pattern_name = pattern_name[2:].strip()
+        elif pattern_name.startswith("现货"):
+            pattern_name = pattern_name[2:].strip()
 
     # 先检查是否匹配已知花型关键词（更健壮的方式）
     # 按长度从长到短排序，优先匹配更长的关键词（如"真爱花"优先于"爱花"）
@@ -307,7 +349,7 @@ def parse_remark(
         if kw in pattern_name:
             matched_keyword = kw
             break
-    
+
     if matched_keyword:
         # 保留关键词后面的附加信息（如"黑色诗人22#"中的"22#"）
         kw_start = pattern_name.find(matched_keyword)
@@ -331,6 +373,13 @@ def parse_remark(
         pic_base = pattern_name or result.picture_code or "定制"
         pic_size_part = f"{actual_size}{remark_after_size}" if remark_after_size else actual_size
         result.picture_code = f"{pic_base};{pic_size_part}"
+    elif is_stock:
+        # 现货：color=标准, model=尺寸(无cm/CM), picture=花型;尺寸(无cm/CM)
+        result.color_code = "标准"
+        result.model_code = actual_size
+        pic_base = pattern_name or result.picture_code or "标准"
+        result.picture_code = f"{pic_base};{actual_size}"
+        result.is_stock = True
     else:
         result.color_code = "标准"
         result.model_code = actual_size
@@ -393,10 +442,37 @@ def extract_multiple_remarks(
 
     text = remark_text.strip()
 
-    # 在整个文本中搜索"定制"关键字（处理"等通知发 定制..."这种情况）
+    # 在整个文本中搜索"定制"或"现货"关键字（处理"等通知发 定制..."这种情况）
     custom_pos = text.find("定制")
     is_custom = custom_pos != -1
-    body = text[custom_pos:] if is_custom else text
+    stock_pos = text.find("现货")
+    is_stock_text = stock_pos != -1
+
+    # 优先级：定制优先于现货（如果同时存在，视为定制）
+    if is_custom and is_stock_text:
+        is_stock_text = False
+
+    if is_custom:
+        body = text[custom_pos:]
+    elif is_stock_text:
+        body = text[stock_pos:]
+    else:
+        body = text
+
+    # 优先检测是否为直接编码格式（如现货编码 "双面格-标准-33x120-塞纳时光;33x120"）
+    # 编码格式的特征：含"-"、不以"定制"/"现货"开头、按"-"分割后>=4段且最后一段含分号
+    if "-" in text and not text.startswith("定制") and not text.startswith("现货"):
+        parts = text.split("-")
+        if len(parts) >= 4 and ";" in parts[-1]:
+            encoded_parsed = parse_remark(text, material_map, material_matcher)
+            if encoded_parsed.success:
+                # 编码格式无需再分割段，直接返回单条结果
+                gifts = _extract_multiple_gifts(remark_text)
+                if gifts:
+                    encoded_parsed.gift_name = gifts[0][0]
+                    encoded_parsed.gift_num = gifts[0][1]
+                    encoded_parsed.gifts = gifts
+                return [encoded_parsed]
 
     # 将备注分割为独立商品段
     segments, trailing_remark = _split_into_segments(text)
@@ -424,8 +500,14 @@ def extract_multiple_remarks(
     current_pattern = ""
 
     for idx, (segment, qty) in enumerate(segments):
-        if "定制" not in segment and is_custom:
-            segment_with_prefix = f"定制{segment}"
+        # 根据原备注的全局类型决定段前缀
+        if "定制" not in segment and "现货" not in segment:
+            if is_custom:
+                segment_with_prefix = f"定制{segment}"
+            elif is_stock_text:
+                segment_with_prefix = f"现货{segment}"
+            else:
+                segment_with_prefix = segment
         else:
             segment_with_prefix = segment
 
@@ -464,22 +546,24 @@ def extract_multiple_remarks(
             if not parsed.material_code:
                 continue
             # trailing_remark（如'裁剪图一张'）只附加到最后一个商品行
-            if trailing_remark and idx == len(segments) - 1:
+            # 现货段不附加 trailing_remark（保持编码纯净：材质-标准-尺寸-花型;尺寸）
+            if trailing_remark and idx == len(segments) - 1 and not parsed.is_stock:
                 clean_remark = _RE_QTY_SUMMARY.sub("", trailing_remark).strip().strip("-;,、，")
                 # 过滤掉"到货返xx"这种无关备注
                 clean_remark = _RE_ARRIVAL_REFUND.sub("", clean_remark).strip().strip("-;,、，")
                 # 过滤掉"桌垫"、"地垫"等无关词语
                 clean_remark = _RE_IRRELEVANT_SUFFIX.sub("", clean_remark).strip().strip("-;,、，")
-                # 再清理一次可能的数量汇总残留
-                clean_remark = re.sub(r'共(?:计)?\d+[张个件套米]', '', clean_remark).strip().strip('，,、;；')
-                clean_remark = re.sub(r'共(?:计)?[一二两三四五六七八九十]+[张个件套米]', '', clean_remark).strip().strip('，,、;；')
-                if clean_remark:
+                # 再清理一次可能的数量汇总残留（兼容"总"字残留：总共X张）
+                clean_remark = re.sub(r'总?共(?:计)?\d+[张个件套米]', '', clean_remark).strip().strip('，,、;；')
+                clean_remark = re.sub(r'总?共(?:计)?[一二两三四五六七八九十]+[张个件套米]', '', clean_remark).strip().strip('，,、;；')
+                # 过滤掉过滤后剩下的单字无意义残留（如"总"）
+                if clean_remark and len(clean_remark) > 1:
                     if ";" in parsed.picture_code:
                         pattern_part, size_part = parsed.picture_code.split(";", 1)
                         parsed.picture_code = f"{pattern_part};{size_part}{clean_remark}"
                     else:
                         parsed.picture_code = f"{parsed.picture_code};{clean_remark}"
-            
+
             results.append(parsed)
 
     if results:
@@ -1493,17 +1577,23 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
                                 trailing_remark = after_comma
         
         # 为后续段补充花型名（如果没有分号），支持花型继承
+        # 同时支持现货/定制类型的继承（现货商品组中后续尺寸无现货前缀时也能正确识别）
         processed_segments = []
         current_pattern = ""
-        
+        current_is_stock = False  # 跟踪当前组的现货/定制类型
+
         for i, (seg, qty) in enumerate(segments):
             cleaned_seg = _clean_segment(seg)
-            
+
             if ";" in cleaned_seg:
                 first_part = cleaned_seg.split(";", 1)[0].strip()
                 pattern_candidate = first_part
                 if pattern_candidate.startswith("定制"):
                     pattern_candidate = pattern_candidate[2:].strip()
+                    current_is_stock = False
+                elif pattern_candidate.startswith("现货"):
+                    pattern_candidate = pattern_candidate[2:].strip()
+                    current_is_stock = True
                 for key in ["双面革", "吸水皮革", "双面格", "镜面皮革", "丝圈", "软玻璃"]:
                     if key in pattern_candidate:
                         pattern_candidate = pattern_candidate.replace(key, "").strip()
@@ -1513,10 +1603,12 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
                 processed_segments.append((cleaned_seg, qty))
             else:
                 if current_pattern:
-                    processed_segments.append((f"{current_pattern};{cleaned_seg}", qty))
+                    # 继承pattern时，同时继承现货/定制类型（添加前缀供parse_remark识别）
+                    prefix = "现货" if current_is_stock else ""
+                    processed_segments.append((f"{prefix}{current_pattern};{cleaned_seg}", qty))
                 else:
                     processed_segments.append((cleaned_seg, qty))
-        
+
         segments = [s for s in processed_segments if s[0]]
     else:
         # 没有找到分割点，使用原有逻辑（按尺寸分割）
