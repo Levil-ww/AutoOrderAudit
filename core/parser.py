@@ -382,6 +382,8 @@ def extract_multiple_remarks(
         ParsedRemark(...picture='克罗印花;30x50格子多些...'),
         ParsedRemark(...picture='莫比之窗;25x35格子多些...')
       ]
+
+    自动去重：相同 shop_mapping_sku 的商品行合并数量
     """
     results = []
     material_map = material_map or {}
@@ -500,6 +502,32 @@ def extract_multiple_remarks(
                 raw_text=remark_text,
             )
             results.append(result)
+
+    # 商品行去重：相同 shop_mapping_sku 的商品合并数量和赠品
+    if results:
+        unique_results = []
+        seen_skus = {}
+        for r in results:
+            if r.success:
+                sku = r.shop_mapping_sku
+                if sku in seen_skus:
+                    seen_skus[sku].num += r.num
+                    if r.gifts:
+                        for gift_name, gift_num in r.gifts:
+                            found = False
+                            for i, (g_name, g_num) in enumerate(seen_skus[sku].gifts):
+                                if g_name == gift_name:
+                                    seen_skus[sku].gifts[i] = (g_name, g_num + gift_num)
+                                    found = True
+                                    break
+                            if not found:
+                                seen_skus[sku].gifts.append((gift_name, gift_num))
+                else:
+                    seen_skus[sku] = r
+                    unique_results.append(r)
+            else:
+                unique_results.append(r)
+        results = unique_results
 
     return results
 
@@ -876,6 +904,8 @@ def _extract_multiple_gifts(text: str) -> list[tuple[str, int]]:
     - "附赠收纳袋" → [("收纳袋", 1)]
     - "小垫子总共送2个" → [("小垫子", 2)]
     - "总共送2个小垫子" → [("小垫子", 2)]
+    
+    自动去重：相同赠品名称合并数量
     """
     gifts = []
     
@@ -955,6 +985,15 @@ def _extract_multiple_gifts(text: str) -> list[tuple[str, int]]:
     
     if not gifts:
         gifts = _extract_gifts_fallback(text)
+    
+    # 赠品行去重：相同赠品名称合并数量
+    unique_gifts = {}
+    for gift_name, gift_num in gifts:
+        if gift_name in unique_gifts:
+            unique_gifts[gift_name] += gift_num
+        else:
+            unique_gifts[gift_name] = gift_num
+    gifts = [(name, num) for name, num in unique_gifts.items()]
     
     return gifts
 

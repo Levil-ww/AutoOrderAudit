@@ -564,3 +564,73 @@ valid_indices = [idx for idx, item in enumerate(order.items) if not self._is_gif
   3.改造 extract_multiple_remarks() 和 parse_remark() 中的赠品处理逻辑
   4.改造 engine.py 中合并订单处理的赠品收集逻辑
   5.改造 adapter.py update_merchant_code() 中的赠品循环处理逻辑
+
+
+2026.7.17
+十五、新建删除手工单（商品行 / 赠品行）的功能
+1、修复了自动审单程序创建的手工单不显示"删除商品"按钮的问题
+问题分析：
+  通过分析方果ERP的商品行数据结构，我发现控制"删除商品"按钮显示的关键字段是商品行的 type 字段：
+    type: 0 → 原始平台商品（不可删除）
+    type: 1 → 手工添加商品（可删除）
+之前程序创建的所有新商品行的 type 都被设为 0，导致方果web界面将它们识别为原始商品，不显示删除按钮。
+
+2、修改内容
+  修改了 adapter.py 中三个创建新商品行的函数：
+    1. _build_new_item - 超出原订单商品行数时新建商品行
+    2. _build_default_item - 没有商品行时的默认构造
+    3. _build_gift_item - 构建赠品商品行（仅 is_new=True 时设为1）
+  新建商品行的 type 字段从 0 改为 1，使其被识别为手工单，从而在方果web界面上显示"删除商品"按钮。
+
+3、保持不变的部分
+  更新现有商品行时（_build_order_item、_build_order_item_keep_sku、_build_price_diff_no_ship_item），type 保持为 0，不影响原始商品
+  更新已有赠品行时（is_new=False），type 保持原有值
+
+4、验证结果：
+  ✅ 新建普通商品行 type=1
+  ✅ 新建赠品行 type=1
+  ✅ 更新现有商品行 type=0（不变）
+  ✅ 更新现有赠品行 type=0（不变）
+
+十六、优化重复创建并检测的问题
+1、重复创建问题检测
+原有问题分析：
+  商品行重复：当备注中出现相同规格的商品多次时，会创建多条相同的商品行
+  赠品行重复：当备注中出现相同赠品多次时，_extract_multiple_gifts 函数会返回重复的赠品条目，虽然 adapter 层有 list(dict.fromkeys()) 去重，但该方法只去重不合并数量
+
+2、去重逻辑修改
+  1. 商品行去重 - parser.py
+    - 在 extract_multiple_remarks 函数末尾添加去重逻辑
+    - 基于 shop_mapping_sku 判断是否为相同商品
+    - 相同商品合并数量，不同商品保留独立行
+  2. 赠品行去重（解析器层） - parser.py
+    - 在 _extract_multiple_gifts 函数末尾添加去重逻辑
+    - 相同赠品名称合并数量
+  3. 赠品行去重（适配器层） - adapter.py
+    - 替换原有的 list(dict.fromkeys()) 方式
+    - 使用字典合并相同赠品的数量
+  4. 合并订单场景下的赠品合并 - parser.py
+    - 当相同商品行合并时，赠品列表也会同步合并 （x）错误的
+      |
+      | 合并订单场景下，去重逻辑不应该跨子订单合并。
+  原问题：
+    - 当两个子订单有相同的赠品时，原来的代码会把它们合并为1个赠品行（数量累加），这是错误的
+    - 例如：子订单A有"送圆垫-1张"，子订单B也有"送圆垫-1张"，错误地合并为1个赠品行（圆垫x2）
+
+  修复内容
+    1. parser.py 去重逻辑 - extract_multiple_remarks
+      - 商品行去重：基于 shop_mapping_sku 合并相同商品的数量和赠品
+      - 赠品行去重：在 _extract_multiple_gifts 中合并相同赠品的数量
+      注意：这个去重是在每个子订单内部进行的（因为 engine.py 按子订单分别调用）
+    
+    2. adapter.py 赠品处理 - update_merchant_code
+      - 核心修改：按 original_tid 分组处理赠品
+      - 每个子订单内部独立去重
+      - 不同子订单之间的相同赠品不会合并，而是分别创建独立的赠品行
+
+  修改后的逻辑
+            场景	                    处理方式
+    同一子订单内有相同赠品	  合并为1个赠品行，数量累加
+    不同子订单有相同赠品	    分别创建独立的赠品行，不合并
+    同一子订单内有相同商品	  合并为1个商品行，数量累加
+    不同子订单有相同商品	    保留独立的商品行，不合并

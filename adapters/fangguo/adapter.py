@@ -516,46 +516,63 @@ class FangguoAdapter(ErpAdapter):
             print(f"    ℹ️  无有效商品解析信息，保留原商品编码不变")
 
         # 第二步：处理赠品（如果有）
-        all_gifts = []
-        material_code = ""
-        gift_original_tid = ""
-        gift_shop_remark = ""
+        # 合并订单场景：按 original_tid 分组处理赠品，避免跨子订单合并
+        gifts_by_tid = {}  # {original_tid: {'gifts': [(name, num)], 'material_code': '', 'shop_remark': ''}}
         for p in effective_list:
             if p.gifts:
-                all_gifts.extend(p.gifts)
+                tid = p.original_tid or ""
+                if tid not in gifts_by_tid:
+                    gifts_by_tid[tid] = {'gifts': [], 'material_code': '', 'shop_remark': ''}
+                gifts_by_tid[tid]['gifts'].extend(p.gifts)
+                if p.material_code:
+                    gifts_by_tid[tid]['material_code'] = p.material_code
+                if p.shop_remark:
+                    gifts_by_tid[tid]['shop_remark'] = p.shop_remark
             elif p.gift_name and p.gift_num > 0:
-                all_gifts.append((p.gift_name, p.gift_num))
-            if p.material_code:
-                material_code = p.material_code
-            if p.original_tid and not gift_original_tid:
-                gift_original_tid = p.original_tid
-            if p.shop_remark and not gift_shop_remark:
-                gift_shop_remark = p.shop_remark
-        
-        all_gifts = list(dict.fromkeys(all_gifts))
+                tid = p.original_tid or ""
+                if tid not in gifts_by_tid:
+                    gifts_by_tid[tid] = {'gifts': [], 'material_code': '', 'shop_remark': ''}
+                gifts_by_tid[tid]['gifts'].append((p.gift_name, p.gift_num))
+                if p.material_code:
+                    gifts_by_tid[tid]['material_code'] = p.material_code
+                if p.shop_remark:
+                    gifts_by_tid[tid]['shop_remark'] = p.shop_remark
+
+        # 收集所有赠品（按子订单分组去重后）
+        all_gifts = []
+        for tid, gift_info in gifts_by_tid.items():
+            # 每个子订单内部去重
+            unique_gifts = {}
+            for gift_name, gift_num in gift_info['gifts']:
+                if gift_name in unique_gifts:
+                    unique_gifts[gift_name] += gift_num
+                else:
+                    unique_gifts[gift_name] = gift_num
+            for name, num in unique_gifts.items():
+                all_gifts.append((name, num, tid, gift_info['material_code'], gift_info['shop_remark']))
 
         if all_gifts:
-            effective_material_code = material_code or "吸水皮革"
             existing_gift_indices = []
             for idx, item in enumerate(order.items):
                 if idx not in used_item_indices and self._is_gift_item(item):
                     existing_gift_indices.append(idx)
 
             existing_idx = 0
-            for gift_name, gift_num in all_gifts:
+            for gift_name, gift_num, gift_tid, gift_material, gift_remark in all_gifts:
+                effective_material_code = gift_material or "吸水皮革"
                 if existing_idx < len(existing_gift_indices):
                     existing_gift_idx = existing_gift_indices[existing_idx]
-                    new_gift = self._build_gift_item(order.items[existing_gift_idx], order, effective_material_code, gift_name, gift_num, is_new=False, original_tid=gift_original_tid, shop_remark=gift_shop_remark)
+                    new_gift = self._build_gift_item(order.items[existing_gift_idx], order, effective_material_code, gift_name, gift_num, is_new=False, original_tid=gift_tid, shop_remark=gift_remark)
                     order_items.append(new_gift)
                     used_item_indices.add(existing_gift_idx)
                     existing_idx += 1
                 else:
                     if template_item:
-                        new_gift = self._build_gift_item(template_item, order, effective_material_code, gift_name, gift_num, is_new=True, original_tid=gift_original_tid, shop_remark=gift_shop_remark)
+                        new_gift = self._build_gift_item(template_item, order, effective_material_code, gift_name, gift_num, is_new=True, original_tid=gift_tid, shop_remark=gift_remark)
                     else:
                         new_gift = self._build_gift_item(
                             OrderItem(id=order.trade_id, order_id=order.trade_id, oid=order.tid, num=1),
-                            order, effective_material_code, gift_name, gift_num, is_new=True, original_tid=gift_original_tid, shop_remark=gift_shop_remark,
+                            order, effective_material_code, gift_name, gift_num, is_new=True, original_tid=gift_tid, shop_remark=gift_remark,
                         )
                     order_items.append(new_gift)
 
@@ -838,6 +855,7 @@ class FangguoAdapter(ErpAdapter):
             order, parsed,
         )
         item['shopMappingSku'] = f'<font color="red">{item["shopMappingSku"]}</font>'
+        item['type'] = 1
         return item
 
     def _build_new_item(self, order: Order, parsed: ParsedRemark) -> dict:
@@ -852,6 +870,7 @@ class FangguoAdapter(ErpAdapter):
             order, parsed,
         )
         item['shopMappingSku'] = f'<font color="red">{item["shopMappingSku"]}</font>'
+        item['type'] = 1
         return item
 
     def _build_gift_item(self, item: OrderItem, order: Order, material_code: str, gift_name: str, gift_num: int, is_new: bool = False, original_tid: str = "", shop_remark: str = "") -> dict:
@@ -1012,7 +1031,7 @@ class FangguoAdapter(ErpAdapter):
             "cancelStatus": False,
             "realModelCode": model_code,
             "realModelId": None,
-            "type": 0,
+            "type": 1 if is_new else 0,
             "showRemarkInfo": True,
             "check": True,
             "loaded": True,
