@@ -185,9 +185,7 @@ class FangguoAdapter(ErpAdapter):
         # 提取当前快递编码（尝试多种可能的字段名）
         current_cp_code = str(raw.get("cpCode") or raw.get("logisticsCpCode") or raw.get("currentCpCode") or raw.get("cp_code") or "")
 
-        # 调试日志：打印原始省份和地址字段（方便排查）
-        if receiver_province or receiver_address or current_cp_code:
-            print(f"  📍 收件地址: 省份={receiver_province or '未知'}, 地址={receiver_address[:30] if receiver_address else ''}..., 当前快递={current_cp_code or '未设置'}")
+
 
         order = Order(
             id=str(raw.get("id") or ""),
@@ -390,12 +388,7 @@ class FangguoAdapter(ErpAdapter):
         expected_skus_set = {p.shop_mapping_sku for p in product_parsed_list}
         expected_sku_num_set = {(p.shop_mapping_sku, p.num) for p in product_parsed_list}
         
-        # 调试日志：打印每个商品行的信息
-        print(f"  📋 商品行详情 ({len(order.items)} 行):")
-        for idx, item in enumerate(order.items):
-            is_gift = self._is_gift_item(item)
-            film_gift_code = item.raw.get('filmGiftCode', '') if item.raw else ''
-            print(f"    [{idx}] id={item.id[:10]}..., title={item.title[:30]}..., is_void={item.is_void}, is_gift={is_gift}, filmGiftCode='{film_gift_code}', original_tid='{item.original_tid[:10]}'...")
+
         
         # 判断是否为"只有补差价但应作为普通订单处理"的情况
         price_diff_items_count = sum(1 for item in order.items if self._is_price_difference_item(item))
@@ -538,7 +531,6 @@ class FangguoAdapter(ErpAdapter):
 
                 if matched_item_idx is not None:
                     matched_item = order.items[matched_item_idx]
-                    print(f"    匹配: 解析结果[{p.shop_mapping_sku[:30]}...] -> 商品行[{matched_item_idx}] original_tid={matched_item.original_tid[:10]}... 方法={match_method}")
                     # 使用现有有效行作为基础，替换编码信息
                     new_item = self._build_order_item(matched_item, order, p)
                     # 确保普通商品行不是赠品
@@ -795,17 +787,7 @@ class FangguoAdapter(ErpAdapter):
             "shopId": "",
         }
 
-        # 打印payload摘要用于调试
-        try:
-            payload_str = json.dumps(payload, ensure_ascii=False)
-            if len(payload_str) > 2000:
-                print(f"  📤 发送payload: totalCount={payload['totalCount']}, items={len(payload['orderItems'])}个")
-                for i, it in enumerate(payload['orderItems']):
-                    print(f"      item[{i}]: id={it.get('id','')}, oid={it.get('oid','')}, sku={str(it.get('shopMappingSku',''))[:50]}")
-            else:
-                print(f"  📤 发送payload: {payload_str[:500]}")
-        except:
-            pass
+
 
         resp = self._session.post(fg_config.API_SAVE_PRODUCT, json=payload, timeout=30)
         resp.raise_for_status()
@@ -817,9 +799,7 @@ class FangguoAdapter(ErpAdapter):
             return True
         else:
             error_msg = result.get("msg", "未知错误")
-            raw_body = json.dumps(result, ensure_ascii=False, indent=2)
             print(f"  ❌ 接口返回失败: code={result.get('code')}, msg={error_msg}")
-            print(f"  🔍 API返回原文:\n{raw_body}")
             return False
 
     def _split_parsed_by_sizes(self, order: Order, parsed: ParsedRemark) -> list[ParsedRemark]:
@@ -1394,17 +1374,6 @@ class FangguoAdapter(ErpAdapter):
             "shopId": "",
         }
         
-        try:
-            payload_str = json.dumps(payload, ensure_ascii=False)
-            if len(payload_str) > 2000:
-                print(f"  📤 发送payload: totalCount={payload['totalCount']}, items={len(payload['orderItems'])}个")
-                for i, it in enumerate(payload['orderItems']):
-                    print(f"      item[{i}]: id={it.get('id','')}, oid={it.get('oid','')}, sku={str(it.get('shopMappingSku',''))[:50]}, num={it.get('num',1)}")
-            else:
-                print(f"  📤 发送payload: {payload_str[:500]}")
-        except:
-            pass
-        
         resp = self._session.post(fg_config.API_SAVE_PRODUCT, json=payload, timeout=30)
         resp.raise_for_status()
         result = resp.json()
@@ -1413,9 +1382,7 @@ class FangguoAdapter(ErpAdapter):
             return True
         else:
             error_msg = result.get("msg", "未知错误")
-            raw_body = json.dumps(result, ensure_ascii=False, indent=2)
             print(f"  ❌ 接口返回失败: code={result.get('code')}, msg={error_msg}")
-            print(f"  🔍 API返回原文:\n{raw_body}")
             return False
 
     def _build_order_item_keep_sku(self, item: OrderItem, order: Order, num: int = 1) -> dict:
@@ -1690,11 +1657,11 @@ class FangguoAdapter(ErpAdapter):
             result = resp.json()
 
             if result.get("code") == 0:
-                print(f"  ✅ 快递更新成功: {express_code}, data={result.get('data')}")
+                print(f"  ✅ 快递更新成功: {express_code}")
                 return True
             else:
                 error_msg = result.get("msg", "未知错误")
-                print(f"  ❌ 快递更新失败: code={result.get('code')}, msg={error_msg}, data={result.get('data')}")
+                print(f"  ❌ 快递更新失败: code={result.get('code')}, msg={error_msg}")
                 return False
         except Exception as e:
             print(f"  ❌ 快递更新请求异常: {e}")
