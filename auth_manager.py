@@ -151,7 +151,6 @@ def auto_login(username: str, password: str) -> LoginResult:
     Returns:
         LoginResult 对象
     """
-    print(f"🔍 TOKEN_FILE 路径 = {TOKEN_FILE}")
     result = api_login(username, password)
 
     if result.success:
@@ -165,6 +164,7 @@ def auto_login(username: str, password: str) -> LoginResult:
 
         print(f"🔍 新Token信息: tenant={auth.tenant_id}, user={auth.username} (API返回mainUsername={result.main_username})")
         print(f"🔍 新Token前缀: {auth.authorization[:25]}...")
+
         saved = save_auth(auth)
         print(f"🔍 save_auth() 返回值 = {saved} {'✅' if saved else '❌ 写入失败！'}")
 

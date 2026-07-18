@@ -17,9 +17,9 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from auth_manager import (
-    get_auth_status, load_auth, save_auth, AuthInfo,
-    TOKEN_FILE, auto_login, register_auth_callback,
-    unregister_auth_callback, is_logged_in,
+    load_auth, AuthInfo,
+    auto_login, register_auth_callback,
+    unregister_auth_callback,
 )
 from adapters.fangguo.config import (
     DRY_RUN, MAX_ORDERS, PAGE_SIZE, QUERY_STATUS,
@@ -157,7 +157,6 @@ class LoginDialog:
     def _do_login(self):
         username = self.username_var.get().strip()
         password = self.password_var.get()
-        print(f"🔍 登录对话框提交: username=\"{username}\"")
 
         if not username:
             self.status_label.config(text="请输入手机号")
@@ -585,24 +584,11 @@ class AutoAuditGUI:
 
     def _on_login_success(self, auth: AuthInfo):
         """登录成功后回调"""
-        from adapters.fangguo import config as fg_config
-        print(f"🔍 登录前 config.TENANT_ID = {fg_config.TENANT_ID}")
-        print(f"🔍 登录前 config.AUTHORIZATION 前缀 = {fg_config.AUTHORIZATION[:20] if fg_config.AUTHORIZATION else '空'}")
-
-        from auth_manager import TOKEN_FILE
-        try:
-            with open(TOKEN_FILE, "r", encoding="utf-8") as _f:
-                _raw = _f.read()
-            print(f"🔍 当前 token.json 内容:\n{_raw}")
-        except Exception as _e:
-            print(f"⚠️ 读 token.json 失败: {_e}")
-
         try:
             reload_auth()
-            print(f"🔍 登录后 config.TENANT_ID = {fg_config.TENANT_ID}")
-            print(f"🔍 登录后 config.AUTHORIZATION 前缀 = {fg_config.AUTHORIZATION[:20] if fg_config.AUTHORIZATION else '空'}")
-        except Exception as e:
-            print(f"⚠️ reload_auth() 失败: {e}")
+        except Exception:
+            pass
+
         self._refresh_status()
         print(f"✅ 登录成功！欢迎 {auth.username or ''}")
         print(f"🔐 Token有效期至 {auth.expires_at}（剩余{auth.remaining_days}天）")
