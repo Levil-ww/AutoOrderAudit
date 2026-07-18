@@ -264,6 +264,11 @@ class AutoAuditGUI:
         self._monitor_thread = None             # 监控线程
         self._monitor_stop_event = threading.Event()  # 停止信号
 
+        # Token自动检查相关状态
+        self._token_check_running = False       # Token检查是否在运行
+        self._token_check_stop_event = threading.Event()  # Token检查停止信号
+        self._login_dialog_showing = False      # 登录对话框是否正在显示（防止重复弹出）
+
         self._center_window()
         self._configure_tags()
         self._build_layout()
@@ -274,6 +279,7 @@ class AutoAuditGUI:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.root.after(500, self._check_login_on_startup)
+        self.root.after(1000, self._start_token_check)
 
     # ------------------------------------------------------------
     #  窗口
@@ -473,15 +479,17 @@ class AutoAuditGUI:
             self._refresh_status, 10,
         ).pack(side=tk.LEFT, padx=(0, 8))
 
-        self._make_button(
-            btn_group, "� 登录", COLORS["accent"], "#ffffff",
+        self.login_btn_footer = self._make_button(
+            btn_group, "🔐 登录", COLORS["accent"], "#ffffff",
             self._open_login, 10,
-        ).pack(side=tk.LEFT, padx=(0, 8))
+        )
+        self.login_btn_footer.pack(side=tk.LEFT, padx=(0, 8))
 
-        self._make_button(
+        self.logout_btn_footer = self._make_button(
             btn_group, "🚪 退出登录", COLORS["danger"], "#ffffff",
             self._logout, 10,
-        ).pack(side=tk.LEFT, padx=(0, 8))
+        )
+        self.logout_btn_footer.pack(side=tk.LEFT, padx=(0, 8))
 
         self._make_button(
             btn_group, "🗑 清空日志", "#6b7280", "#ffffff",
@@ -541,7 +549,39 @@ class AutoAuditGUI:
 
     def _open_login(self):
         """打开登录对话框"""
+        if self._login_dialog_showing:
+            return
         LoginDialog(self.root, on_success=self._on_login_success)
+
+    def _show_auto_relogin_dialog(self, reason: str = "Token已过期"):
+        """Token过期时自动弹出登录对话框
+
+        Args:
+            reason: 弹出登录框的原因描述
+        """
+        if self._login_dialog_showing:
+            return
+
+        self._login_dialog_showing = True
+        print(f"\n⚠️ {reason}，请重新登录")
+
+        def _on_success(auth: AuthInfo):
+            self._login_dialog_showing = False
+            self._on_login_success(auth)
+
+        def _on_close():
+            self._login_dialog_showing = False
+
+        dialog = LoginDialog(self.root, on_success=_on_success)
+
+        # 监听对话框关闭事件
+        original_destroy = dialog.dialog.destroy
+
+        def _wrapped_destroy():
+            self._login_dialog_showing = False
+            original_destroy()
+
+        dialog.dialog.destroy = _wrapped_destroy
 
     def _on_login_success(self, auth: AuthInfo):
         """登录成功后回调"""
@@ -578,6 +618,55 @@ class AutoAuditGUI:
         """鉴权信息变化回调（来自auth_manager的通知）"""
         self._refresh_status()
 
+    # ------------------------------------------------------------
+    #  🔐 Token自动检查（后台周期性检测）
+    # ------------------------------------------------------------
+    def _start_token_check(self):
+        """启动Token定时检查线程"""
+        if self._token_check_running:
+            return
+        self._token_check_running = True
+        self._token_check_stop_event.clear()
+        threading.Thread(target=self._token_check_loop, daemon=True).start()
+
+    def _stop_token_check(self):
+        """停止Token定时检查"""
+        self._token_check_running = False
+        self._token_check_stop_event.set()
+
+    def _token_check_loop(self):
+        """Token检查线程主循环"""
+        # 首次等待2秒后开始检查
+        self._token_check_stop_event.wait(timeout=2)
+
+        while self._token_check_running:
+            if self._token_check_stop_event.is_set():
+                break
+
+            try:
+                auth = load_auth()
+
+                # 只有在有Token的情况下才检查是否过期
+                if auth.authorization:
+                    if not auth.is_valid:
+                        # Token已过期，自动弹出登录框
+                        if not self._login_dialog_showing:
+                            print(f"\n⚠️ 检测到Token已过期（{auth.expires_at}）")
+                            self.root.after(0, lambda: self._show_auto_relogin_dialog("Token已过期"))
+                    else:
+                        # Token即将过期（剩余1天），提前提醒
+                        if auth.remaining_days <= 1:
+                            print(f"⚠️ Token即将过期，剩余{auth.remaining_days}天，请及时重新登录")
+
+            except Exception as e:
+                # 检查出错不影响主流程
+                pass
+
+            # 每60秒检查一次
+            self._token_check_stop_event.wait(timeout=60)
+
+        print("🔐 Token检查线程已退出")
+
     def _logout(self):
         """退出登录，清除Token"""
         if not load_auth().authorization:
@@ -611,6 +700,25 @@ class AutoAuditGUI:
             self._card_token.config(fg=COLORS["danger"])
 
         self._card_time.config(text=get_time_range_display())
+
+        # 动态更新登录/退出按钮显示状态
+        self._update_login_buttons(auth)
+
+    def _update_login_buttons(self, auth: AuthInfo = None):
+        """根据登录状态动态更新登录/退出按钮的显示"""
+        if auth is None:
+            auth = load_auth()
+
+        is_logged_in = bool(auth.authorization) and auth.is_valid
+
+        if is_logged_in:
+            # 已登录：显示退出按钮，隐藏登录按钮
+            self.logout_btn_footer.pack(side=tk.LEFT, padx=(0, 8))
+            self.login_btn_footer.pack_forget()
+        else:
+            # 未登录或Token过期：显示登录按钮，隐藏退出按钮
+            self.login_btn_footer.pack(side=tk.LEFT, padx=(0, 8))
+            self.logout_btn_footer.pack_forget()
 
     def _open_token_file(self):
         path = os.path.join(os.path.dirname(__file__), "token.json")
@@ -796,6 +904,7 @@ class AutoAuditGUI:
             auth = load_auth()
             if not auth.authorization or not auth.is_valid:
                 print("⚠️ Token已失效，自动监控已暂停，请重新登录")
+                self.root.after(0, lambda: self._show_auto_relogin_dialog("Token已过期"))
                 self.root.after(0, self._stop_monitor)
                 return
 
@@ -864,6 +973,11 @@ class AutoAuditGUI:
         ExpressConfigDialog(self.root)
 
     def _on_close(self):
+        # 先停止Token检查线程
+        if self._token_check_running:
+            self._token_check_running = False
+            self._token_check_stop_event.set()
+
         # 先停止监控线程
         if self._auto_monitor:
             self._auto_monitor = False

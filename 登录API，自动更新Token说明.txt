@@ -223,3 +223,32 @@ POST /user/system/auth/login/tenant → 登录到指定tenant上下文
         - 将所有 AUTHORIZATION , COOKIE_STR , TENANT_ID , API_MATERIAL_LIST 改为 fg_config.xxx
 
 总结： -- 现在一键登录功能可以正常工作了：登录后调用 reload_auth() 更新 config 模块的全局变量，adapter 和 material_source 通过模块引用动态获取最新的认证信息。
+
+2026.7.18
+优化GUI界面的登录退出逻辑
+优化内容总结
+    1. 登录/退出登录按钮动态切换
+    修改了 gui.py 中的按钮显示逻辑：
+        已登录状态：只显示「🚪 退出登录」按钮，隐藏登录按钮
+        未登录/Token过期状态：只显示「🔐 登录」按钮，隐藏退出按钮
+    核心方法：_update_login_buttons
+
+    2. Token过期自动弹出登录对话框
+    当检测到Token过期时，会自动弹出登录对话框让用户重新登录，而不只是静默停止：
+        自动监控模式下：Token过期后自动弹出登录框并停止监控
+        后台检测到过期：定时检查发现过期也会自动弹出
+    核心方法：_show_auto_relogin_dialog
+
+    3. 后台Token定时检查机制
+    新增了后台线程每 60秒 自动检查一次Token状态：
+        Token已过期 → 自动弹出登录对话框
+        Token剩余1天 → 日志中提前提醒用户
+        检查出错不影响主程序运行
+    核心方法：_token_check_loop
+
+    4. 防止登录对话框重复弹出
+    添加了 _login_dialog_showing 标志位，避免Token过期时多个检测点同时弹出多个登录框。
+
+    5. 修改的文件
+    gui.py — 主要修改文件，包含上述所有功能
+
