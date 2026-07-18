@@ -337,6 +337,8 @@ def test_price_diff_no_print():
     assert AutoAuditEngine._is_no_ship_remark("差价不发货") == True
     assert AutoAuditEngine._is_no_ship_remark("不打印") == True
     assert AutoAuditEngine._is_no_ship_remark("补差价不打印") == True
+    assert AutoAuditEngine._is_no_ship_remark("不用发") == True
+    assert AutoAuditEngine._is_no_ship_remark("差价不用发") == True
     assert AutoAuditEngine._is_no_ship_remark("定制双面革") == False
     assert AutoAuditEngine._is_no_ship_remark("") == False
 
@@ -352,6 +354,9 @@ def test_price_diff_no_print():
     assert AutoAuditEngine._get_no_print_reason(" 差价 ") == "备注为'差价'"
     # 包含"差价不发货" → 返回"差价不发货"
     assert AutoAuditEngine._get_no_print_reason("差价不发货") == "差价不发货"
+    # 包含"不用发" → 返回"不用发"
+    assert AutoAuditEngine._get_no_print_reason("不用发") == "不用发"
+    assert AutoAuditEngine._get_no_print_reason("差价不用发") == "不用发"
     # 包含"不打印" → 返回"不打印"
     assert AutoAuditEngine._get_no_print_reason("补差价不打印") == "不打印"
     # 有定制信息 → 返回 None
