@@ -76,7 +76,7 @@ class AutoAuditEngine:
     @staticmethod
     def _is_no_ship_remark(remark: str) -> bool:
         """判断备注是否表示补差价不发货/不打印"""
-        return "差价不发货" in remark or "不打印" in remark
+        return "差价不发货" in remark or "不打印" in remark or "不用发" in remark
 
     @staticmethod
     def _get_no_print_reason(remark: str) -> str:
@@ -86,7 +86,8 @@ class AutoAuditEngine:
         1. 备注为空（无信息）
         2. 备注内容为"补差价"或"差价"
         3. 包含"差价不发货"
-        4. 包含"不打印"
+        4. 包含"不用发"
+        5. 包含"不打印"
         返回原因字符串，None 表示不匹配。
         """
         stripped = remark.strip()
@@ -96,6 +97,8 @@ class AutoAuditEngine:
             return f"备注为'{stripped}'"
         if "差价不发货" in remark:
             return "差价不发货"
+        if "不用发" in remark:
+            return "不用发"
         if "不打印" in remark:
             return "不打印"
         return None
