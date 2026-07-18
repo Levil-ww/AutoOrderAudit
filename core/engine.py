@@ -428,6 +428,52 @@ class AutoAuditEngine:
 
         self._print_summary()
 
+    def run_monitor_cycle(self, page_no=1, page_size=500, query_status=1, time_begin="", time_end="") -> int:
+        """
+        监控周期：查询订单，有则处理，无则安静返回。
+        比 run() 更安静，不打印 banner，无订单时不打印多余信息。
+        返回本次处理的订单总数（0 表示无待处理订单）。
+        """
+        # 重置统计
+        self.stats = {"total": 0, "success": 0, "skipped": 0, "failed": 0, "errors": [], "cancelled": 0}
+
+        try:
+            orders = self.adapter.query_orders(
+                page_no=page_no, page_size=page_size,
+                query_status=query_status, time_begin=time_begin, time_end=time_end,
+            )
+        except Exception as e:
+            print(f"❌ 查询订单失败: {e}")
+            return 0
+
+        if not orders:
+            return 0
+
+        print(f"\n📋 检测到 {len(orders)} 个待处理订单，开始处理...")
+        print(f"🚀 开始自动审单 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 60)
+
+        for idx, order in enumerate(orders):
+            if self.max_orders > 0 and idx >= self.max_orders:
+                print(f"\n⏸️  已达最大处理数量 ({self.max_orders})")
+                break
+
+            self.stats["total"] += 1
+            print(f"[{idx+1}/{len(orders)}] 处理订单 {order.id or order.trade_id}")
+
+            try:
+                self._process_order(order)
+                self._update_express_for_order(order)
+            except Exception as e:
+                self.stats["failed"] += 1
+                self.stats["errors"].append(str(e))
+                print(f"  ❌ 订单处理异常: {e}")
+
+            time.sleep(self.interval)
+
+        self._print_summary()
+        return self.stats["total"]
+
     def _process_order(self, order):
         remark = order.shop_remark or ""
         print(f"  卖家备注: {remark[:60]}..." if len(remark) > 60 else f"  卖家备注: {remark}")

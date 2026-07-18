@@ -52,6 +52,14 @@ COLORS = {
 FONT = "Microsoft YaHei"
 FONT_MONO = "Consolas"
 
+# ================================================================
+#  自适应监控间隔配置
+# ================================================================
+MONITOR_MIN_INTERVAL = 10     # 有订单时：10秒后再次检查
+MONITOR_MAX_INTERVAL = 180    # 无订单时：最长180秒（3分钟）
+MONITOR_INIT_INTERVAL = 30    # 初始间隔：30秒
+MONITOR_STEP_FACTOR = 1.5     # 无订单时间隔放大倍数
+
 
 class LoginDialog:
     """登录对话框"""
@@ -244,12 +252,17 @@ class TextRedirector(io.StringIO):
 class AutoAuditGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("方果ERP · 自动审单工具v2.0")
+        self.root.title("方果ERP · 自动审单工具V2.1")
         self.root.geometry("950x720")
         self.root.resizable(True, True)
         self.root.configure(bg=COLORS["bg"])
         self._running = False
         self._batch_confirm_decision = None
+
+        # 自动监控相关状态
+        self._auto_monitor = False              # 监控开关
+        self._monitor_thread = None             # 监控线程
+        self._monitor_stop_event = threading.Event()  # 停止信号
 
         self._center_window()
         self._configure_tags()
@@ -325,7 +338,7 @@ class AutoAuditGUI:
         mode_fg = COLORS["warning"] if DRY_RUN else COLORS["success"]
         self._make_badge(badge_frame, mode_text, mode_bg, mode_fg).pack(side=tk.RIGHT, padx=(6, 0))
 
-        self._make_badge(badge_frame, "v2.0", COLORS["info_bg"], COLORS["info"]).pack(side=tk.RIGHT)
+        self._make_badge(badge_frame, "V2.1", COLORS["info_bg"], COLORS["info"]).pack(side=tk.RIGHT)
 
     def _make_badge(self, parent, text, bg, fg):
         return tk.Label(
@@ -449,6 +462,12 @@ class AutoAuditGUI:
         )
         self.start_btn.pack(side=tk.LEFT, padx=(0, 8))
 
+        self.monitor_btn = self._make_button(
+            btn_group, "🔄 自动监控", COLORS["warning"], "#ffffff",
+            self._toggle_monitor, 11,
+        )
+        self.monitor_btn.pack(side=tk.LEFT, padx=(0, 8))
+
         self._make_button(
             btn_group, "🔄 刷新", COLORS["info"], "#ffffff",
             self._refresh_status, 10,
@@ -502,6 +521,23 @@ class AutoAuditGUI:
             print(f"⚠️ Token已过期（{auth.expires_at}），请重新登录")
         else:
             print(f"✅ Token有效（{auth.username or ''}，剩余{auth.remaining_days}天）")
+            # 登录状态正常，弹窗询问是否开启自动监控
+            self.root.after(800, self._ask_start_monitor)
+
+    def _ask_start_monitor(self):
+        """启动时弹窗询问是否开启自动监控"""
+        if self._auto_monitor:
+            return  # 已经在监控中
+        ret = messagebox.askyesno(
+            "自动审单",
+            "✅ 登录状态正常！\n\n"
+            "是否立即开启自动审单监控？\n\n"
+            "📌 开启后程序将自动检测待处理订单并执行审单\n"
+            "📌 自适应间隔：有订单时快查，无订单时自动拉长间隔\n"
+            "📌 可随时点击「停止监控」按钮关闭"
+        )
+        if ret:
+            self._start_monitor()
 
     def _open_login(self):
         """打开登录对话框"""
@@ -533,6 +569,10 @@ class AutoAuditGUI:
         print("💡 现在可以开始审单了")
         if not self._running:
             self.start_btn.config(state=tk.NORMAL, bg=COLORS["success"])
+
+        # 登录成功后询问是否开启自动监控
+        if not self._auto_monitor:
+            self.root.after(500, self._ask_start_monitor)
 
     def _on_auth_changed(self, auth: AuthInfo):
         """鉴权信息变化回调（来自auth_manager的通知）"""
@@ -705,11 +745,130 @@ class AutoAuditGUI:
         print("✅ 自动审单完成")
         print("━" * 60)
 
+    # ------------------------------------------------------------
+    #  🔁 自动监控模式（自适应间隔轮询）
+    # ------------------------------------------------------------
+    def _toggle_monitor(self):
+        """切换自动监控开关"""
+        if self._auto_monitor:
+            self._stop_monitor()
+        else:
+            self._start_monitor()
+
+    def _start_monitor(self):
+        """启动自动监控"""
+        auth = load_auth()
+        if not auth.authorization:
+            messagebox.showerror("未登录", "❌ 请先点击「登录」按钮输入账号密码！")
+            return
+        if not auth.is_valid:
+            messagebox.showerror("Token已过期", "⚠️ Token已过期，请重新登录！")
+            return
+
+        self._auto_monitor = True
+        self._monitor_stop_event.clear()
+        self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._monitor_thread.start()
+
+        self.monitor_btn.config(text="⏸ 停止监控", bg=COLORS["danger"])
+        print("\n" + "━" * 60)
+        print(f"🔄 自动监控已启动 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"📌 自适应间隔：有订单时 {MONITOR_MIN_INTERVAL}秒，无订单时逐步拉长至 {MONITOR_MAX_INTERVAL}秒")
+        print("━" * 60)
+
+    def _stop_monitor(self):
+        """停止自动监控"""
+        self._auto_monitor = False
+        self._monitor_stop_event.set()
+        self.monitor_btn.config(text="🔄 自动监控", bg=COLORS["warning"])
+        print("\n🛑 自动监控已停止")
+
+    def _monitor_loop(self):
+        """监控线程主循环：自适应间隔轮询待处理订单"""
+        interval = MONITOR_INIT_INTERVAL
+
+        while self._auto_monitor:
+            # 检查停止信号
+            if self._monitor_stop_event.is_set():
+                break
+
+            # 1. 检查 Token 有效性
+            auth = load_auth()
+            if not auth.authorization or not auth.is_valid:
+                print("⚠️ Token已失效，自动监控已暂停，请重新登录")
+                self.root.after(0, self._stop_monitor)
+                return
+
+            # 2. 如果正在手动审单，等待
+            if self._running:
+                self._monitor_stop_event.wait(timeout=3)
+                continue
+
+            # 3. 执行审单周期
+            self._running = True
+            self._batch_confirm_decision = None
+            processed = 0
+
+            try:
+                from core import AutoAuditEngine
+                from adapters.fangguo import FangguoAdapter
+                from adapters.fangguo.config import (
+                    QUERY_STATUS, PAGE_SIZE, TIME_BEGIN, TIME_END,
+                    DRY_RUN, MAX_ORDERS,
+                )
+
+                adapter = FangguoAdapter()
+                confirm_cb = None
+                engine = AutoAuditEngine(
+                    adapter=adapter, dry_run=DRY_RUN,
+                    max_orders=MAX_ORDERS, interval=0.5,
+                    confirm_callback=confirm_cb,
+                )
+                processed = engine.run_monitor_cycle(
+                    page_no=1, page_size=PAGE_SIZE,
+                    query_status=QUERY_STATUS,
+                    time_begin=TIME_BEGIN, time_end=TIME_END,
+                )
+            except Exception as e:
+                print(f"❌ 监控异常: {e}")
+                import traceback
+                print(traceback.format_exc())
+            finally:
+                self._running = False
+                self._batch_confirm_decision = None
+
+            # 4. 自适应调整间隔
+            if processed > 0:
+                interval = MONITOR_MIN_INTERVAL
+            else:
+                interval = min(int(interval * MONITOR_STEP_FACTOR), MONITOR_MAX_INTERVAL)
+                now = datetime.now().strftime('%H:%M:%S')
+                print(f"😴 [{now}] 无待处理订单，{interval}秒后再次检查...")
+
+            # 5. 更新UI按钮显示
+            self.root.after(0, lambda i=interval, p=processed: self._update_monitor_btn(i, p))
+
+            # 6. 可中断等待
+            self._monitor_stop_event.wait(timeout=interval)
+
+        print("🛑 自动监控线程已退出")
+
+    def _update_monitor_btn(self, next_interval, processed):
+        """更新监控按钮显示倒计时"""
+        if not self._auto_monitor:
+            return
+        self.monitor_btn.config(text=f"⏸ 监控中({next_interval}s)", bg=COLORS["danger"])
+
     def _open_express_config(self):
         """打开快递配置对话框"""
         ExpressConfigDialog(self.root)
 
     def _on_close(self):
+        # 先停止监控线程
+        if self._auto_monitor:
+            self._auto_monitor = False
+            self._monitor_stop_event.set()
+
         if self._running:
             if not messagebox.askyesno("确认退出", "审单正在运行，确定退出吗？"):
                 return
