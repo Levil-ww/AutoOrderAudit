@@ -347,6 +347,9 @@ def test_price_diff_no_print():
     # 备注为"补差价" → 返回"备注为'补差价'"
     assert AutoAuditEngine._get_no_print_reason("补差价") == "备注为'补差价'"
     assert AutoAuditEngine._get_no_print_reason(" 补差价 ") == "备注为'补差价'"
+    # 备注为"差价" → 返回"备注为'差价'"
+    assert AutoAuditEngine._get_no_print_reason("差价") == "备注为'差价'"
+    assert AutoAuditEngine._get_no_print_reason(" 差价 ") == "备注为'差价'"
     # 包含"差价不发货" → 返回"差价不发货"
     assert AutoAuditEngine._get_no_print_reason("差价不发货") == "差价不发货"
     # 包含"不打印" → 返回"不打印"
@@ -511,6 +514,74 @@ def test_mixed_order_price_diff_with_remark():
     print()
 
 
+def test_merged_order_price_diff_empty_remark():
+    """测试十一：合并订单补差价分组备注为空 -> 编码改为不打印、数量1"""
+    print('=' * 80)
+    print('测试十一：合并订单补差价分组备注为空 -> 编码改为不打印、数量1')
+    print('=' * 80)
+    
+    adapter = FangguoAdapter()
+    engine = AutoAuditEngine(adapter, dry_run=True)
+    
+    order = Order(
+        id='test',
+        trade_id='5124693422585022132&5124948516963022132',
+        tid='5124693422585022132&5124948516963022132',
+        shop_remark='定制pu皮革飘窗垫莫系几何；55x177cm-1张',
+    )
+    
+    order.items.append(OrderItem(
+        id='item1',
+        order_id='test_order_011',
+        oid='5124693422585022132',
+        title='主卧阳台飘窗垫窗台垫子2024新款轻奢北欧风防水防晒防潮垫可裁剪',
+        num=1,
+        price=88.0,
+        shop_remark='定制pu皮革飘窗垫莫系几何；55x177cm-1张',
+        original_tid='5124693422585022132',
+        raw={
+            "materialCode": "PU防水",
+            "modelCode": "定制尺寸",
+            "colorCode": "定制",
+            "pictureCode": "莫系几何;55x177CM",
+        },
+    ))
+    order.items.append(OrderItem(
+        id='item2',
+        order_id='test_order_011',
+        oid='5124948516963022132',
+        title='差价专用少几元就拍几件',
+        num=6,
+        price=1.0,
+        shop_remark='',
+        original_tid='5124948516963022132',
+        raw={
+            "materialCode": "",
+            "modelCode": "",
+            "colorCode": "",
+            "pictureCode": "",
+        },
+    ))
+    
+    print(f"订单号: {order.trade_id}")
+    print(f"商品行1标题: {order.items[0].title}")
+    print(f"商品行1备注: '{order.items[0].shop_remark}'")
+    print(f"商品行1原始订单号: {order.items[0].original_tid}")
+    print(f"商品行2标题: {order.items[1].title}")
+    print(f"商品行2备注: '{order.items[1].shop_remark}'")
+    print(f"商品行2原始订单号: {order.items[1].original_tid}")
+    print(f"商品行2数量: {order.items[1].num}")
+    print()
+    
+    engine.stats = {"total": 0, "success": 0, "skipped": 0, "failed": 0, "errors": [], "cancelled": 0}
+    
+    engine._process_order(order)
+    
+    assert engine.stats['success'] == 1, f"期望成功1个订单，实际success={engine.stats['success']}, skipped={engine.stats['skipped']}"
+    print('✅ 测试通过：合并订单补差价分组备注为空，编码已改为不打印、数量1')
+    print()
+
+
 if __name__ == '__main__':
     test_price_diff_detection()
     test_price_diff_only_empty_remark()
@@ -522,6 +593,7 @@ if __name__ == '__main__':
     test_price_diff_no_print_engine_flow()
     test_merged_order_price_diff_no_print()
     test_mixed_order_price_diff_with_remark()
+    test_merged_order_price_diff_empty_remark()
     
     print('=' * 80)
     print('🎉 所有测试通过！')
