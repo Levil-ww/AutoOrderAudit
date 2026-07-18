@@ -84,7 +84,7 @@ class AutoAuditEngine:
         判断是否需要将补差价行标记为'定制-定制-补差价-不打印'编码。
         条件（按优先级）：
         1. 备注为空（无信息）
-        2. 备注内容为"补差价"
+        2. 备注内容为"补差价"或"差价"
         3. 包含"差价不发货"
         4. 包含"不打印"
         返回原因字符串，None 表示不匹配。
@@ -92,8 +92,8 @@ class AutoAuditEngine:
         stripped = remark.strip()
         if not stripped:
             return "备注为空"
-        if stripped == "补差价":
-            return "备注为'补差价'"
+        if stripped == "补差价" or stripped == "差价":
+            return f"备注为'{stripped}'"
         if "差价不发货" in remark:
             return "差价不发货"
         if "不打印" in remark:
@@ -435,11 +435,6 @@ class AutoAuditEngine:
         material_map = getattr(self.adapter, 'material_map', None)
         material_matcher = getattr(self.adapter, 'get_material_matcher', lambda: None)()
 
-        # ===== 检测补差价订单 =====
-        if self._is_price_difference_order(order):
-            self._process_price_difference_order(order)
-            return
-
         # ===== 检测合并订单 =====
         # 合并订单特征：订单号包含 &，或商品行有不同的 original_tid
         is_merged_order = "&" in order.trade_id or "&" in order.tid
@@ -455,6 +450,11 @@ class AutoAuditEngine:
 
         if is_merged_order:
             self._process_merged_order(order, material_map, material_matcher)
+            return
+
+        # ===== 检测补差价订单 =====
+        if self._is_price_difference_order(order):
+            self._process_price_difference_order(order)
             return
 
         # ===== 普通订单处理 =====
