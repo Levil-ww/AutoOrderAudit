@@ -182,11 +182,12 @@ class FangguoAdapter(ErpAdapter):
         if not receiver_province and receiver_address:
             receiver_province = self._extract_province_from_address(receiver_address)
 
-        # 调试日志：打印原始省份和地址字段（方便排查）
-        if receiver_province or receiver_address:
-            print(f"  📍 收件地址: 省份={receiver_province or '未知'}, 地址={receiver_address[:30] if receiver_address else ''}...")
+        # 提取当前快递编码（尝试多种可能的字段名）
+        current_cp_code = str(raw.get("cpCode") or raw.get("logisticsCpCode") or raw.get("currentCpCode") or raw.get("cp_code") or "")
 
-        current_cp_code = str(raw.get("cpCode") or raw.get("logisticsCpCode") or "")
+        # 调试日志：打印原始省份和地址字段（方便排查）
+        if receiver_province or receiver_address or current_cp_code:
+            print(f"  📍 收件地址: 省份={receiver_province or '未知'}, 地址={receiver_address[:30] if receiver_address else ''}..., 当前快递={current_cp_code or '未设置'}")
 
         order = Order(
             id=str(raw.get("id") or ""),
