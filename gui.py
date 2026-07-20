@@ -53,12 +53,18 @@ FONT = "Microsoft YaHei"
 FONT_MONO = "Consolas"
 
 # ================================================================
-#  自适应监控间隔配置
+#  自适应监控间隔配置（智能版）
 # ================================================================
-MONITOR_MIN_INTERVAL = 10     # 有订单时：10秒后再次检查
+MONITOR_MIN_INTERVAL = 15     # 有订单时：15秒后再次检查（避免过于频繁）
 MONITOR_MAX_INTERVAL = 180    # 无订单时：最长180秒（3分钟）
 MONITOR_INIT_INTERVAL = 30    # 初始间隔：30秒
 MONITOR_STEP_FACTOR = 1.5     # 无订单时间隔放大倍数
+
+MONITOR_DETECT_DELAY_MIN = 10  # 检测到订单后最短延迟时间（秒）- 给客服完善备注
+MONITOR_DETECT_DELAY_MAX = 60  # 检测到订单后最长延迟时间（秒）
+MONITOR_DETECT_DELAY_BASE = 30 # 基础延迟时间（秒）- 默认等待30秒让客服完善备注
+
+MONITOR_API_COOLDOWN = 5      # API调用冷却时间（秒）- 防止过于频繁调用方果API
 
 
 class LoginDialog:
@@ -866,8 +872,10 @@ class AutoAuditGUI:
 
         self.monitor_btn.config(text="⏸ 停止监控", bg=COLORS["danger"])
         print("\n" + "━" * 60)
-        print(f"🔄 自动监控已启动 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"🔄 智能自动监控已启动 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"📌 自适应间隔：有订单时 {MONITOR_MIN_INTERVAL}秒，无订单时逐步拉长至 {MONITOR_MAX_INTERVAL}秒")
+        print(f"⏳ 智能延迟：检测到订单后等待 {MONITOR_DETECT_DELAY_BASE}~{MONITOR_DETECT_DELAY_MAX}秒让客服完善备注")
+        print(f"❄️ API冷却：每次调用间隔至少 {MONITOR_API_COOLDOWN}秒，防止方果服务器崩溃")
         print("━" * 60)
 
     def _stop_monitor(self):
@@ -878,17 +886,27 @@ class AutoAuditGUI:
         print("\n🛑 自动监控已停止")
 
     def _monitor_loop(self):
-        """监控线程主循环：自适应间隔轮询待处理订单"""
+        """监控线程主循环：智能自适应间隔轮询待处理订单
+        
+        核心改进：
+        1. 检测到订单后不立即处理，等待一段时间让客服完善备注
+        2. 等待期间如果有新订单加入，重新计时（避免过早处理）
+        3. 实现API调用冷却时间，防止过于频繁调用方果API
+        4. 根据订单数量动态调整延迟时间
+        """
         interval = MONITOR_INIT_INTERVAL
-        # 跨轮询共享的已正确订单缓存，避免重复处理同一订单
         skip_cache = {}
+        
+        # 状态追踪
+        pending_orders = set()
+        last_detect_time = 0
+        last_api_call_time = 0
+        waiting_for_process = False
 
         while self._auto_monitor:
-            # 检查停止信号
             if self._monitor_stop_event.is_set():
                 break
 
-            # 1. 检查 Token 有效性
             auth = load_auth()
             if not auth.authorization or not auth.is_valid:
                 print("⚠️ Token已失效，自动监控已暂停，请重新登录")
@@ -896,60 +914,139 @@ class AutoAuditGUI:
                 self.root.after(0, self._stop_monitor)
                 return
 
-            # 2. 如果正在手动审单，等待
             if self._running:
                 self._monitor_stop_event.wait(timeout=3)
                 continue
 
-            # 3. 执行审单周期
-            self._running = True
-            self._batch_confirm_decision = None
-            processed = 0
+            # API调用冷却检查
+            now = datetime.now().timestamp()
+            if now - last_api_call_time < MONITOR_API_COOLDOWN:
+                remaining = MONITOR_API_COOLDOWN - (now - last_api_call_time)
+                self._monitor_stop_event.wait(timeout=remaining)
+                continue
 
-            try:
-                from core import AutoAuditEngine
-                from adapters.fangguo import FangguoAdapter
-                from adapters.fangguo.config import (
-                    QUERY_STATUS, PAGE_SIZE, TIME_BEGIN, TIME_END,
-                    DRY_RUN, MAX_ORDERS,
-                )
+            # 查询待处理订单（轻量级检查）
+            order_count = self._quick_check_orders()
+            last_api_call_time = now
 
-                adapter = FangguoAdapter()
-                confirm_cb = None
-                engine = AutoAuditEngine(
-                    adapter=adapter, dry_run=DRY_RUN,
-                    max_orders=MAX_ORDERS, interval=0.5,
-                    confirm_callback=confirm_cb,
-                    skip_cache=skip_cache,
-                )
-                processed = engine.run_monitor_cycle(
-                    page_no=1, page_size=PAGE_SIZE,
-                    query_status=QUERY_STATUS,
-                    time_begin=TIME_BEGIN, time_end=TIME_END,
-                )
-            except Exception as e:
-                print(f"❌ 监控异常: {e}")
-                import traceback
-                print(traceback.format_exc())
-            finally:
-                self._running = False
-                self._batch_confirm_decision = None
+            if order_count > 0:
+                current_orders = set(range(order_count))
+                new_orders_detected = current_orders - pending_orders
+                pending_orders = current_orders
 
-            # 4. 自适应调整间隔
-            if processed > 0:
-                interval = MONITOR_MIN_INTERVAL
+                if new_orders_detected:
+                    last_detect_time = now
+                    waiting_for_process = True
+                    delay = self._calculate_delay(order_count)
+                    now_str = datetime.now().strftime('%H:%M:%S')
+                    print(f"🔍 [{now_str}] 检测到 {order_count} 个待处理订单（新增 {len(new_orders_detected)} 个）")
+                    print(f"⏳ [{now_str}] 等待 {delay}秒让客服完善备注...")
+
+                # 检查是否到达处理时间
+                time_since_detect = now - last_detect_time
+                delay = self._calculate_delay(order_count)
+                
+                if waiting_for_process and time_since_detect >= delay:
+                    processed = self._execute_audit_cycle(skip_cache)
+                    waiting_for_process = False
+                    pending_orders = set()
+                    last_detect_time = 0
+                    
+                    if processed > 0:
+                        interval = MONITOR_MIN_INTERVAL
+                    else:
+                        interval = MONITOR_INIT_INTERVAL
+                else:
+                    remaining_wait = max(0, delay - time_since_detect)
+                    sleep_time = min(remaining_wait, 5)
+                    self._monitor_stop_event.wait(timeout=sleep_time)
+                    continue
             else:
+                pending_orders = set()
+                waiting_for_process = False
+                last_detect_time = 0
+                
                 interval = min(int(interval * MONITOR_STEP_FACTOR), MONITOR_MAX_INTERVAL)
-                now = datetime.now().strftime('%H:%M:%S')
-                print(f"😴 [{now}] 无待处理订单，{interval}秒后再次检查...")
+                now_str = datetime.now().strftime('%H:%M:%S')
+                print(f"😴 [{now_str}] 无待处理订单，{interval}秒后再次检查...")
 
-            # 5. 更新UI按钮显示
-            self.root.after(0, lambda i=interval, p=processed: self._update_monitor_btn(i, p))
-
-            # 6. 可中断等待
+            self.root.after(0, lambda i=interval: self._update_monitor_btn(i, 0))
             self._monitor_stop_event.wait(timeout=interval)
 
         print("🛑 自动监控线程已退出")
+
+    def _quick_check_orders(self) -> int:
+        """快速检查待处理订单数量（轻量级，只查询数量）"""
+        try:
+            from adapters.fangguo import FangguoAdapter
+            from adapters.fangguo.config import QUERY_STATUS, TIME_BEGIN, TIME_END
+            
+            adapter = FangguoAdapter()
+            orders = adapter.query_orders(
+                page_no=1, page_size=1,
+                query_status=QUERY_STATUS,
+                time_begin=TIME_BEGIN, time_end=TIME_END,
+            )
+            return len(orders) if orders else 0
+        except Exception as e:
+            print(f"❌ 快速检查订单失败: {e}")
+            return 0
+
+    def _calculate_delay(self, order_count: int) -> int:
+        """根据订单数量动态计算延迟时间
+        
+        逻辑：订单越多，延迟越短（客服可能正在集中处理）
+             订单越少，延迟越长（给客服足够时间完善备注）
+        """
+        if order_count >= 20:
+            delay = MONITOR_DETECT_DELAY_MIN
+        elif order_count >= 10:
+            delay = int(MONITOR_DETECT_DELAY_BASE * 0.7)
+        elif order_count >= 5:
+            delay = MONITOR_DETECT_DELAY_BASE
+        elif order_count >= 2:
+            delay = int(MONITOR_DETECT_DELAY_BASE * 1.3)
+        else:
+            delay = MONITOR_DETECT_DELAY_MAX
+        
+        return delay
+
+    def _execute_audit_cycle(self, skip_cache: dict) -> int:
+        """执行一次完整的审单周期"""
+        self._running = True
+        self._batch_confirm_decision = None
+        processed = 0
+
+        try:
+            from core import AutoAuditEngine
+            from adapters.fangguo import FangguoAdapter
+            from adapters.fangguo.config import (
+                QUERY_STATUS, PAGE_SIZE, TIME_BEGIN, TIME_END,
+                DRY_RUN, MAX_ORDERS,
+            )
+
+            adapter = FangguoAdapter()
+            confirm_cb = None
+            engine = AutoAuditEngine(
+                adapter=adapter, dry_run=DRY_RUN,
+                max_orders=MAX_ORDERS, interval=0.5,
+                confirm_callback=confirm_cb,
+                skip_cache=skip_cache,
+            )
+            processed = engine.run_monitor_cycle(
+                page_no=1, page_size=PAGE_SIZE,
+                query_status=QUERY_STATUS,
+                time_begin=TIME_BEGIN, time_end=TIME_END,
+            )
+        except Exception as e:
+            print(f"❌ 监控异常: {e}")
+            import traceback
+            print(traceback.format_exc())
+        finally:
+            self._running = False
+            self._batch_confirm_decision = None
+
+        return processed
 
     def _update_monitor_btn(self, next_interval, processed):
         """更新监控按钮显示倒计时"""
