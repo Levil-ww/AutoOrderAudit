@@ -47,19 +47,87 @@ class AutoAuditEngine:
         max_orders: int = 0,
         interval: float = 0.5,
         confirm_callback: Optional[Callable] = None,
+        skip_cache: Optional[dict] = None,
     ):
         """
         :param confirm_callback: 确认回调，签名 (order, parsed_list, changes: list[str]) -> bool
                                 返回 True 表示确认修改，False 表示仅记录不修改。
                                 仅在非 dry_run 模式下生效。
+        :param skip_cache: 已正确订单缓存，格式 {trade_id: expected_key}。
+                           传入同一个 dict 可在多次轮询间共享缓存。
         """
         self.adapter = adapter
         self.dry_run = dry_run
         self.max_orders = max_orders
         self.interval = interval
         self.confirm_callback = confirm_callback
+        self.skip_cache = skip_cache if skip_cache is not None else {}
         self.stats = {"total": 0, "success": 0, "skipped": 0, "failed": 0, "errors": [],
                       "cancelled": 0}  # cancelled 统计用户取消的数量
+
+    # ------------------------------------------------------------------
+    #  缓存辅助方法：避免重复处理已正确的订单
+    # ------------------------------------------------------------------
+    def _compute_expected_key(
+        self,
+        parsed_list=None,
+        price_diff_updates=None,
+        gift_no_ship: bool = False,
+        gift_no_ship_tids=None,
+    ):
+        """计算订单的期望编码签名，用于缓存比对"""
+        parts = []
+
+        # 普通商品编码+数量
+        for p in (parsed_list or []):
+            if p and p.success:
+                parts.append(("p", p.shop_mapping_sku, p.num))
+
+        # 赠品（去重排序）
+        gifts = set()
+        for p in (parsed_list or []):
+            if p and p.gifts:
+                for name, num in p.gifts:
+                    gifts.add((name, num))
+            elif p and p.gift_name and p.gift_num > 0:
+                gifts.add((p.gift_name, p.gift_num))
+        for name, num in sorted(gifts):
+            parts.append(("g", name, num))
+
+        # 补差价行
+        for update in (price_diff_updates or []):
+            ship = update.get("ship", True)
+            for item in update.get("items", []):
+                if ship:
+                    parts.append(("d", item.shop_mapping_sku, 1))
+                else:
+                    parts.append(("d", "定制-定制-补差价-不打印", 1))
+
+        # 赠品不送
+        if gift_no_ship:
+            parts.append(("ns", "all"))
+        if gift_no_ship_tids:
+            for tid in sorted(gift_no_ship_tids):
+                parts.append(("ns", tid))
+
+        return frozenset(parts)
+
+    def _check_skip_cache(self, order: Order, expected_key) -> bool:
+        """检查订单是否已在缓存中且期望签名未变"""
+        if not expected_key:
+            return False
+        cached_key = self.skip_cache.get(order.trade_id)
+        if cached_key is None:
+            return False
+        if cached_key == expected_key:
+            print(f"  ⏭️  跳过：订单编码已正确（缓存命中）")
+            return True
+        return False
+
+    def _update_skip_cache(self, order: Order, expected_key):
+        """将订单期望签名写入缓存"""
+        if expected_key:
+            self.skip_cache[order.trade_id] = expected_key
 
     def _is_price_difference_order(self, order: Order) -> bool:
         """
@@ -128,18 +196,28 @@ class AutoAuditEngine:
         if no_print_reason:
             print(f"  📝 {no_print_reason}：修改编码为'定制-定制-补差价-不打印'，数量改为1")
 
+            expected_key = self._compute_expected_key(
+                price_diff_updates=[{'tid': order.tid, 'items': price_diff_items, 'ship': False}]
+            )
+            if self._check_skip_cache(order, expected_key):
+                self.stats["skipped"] += 1
+                return
+
             if self.dry_run:
                 print(f"  🔶 DRY RUN: 修改编码为'定制-定制-补差价-不打印'")
                 self.stats["success"] += 1
+                self._update_skip_cache(order, expected_key)
                 return
 
             try:
                 ok = self.adapter.update_price_difference_order(order, price_diff_items, ship=False)
                 if ok is None:
                     print(f"  ⏭️  跳过：补差价订单编码已正确")
+                    self._update_skip_cache(order, expected_key)
                     self.stats["skipped"] += 1
                 elif ok:
                     print(f"  ✅ 修改成功！")
+                    self._update_skip_cache(order, expected_key)
                     self.stats["success"] += 1
                 else:
                     print(f"  ❌ 修改失败")
@@ -318,6 +396,17 @@ class AutoAuditEngine:
                             'ship': True,
                         }]
 
+        # ---- 缓存检查：如果订单已正确，直接跳过 ----
+        expected_key = self._compute_expected_key(
+            parsed_list=parsed_list,
+            price_diff_updates=price_diff_updates,
+            gift_no_ship=gift_no_ship,
+        )
+        if self._check_skip_cache(order, expected_key):
+            self.stats["skipped"] += 1
+            return
+        # ------------------------------------------
+
         if self.dry_run:
             print()
             for parsed in parsed_list:
@@ -373,6 +462,7 @@ class AutoAuditEngine:
                     print(f"  🎁 赠品已添加: {gift_name} x {gift_num}")
                 if price_diff_updates:
                     print(f"  ✅ 补差价订单修改成功！")
+                self._update_skip_cache(order, expected_key)
                 self.stats["success"] += 1
             else:
                 print(f"  ❌ 修改失败")
@@ -529,7 +619,8 @@ class AutoAuditEngine:
         # 按 original_tid 分组商品行
         groups = {}
         for item in order.items:
-            tid = item.original_tid or order.tid
+            # 优先使用不包含&的子订单号
+            tid = item.original_tid if item.original_tid and "&" not in item.original_tid else (item.oid if item.oid and "&" not in item.oid else order.tid)
             if tid not in groups:
                 groups[tid] = {
                     'items': [],
@@ -713,6 +804,17 @@ class AutoAuditEngine:
             for gift_name, gift_num in all_gifts:
                 print(f"  🎁 赠品: {gift_name} x {gift_num}")
         
+        # ---- 缓存检查：如果订单已正确，直接跳过 ----
+        expected_key = self._compute_expected_key(
+            parsed_list=all_parsed_list,
+            price_diff_updates=price_diff_updates,
+            gift_no_ship_tids=gift_no_ship_tids,
+        )
+        if self._check_skip_cache(order, expected_key):
+            self.stats["skipped"] += 1
+            return
+        # ------------------------------------------
+
         if self.dry_run:
             if all_parsed_list:
                 for parsed in all_parsed_list:
@@ -722,6 +824,7 @@ class AutoAuditEngine:
                 print(f"  🔶 DRY RUN: 补差价订单 {update['tid'][:16]}... -> {action}")
             for tid in gift_no_ship_tids:
                 print(f"  🔶 DRY RUN: 赠品不发货 {tid[:16]}... -> 修改赠品行编码为'定制-定制-补差价-不打印'")
+            self._update_skip_cache(order, expected_key)
             self.stats["success"] += 1
             return
         
@@ -745,8 +848,8 @@ class AutoAuditEngine:
         
         try:
             if all_parsed_list or price_diff_updates or gift_no_ship_tids:
-                ok = self.adapter.update_merchant_code(order, 
-                    all_parsed_list[0] if all_parsed_list else None, 
+                ok = self.adapter.update_merchant_code(order,
+                    all_parsed_list[0] if all_parsed_list else None,
                     all_parsed_list,
                     price_diff_updates,
                     gift_no_ship_tids=gift_no_ship_tids,
@@ -761,6 +864,7 @@ class AutoAuditEngine:
                         print(f"  ✅ 补差价订单修改成功！")
                     if gift_no_ship_tids:
                         print(f"  ✅ 赠品不发货修改成功！")
+                    self._update_skip_cache(order, expected_key)
                     self.stats["success"] += 1
                 else:
                     print(f"  ❌ 修改失败")

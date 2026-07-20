@@ -880,6 +880,8 @@ class AutoAuditGUI:
     def _monitor_loop(self):
         """监控线程主循环：自适应间隔轮询待处理订单"""
         interval = MONITOR_INIT_INTERVAL
+        # 跨轮询共享的已正确订单缓存，避免重复处理同一订单
+        skip_cache = {}
 
         while self._auto_monitor:
             # 检查停止信号
@@ -918,6 +920,7 @@ class AutoAuditGUI:
                     adapter=adapter, dry_run=DRY_RUN,
                     max_orders=MAX_ORDERS, interval=0.5,
                     confirm_callback=confirm_cb,
+                    skip_cache=skip_cache,
                 )
                 processed = engine.run_monitor_cycle(
                     page_no=1, page_size=PAGE_SIZE,

@@ -232,7 +232,18 @@ class FangguoAdapter(ErpAdapter):
             ])
             
             # 提取商品行所属的原始订单号（用于合并订单的拆分）
-            original_tid = str(it.get("tid") or it.get("oid") or it.get("sysOid") or "")
+            # 优先选择不包含&的子订单号
+            tid_val = str(it.get("tid") or "")
+            oid_val = str(it.get("oid") or "")
+            sys_oid_val = str(it.get("sysOid") or "")
+            if tid_val and "&" not in tid_val:
+                original_tid = tid_val
+            elif oid_val and "&" not in oid_val:
+                original_tid = oid_val
+            elif sys_oid_val and "&" not in sys_oid_val:
+                original_tid = sys_oid_val
+            else:
+                original_tid = tid_val or oid_val or sys_oid_val
             
             item = OrderItem(
                 id=str(it.get("id") or ""),
@@ -319,7 +330,18 @@ class FangguoAdapter(ErpAdapter):
                         "备注", "卖家备注", "shop_remark",
                     ])
                     
-                    original_tid = str(it.get("tid") or it.get("oid") or it.get("sysOid") or "")
+                    # 优先选择不包含&的子订单号
+                    tid_val = str(it.get("tid") or "")
+                    oid_val = str(it.get("oid") or "")
+                    sys_oid_val = str(it.get("sysOid") or "")
+                    if tid_val and "&" not in tid_val:
+                        original_tid = tid_val
+                    elif oid_val and "&" not in oid_val:
+                        original_tid = oid_val
+                    elif sys_oid_val and "&" not in sys_oid_val:
+                        original_tid = sys_oid_val
+                    else:
+                        original_tid = tid_val or oid_val or sys_oid_val
                     
                     order.items.append(OrderItem(
                         id=str(it.get("id") or ""),
@@ -960,6 +982,7 @@ class FangguoAdapter(ErpAdapter):
         )
         item['shopMappingSku'] = f'<font color="red">{item["shopMappingSku"]}</font>'
         item['type'] = 1
+        item['shopRemark'] = ""
         return item
 
     def _build_new_item(self, order: Order, parsed: ParsedRemark) -> dict:
@@ -975,6 +998,7 @@ class FangguoAdapter(ErpAdapter):
         )
         item['shopMappingSku'] = f'<font color="red">{item["shopMappingSku"]}</font>'
         item['type'] = 1
+        item['shopRemark'] = ""
         return item
 
     def _build_gift_item(self, item: OrderItem, order: Order, material_code: str, gift_name: str, gift_num: int, is_new: bool = False, original_tid: str = "", shop_remark: str = "") -> dict:
