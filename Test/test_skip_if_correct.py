@@ -25,8 +25,8 @@ def test_skip_if_already_correct():
     
     if not parsed_list:
         print('❌ 解析失败，无法进行测试')
-        return False
-    
+        assert False, '解析失败'
+
     expected_sku = parsed_list[0].shop_mapping_sku
     print(f'期望编码: {expected_sku}')
     
@@ -63,10 +63,10 @@ def test_skip_if_already_correct():
     
     if ok == True and '编码已正确，跳过修改' in output:
         print('\n✅ 测试通过：编码已正确时，程序跳过修改')
-        return True
+        assert True
     else:
         print('\n❌ 测试失败：编码已正确但未跳过修改')
-        return False
+        assert False, '编码已正确但未跳过修改'
 
 
 def test_modify_if_incorrect():
@@ -85,8 +85,8 @@ def test_modify_if_incorrect():
     
     if not parsed_list:
         print('❌ 解析失败，无法进行测试')
-        return False
-    
+        assert False, '解析失败'
+
     expected_sku = parsed_list[0].shop_mapping_sku
     print(f'期望编码: {expected_sku}')
     
@@ -123,10 +123,10 @@ def test_modify_if_incorrect():
     
     if ok != True or '编码已正确，跳过修改' not in output:
         print('\n✅ 测试通过：编码不正确时，程序执行修改')
-        return True
+        assert True
     else:
         print('\n❌ 测试失败：编码不正确但被跳过')
-        return False
+        assert False, '编码不正确但被跳过'
 
 
 if __name__ == '__main__':

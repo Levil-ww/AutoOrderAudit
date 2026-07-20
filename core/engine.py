@@ -786,7 +786,7 @@ class AutoAuditEngine:
 
         all_gifts = list(dict.fromkeys(all_gifts))
 
-        if not all_parsed_list and not price_diff_updates and not gift_no_ship_tids:
+        if not all_parsed_list and not price_diff_updates and not gift_no_ship_tids and not all_gifts:
             print(f"  ⏭️  跳过：所有分组均无法解析")
             self.stats["skipped"] += 1
             return

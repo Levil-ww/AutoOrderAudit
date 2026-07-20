@@ -280,7 +280,7 @@ def parse_remark(
     # 提取cm后面的备注内容（仅定制有效，现货不带单位）
     remark_after_size = ""
     if not is_stock:
-        cm_match = re.search(r"cm(.*)", text, re.IGNORECASE)
+        cm_match = re.search(r"cm(.*?)(?=\d+\s*[xX×*]|\Z|$)", text, re.IGNORECASE)
         if cm_match:
             after_cm = cm_match.group(1)
             # 去掉数量标记（如-1张、*2张），但保留其他内容
@@ -623,40 +623,53 @@ def extract_multiple_remarks(
 def _extract_all_sizes(text: str) -> list[tuple[str, str]]:
     """提取文本中所有尺寸对，包括矩形尺寸和圆形尺寸"""
     # 先找到赠品信息的起始位置，只提取赠品之前的尺寸
-    gift_pos = -1
-    for kw in _GIFT_KEYWORDS:
-        pos = text.find(kw)
-        if pos != -1:
-            if gift_pos == -1 or pos < gift_pos:
-                gift_pos = pos
-    
+    # 排除"发送/送达/配送/放送"等非赠品语境
+    gift_pos = _find_gift_keyword_pos(text)
+
     # 如果有赠品信息，只处理赠品之前的文本
     if gift_pos != -1:
         text = text[:gift_pos]
-    
+
     sizes = []
-    
+
     # 提取矩形尺寸
     for w, h in _RE_SIZE.findall(text):
         sizes.append((w, h))
-    
+
     # 提取圆形尺寸（保留原始前缀格式）
     for prefix, diameter in _RE_ROUND_SIZE.findall(text):
         sizes.append((diameter, prefix))
-    
+
     return sizes
+
+
+def _find_gift_keyword_pos(text: str) -> int:
+    """查找赠品关键字的起始位置，排除'发送/送达/配送/放送'等非赠品语境"""
+    gift_pos = -1
+    for kw in _GIFT_KEYWORDS:
+        start = 0
+        while True:
+            pos = text.find(kw, start)
+            if pos == -1:
+                break
+            # 排除"发送"、"送达"、"配送"、"放送"等非赠品语境
+            prev_char = text[pos - 1] if pos > 0 else ""
+            next_char = text[pos + len(kw)] if pos + len(kw) < len(text) else ""
+            if prev_char in "发送达配放" or next_char in "达发":
+                start = pos + 1
+                continue
+            if gift_pos == -1 or pos < gift_pos:
+                gift_pos = pos
+            break
+    return gift_pos
 
 
 def _extract_all_sizes_with_position(text: str) -> list[tuple[str, str, int, int]]:
     """提取文本中所有尺寸对，包括位置信息 (w, h, start_pos, end_pos)"""
     # 先找到赠品信息的起始位置，只提取赠品之前的尺寸
-    gift_pos = -1
-    for kw in _GIFT_KEYWORDS:
-        pos = text.find(kw)
-        if pos != -1:
-            if gift_pos == -1 or pos < gift_pos:
-                gift_pos = pos
-    
+    # 排除"发送/送达/配送/放送"等非赠品语境
+    gift_pos = _find_gift_keyword_pos(text)
+
     sizes_with_pos = []
     
     # 提取矩形尺寸（带位置）
@@ -783,7 +796,7 @@ def _parse_multi_size_direct(
 
     # 提取cm后面的备注内容（包含裁剪类型和额外备注，但去掉数量标记如-1张）
     remark_after_size = ""
-    cm_match = re.search(r"cm(.*)", text, re.IGNORECASE)
+    cm_match = re.search(r"cm(.*?)(?=\d+\s*[xX×*]|\Z|$)", text, re.IGNORECASE)
     if cm_match:
         after_cm = cm_match.group(1)
         after_cm = re.sub(r"[-*×]\d+[张个件套米]", "", after_cm).strip()
@@ -1075,6 +1088,10 @@ def _extract_multiple_gifts(text: str) -> list[tuple[str, int]]:
 
             if gift_text and gift_text not in ["一", "二", "两", "三", "四", "五", "六", "七", "八", "九", "十", "赠品"]:
                 gifts.append((gift_text, gift_num))
+        elif gift_num > 0 and keyword in ("赠品", "附赠", "加送"):
+            # 处理"赠品2张"这种只有数量没有名称的简洁格式
+            # 使用默认赠品名"赠品"
+            gifts.append(("赠品", gift_num))
     
     if not gifts:
         gifts = _extract_gifts_fallback(text)
@@ -1594,8 +1611,8 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
         for i, (seg, qty) in enumerate(segments):
             cleaned_seg = _clean_segment(seg)
 
-            if ";" in cleaned_seg:
-                first_part = cleaned_seg.split(";", 1)[0].strip()
+            if ";" in cleaned_seg or "；" in cleaned_seg:
+                first_part = re.split(r"[;；]", cleaned_seg, maxsplit=1)[0].strip()
                 pattern_candidate = first_part
                 if pattern_candidate.startswith("定制"):
                     pattern_candidate = pattern_candidate[2:].strip()
@@ -1637,9 +1654,9 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
                 segments.append((cleaned, qty))
             return segments, trailing_remark
         
-        # 查找分号位置
+        # 查找分号位置（同时支持英文和中文分号）
         semi_positions = []
-        for match in re.finditer(r";", text):
+        for match in re.finditer(r"[;；]", text):
             semi_positions.append(match.start())
         
         # 分析每个尺寸前面的花型名

@@ -6,6 +6,7 @@
 
 import re
 import json
+from collections import defaultdict
 from typing import Any, Optional
 
 import requests
@@ -427,9 +428,11 @@ class FangguoAdapter(ErpAdapter):
             non_gift_non_price_diff_items = [item for item in order.items if not self._is_gift_item(item) and not self._is_price_difference_item(item)]
 
         # 检查是否存在任何已作废或已退款的非赠品、非补差价商品行
-        void_non_gift_items = [item for item in non_gift_non_price_diff_items if item.is_void]
-        if void_non_gift_items:
-            print(f"  ⏭️  跳过：存在已作废或已退款的商品行")
+        # 项目规则：未匹配的非赠品、非作废商品行必须保留；作废行也由第四步保留
+        # 因此只有当所有非赠品行都已作废时才整体跳过，否则只跳过作废的检查
+        void_non_gift_count = sum(1 for item in non_gift_non_price_diff_items if item.is_void)
+        if void_non_gift_count > 0 and void_non_gift_count == len(non_gift_non_price_diff_items):
+            print(f"  ⏭️  跳过：所有非赠品商品行已作废或已退款")
             return None
         
         # 检查当前订单是否已经完全正确
@@ -438,14 +441,20 @@ class FangguoAdapter(ErpAdapter):
         if product_parsed_list and len(valid_items) == len(product_parsed_list):
             if is_merged_order:
                 # 合并订单：按 original_tid 验证每个商品行的 SKU 和数量是否正确
-                parsed_by_tid = {p.original_tid: p for p in product_parsed_list if p.original_tid}
+                # 同一子订单可能解析出多个尺寸（多段备注），需用 list 收集，避免覆盖
+                parsed_by_tid = defaultdict(list)
+                for p in product_parsed_list:
+                    if p.original_tid:
+                        parsed_by_tid[p.original_tid].append(p)
                 all_matched = True
                 for item in valid_items:
-                    p = parsed_by_tid.get(item.original_tid)
-                    if p and (item.shop_mapping_sku != p.shop_mapping_sku or item.num != p.num):
-                        all_matched = False
-                        break
-                    if not p and item.shop_mapping_sku:
+                    parsed_list_for_tid = parsed_by_tid.get(item.original_tid, [])
+                    # 当前商品行只要能匹配该子订单的任一解析结果即可
+                    item_matched = any(
+                        item.shop_mapping_sku == p.shop_mapping_sku and item.num == p.num
+                        for p in parsed_list_for_tid
+                    )
+                    if not item_matched and item.shop_mapping_sku:
                         all_matched = False
                         break
                 is_already_correct = all_matched
@@ -1014,16 +1023,13 @@ class FangguoAdapter(ErpAdapter):
         if "圆垫" in gift_name:
             model_code = "赠品沥水垫小圆或小方"
             picture_code = "赠品沥水垫小圆或小方"
-            gift_code = "赠品沥水垫小圆或小方"
         elif "方垫" in gift_name or re.search(r"30\s*[xX×]\s*50", gift_name):
             # 包含"方垫"或"30x50"尺寸的赠品都视为30x50规格，使用方垫编码
             model_code = "30x50"
             picture_code = "随机发；30x50"
-            gift_code = "30x50-随机发；30x50"
         else:
             model_code = "赠品沥水垫小圆或小方"
             picture_code = "赠品沥水垫小圆或小方"
-            gift_code = "赠品沥水垫小圆或小方"
 
         if is_new:
             id_field = None
@@ -1170,31 +1176,34 @@ class FangguoAdapter(ErpAdapter):
 
     def _is_gift_item(self, item: OrderItem) -> bool:
         """判断一个商品行是否是赠品行
-        
+
         检测方式（任一满足即为赠品）：
         1. filmGiftCode 字段非空
         2. 商品标题包含"赠品"
         3. shop_mapping_sku 包含"赠品"
-        4. price为0且标题包含"垫"（常见赠品如沥水垫、防滑垫等）
+        4. price为0且标题包含"垫"（常见赠品如沥水垫、防滑垫等，且非桌垫/餐垫/地垫等普通商品）
         """
         # 方式1：检查 filmGiftCode 字段
         gift_code = item.raw.get('filmGiftCode', '') if item.raw else ''
         if gift_code:
             return True
-        
+
         # 方式2：检查标题是否包含"赠品"
         title = item.title or ''
         if '赠品' in title:
             return True
-        
+
         # 方式3：检查 shop_mapping_sku 是否包含"赠品"
         sku = item.shop_mapping_sku or ''
         if '赠品' in sku:
             return True
-        
+
         # 方式4：检查 price 为0 且标题包含"垫"（常见赠品）
+        # 排除明显的非赠品关键词（桌垫/餐垫/杯垫/地垫/鼠标垫等普通商品）
         if item.price == 0 and '垫' in title:
-            return True
+            non_gift_keywords = ['桌垫', '餐垫', '杯垫', '地垫', '鼠标垫', '脚垫']
+            if not any(kw in title for kw in non_gift_keywords):
+                return True
 
         # 方式5：检查 shop_mapping_sku 是否为程序生成的赠品编码格式
         if self._is_gift_sku(sku):
@@ -1227,9 +1236,11 @@ class FangguoAdapter(ErpAdapter):
         # 常见赠品商品名称
         if any(kw in title for kw in ["沥水垫", "防滑垫", "餐垫", "杯垫"]):
             return True
-        # 价格 0 且标题含"垫"
+        # 价格 0 且标题含"垫"，但需排除非赠品（桌垫/地垫/鼠标垫/脚垫）
         if item.price == 0 and '垫' in title:
-            return True
+            non_gift_keywords = ['桌垫', '地垫', '鼠标垫', '脚垫']
+            if not any(kw in title for kw in non_gift_keywords):
+                return True
         # 商家编码含赠品字样
         if '赠品' in sku:
             return True

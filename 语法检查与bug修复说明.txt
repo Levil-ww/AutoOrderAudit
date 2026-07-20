@@ -129,3 +129,32 @@ Bug 5 — 编码格式判断缺少分号校验
     Issue 7	    adapter.py:388	        删除未使用的 expected_skus_set 变量
     Issue 8	    adapter.py:491-495	    删除重复定义的 valid_indices 变量
     Issue 9	    engine.py:769-771	    删除不可达的 else 死分支（前面已有相同判断并 return）
+
+
+
+四、优化程序后新产生的潜在bug  --  需修复
+    修复Bug1: _extract_all_sizes 误匹配'发送/送达'导致尺寸丢失
+    修复Bug2: _split_into_segments 不识别中文分号'；'
+    修复Bug3: 合并订单 is_already_correct 检查覆盖同子订单多尺寸
+    修复Bug4: 合并订单只有赠品时被错误跳过
+    修复Bug5: 合并订单中只要有一个非赠品已作废就跳过整个订单
+    修复Bug6: _is_gift_item 将价格为0的普通商品误判为赠品
+    修复Bug7: _extract_gifts_fallback 对'赠品2张'格式处理不正确
+    修复代码异味: gift_code未使用变量
+    修复代码异味: 测试函数使用 return 而非 assert
+    修复代码异味: cm后贪婪匹配
+    修复代码异味: void_non_gift_items列表简化
+
+    修复完成 ✅
+                        Bug	                            文件	                                                    修复内容
+    1	_extract_all_sizes 误匹配"发送/送达"导致尺寸丢失	    parser.py	                    提取 _find_gift_keyword_pos() 辅助函数，跳过前后字为"发送达配放"的位置
+    2	_split_into_segments 不识别中文分号 ；	            parser.py	                    分号匹配改为 [;；]，re.split 也支持中英文分号
+    3	合并订单 is_already_correct 字典覆盖多尺寸	        adapter.py	                    改用 defaultdict(list)，逐条匹配
+    4	合并订单只有赠品时被错误跳过	                        engine.py	                    跳过条件增加 not all_gifts
+    5	单条作废导致整单跳过	                            adapter.py	                    改为仅在所有非赠品行都作废时才跳过
+    6	价格0的普通商品误判为赠品	                        adapter.py	                    _is_gift_item 和 _looks_like_gift_item 增加"桌垫/餐垫/地垫/鼠标垫/脚垫"等非赠品关键词排除
+    7	"赠品2张"格式无法识别	                            parser.py	                    _extract_multiple_gifts 中增加 elif gift_num > 0 and keyword in ("赠品", "附赠", "加送") 兜底分支
+    8	未使用的 gift_code 变量	                        adapter.py	                    删除 _build_gift_item 中冗余的 gift_code 赋值
+    9	测试函数用 return 而非 assert	                    Test/test_skip_if_correct.py	改用 assert 语句
+    10	re.search(r"cm(.*)") 贪婪匹配	                parser.py	                    改为非贪婪 `re.search(r"cm(.?)(?=\d+\s[xX×*]
+    11	void_non_gift_items 列表简化	                    adapter.py	                    用 sum(1 for ...) 替换列表推导式
