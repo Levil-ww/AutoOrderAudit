@@ -116,6 +116,9 @@ _RE_ARRIVAL_REFUND = re.compile(r"(到货返|到货返差价|到货退差价|确
 # 无关词语匹配（如"桌垫"、"地垫"等，作为后缀时应过滤）
 _RE_IRRELEVANT_SUFFIX = re.compile(r"(桌垫|地垫)[，,；;]?")
 
+# 快递信息匹配（如"发中通"、"发顺丰"、"发德邦"等，过滤掉发后面的快递选择）
+_RE_EXPRESS_DELIVERY = re.compile(r"发(?:中通|顺丰|德邦|京东|邮政|极兔|圆通|韵达|申通|天天|EMS|SF|DHL|UPS|FedEx|优速|速尔|全峰|国通|快捷|宅急送|跨越|中铁|中邮|龙邦|安能|天地华宇|佳吉|百世)(?:快递|速递|速运|物流|特快)?[，,；;。]?")
+
 # 花型关键词
 _PATTERN_KEYWORDS = ["花幔", "卢浮梦境", "安妮森林", "暗夜缪斯", "萃园", 
 "玫瑰骑士", "花园秘境", "复古大花", "中古大花","凯特玫瑰","中古花园",
@@ -291,6 +294,8 @@ def parse_remark(
             after_cm = _RE_ARRIVAL_REFUND.sub("", after_cm).strip()
             # 过滤掉"桌垫"、"地垫"等无关词语
             after_cm = _RE_IRRELEVANT_SUFFIX.sub("", after_cm).strip()
+            # 过滤掉快递信息（如"发中通"、"发顺丰"等）
+            after_cm = _RE_EXPRESS_DELIVERY.sub("", after_cm).strip()
 
             # 去掉赠品信息：找到最早的赠品关键词位置，然后向前找到分隔符
             # 处理"小垫子总共送3个"这种模式，把"小垫子"也去掉
@@ -556,6 +561,8 @@ def extract_multiple_remarks(
                 clean_remark = _RE_ARRIVAL_REFUND.sub("", clean_remark).strip().strip("-;,、，")
                 # 过滤掉"桌垫"、"地垫"等无关词语
                 clean_remark = _RE_IRRELEVANT_SUFFIX.sub("", clean_remark).strip().strip("-;,、，")
+                # 过滤掉快递信息（如"发中通"、"发顺丰"等）
+                clean_remark = _RE_EXPRESS_DELIVERY.sub("", clean_remark).strip().strip("-;,、，")
                 # 再清理一次可能的数量汇总残留（兼容"总"字残留：总共X张）
                 clean_remark = re.sub(r'总?共(?:计)?\d+[张个件套米]', '', clean_remark).strip().strip('，,、;；')
                 clean_remark = re.sub(r'总?共(?:计)?[一二两三四五六七八九十]+[张个件套米]', '', clean_remark).strip().strip('，,、;；')
@@ -1596,6 +1603,7 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
                         after_comma = _RE_QTY_SUMMARY.sub("", after_comma).strip().strip("-;,、，")
                         after_comma = _RE_ARRIVAL_REFUND.sub("", after_comma).strip().strip("-;,、，")
                         after_comma = _RE_IRRELEVANT_SUFFIX.sub("", after_comma).strip().strip("-;,、，")
+                        after_comma = _RE_EXPRESS_DELIVERY.sub("", after_comma).strip().strip("-;,、，")
                         if after_comma:
                             if trailing_remark:
                                 trailing_remark = f"{trailing_remark}，{after_comma}"
@@ -1847,6 +1855,7 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
                         after_comma = _RE_QTY_SUMMARY.sub("", after_comma).strip().strip("-;,、，")
                         after_comma = _RE_ARRIVAL_REFUND.sub("", after_comma).strip().strip("-;,、，")
                         after_comma = _RE_IRRELEVANT_SUFFIX.sub("", after_comma).strip().strip("-;,、，")
+                        after_comma = _RE_EXPRESS_DELIVERY.sub("", after_comma).strip().strip("-;,、，")
                         if after_comma:
                             trailing_remark = after_comma
     
