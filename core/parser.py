@@ -111,7 +111,7 @@ _CHINESE_NUMBERS = r"(?:[一二两三四五六七八九十]|\d+)"
 _RE_QTY_SUMMARY = re.compile(rf"共(?:计)?{_CHINESE_NUMBERS}[张个件套米]")
 
 # 到货返信息匹配（如"到货返22"、"到货返50元"、"确认收货返差价0.3元"、“返现10 /0.2元”）
-_RE_ARRIVAL_REFUND = re.compile(r"(到货返|到货退差价|确认收货返差价|返差价|返现)\d+(?:\.\d+)?[元]?")
+_RE_ARRIVAL_REFUND = re.compile(r"(到货返|到货返差价|到货退差价|确认收货返差价|返差价|返现)\d+(?:\.\d+)?[元]?")
 
 # 无关词语匹配（如"桌垫"、"地垫"等，作为后缀时应过滤）
 _RE_IRRELEVANT_SUFFIX = re.compile(r"(桌垫|地垫)[，,；;]?")
@@ -172,15 +172,18 @@ def parse_remark(
     # 情况1：已经是编码格式 "材质-标准/定制-尺寸-花型;尺寸" 或 现货编码 "材质-标准-尺寸-花型;尺寸"
     if "-" in text and not text.startswith("定制") and not text.startswith("现货"):
         parts = text.split("-")
-        if len(parts) >= 4:
+        if len(parts) >= 4 and ";" in parts[-1]:
             result.material_code = _map_material(parts[0], material_map)
             result.color_code = parts[1]
             result.model_code = parts[2]
             result.picture_code = "-".join(parts[3:])
             result.num = _extract_qty(text)
             result.success = True
-            # 现货编码特征：color="标准" 且 model为纯尺寸（数字x数字），无cm/CM
-            if result.color_code == "标准" and re.match(r"^[\d.]+[xX×*][\d.]+(?:[圆直径圆形].*)?$", result.model_code):
+            # 现货编码特征：color="标准" 且 model为纯尺寸（数字x数字 或 直径/圆形尺寸），无cm/CM
+            if result.color_code == "标准" and (
+                re.match(r"^[\d.]+[xX×*][\d.]+(?:[圆直径圆形].*)?$", result.model_code)
+                or re.match(r"^(?:直径|圆|圆形|圆直径)\d+(?:\.\d+)?$", result.model_code)
+            ):
                 result.is_stock = True
             return result
 

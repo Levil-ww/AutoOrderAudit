@@ -1,0 +1,131 @@
+2026.7.20
+一、严重逻辑Bug（影响功能正确性）
+Bug 1: core/engine.py:366 - 空列表访问导致 IndexError
+    问题：在 _process_normal_order_logic 方法中，调用 update_merchant_code 时已经用 parsed_list[0] if parsed_list else None 防御空列表，但下面访问 parsed_list[0].success 时没有防御：
+        ok = self.adapter.update_merchant_code(order, parsed_list[0] if parsed_list else None, parsed_list, price_diff_updates, gift_no_ship=gift_no_ship)
+        if ok is None:
+            ...
+        elif ok:
+            if parsed_list[0].success:  # ← parsed_list 可能为空！
+    触发场景：当订单只有补差价行、备注为空或只有赠品信息时，parsed_list=[] 但 price_diff_updates 非空，update_merchant_code 返回 True，会触发 IndexError。
+
+    修复方案：
+    elif ok:
+    if parsed_list and parsed_list[0].success:
+        print(f"  ✅ 修改成功！新编码: {parsed_list[0].shop_mapping_sku}")
+        if len(parsed_list) > 1:
+            print(f"  📦 包含 {len(parsed_list)} 个尺寸，已拆分处理")
+    else:
+        print(f"  ✅ 修改成功！")
+
+Bug 2: core/engine.py:607-632 - 合并订单补差价分组无普通商品行时漏处理
+    问题：在 _process_merged_order 中，当合并订单的某个分组是补差价分组（is_price_diff=True）、备注含定制信息（no_print_reason=None）、且分组内没有普通商品行（regular_items_in_group 为空）时，不会创建任何 price_diff_updates，但 all_parsed_list 会被 extend。这导致：
+        - 补差价行的编码不会被修改
+        - 在 update_merchant_code 中，解析结果会创建新商品行而不是覆盖补差价行
+    修复方案：在 if regular_items_in_group: 前补充 else 分支：
+                            if regular_items_in_group:
+                        # ... 原有混合分组逻辑 ...
+                    else:
+                        # 没有普通商品行，所有解析结果分配给补差价行
+                        successful_parsed = [p for p in parsed_list if p.success]
+                        if successful_parsed:
+                            price_diff_updates.append({
+                                'tid': tid,
+                                'items': diff_items,
+                                'remark': group_remark,
+                                'ship': True,
+                                'parsed_list': successful_parsed,
+                            })
+                        else:
+                            price_diff_updates.append({
+                                'tid': tid,
+                                'items': diff_items,
+                                'remark': group_remark,
+                                'ship': True,
+                            })
+
+                    all_parsed_list.extend(parsed_list)
+
+Bug 3: adapters/fangguo/adapter.py:147 - 快递编码始终为空
+    问题：query_orders 中补充订单详情的条件不完整：
+        for order in orders:
+            if not order.shop_remark or not order.items:  # ← 没检查 current_cp_code
+                self._enrich_order_with_detail(order)
+    而 _enrich_order_with_detail 内部检查了三个字段：
+        if order.shop_remark and order.items and order.current_cp_code:
+            return order
+    后果：当订单的 shop_remark 和 items 都已填充但 current_cp_code 为空时（列表接口经常不返回快递编码），不会调用详情接口，导致 current_cp_code 始终为空字符串。
+        _update_express_for_order 中的 if order.current_cp_code == express_code 永远不相等，会重复调用快递更新接口。
+
+    修复方案：
+        for order in orders:
+            if not order.shop_remark or not order.items or not order.current_cp_code:
+                self._enrich_order_with_detail(order)
+
+Bug 4: core/parser.py:183 - 圆形现货尺寸未识别为现货
+    问题：识别现货编码时，正则只匹配矩形尺寸（数字x数字），不匹配圆形尺寸（圆直径80）：
+        if result.color_code == "标准" and re.match(r"^[\d.]+[xX×*][\d.]+(?:[圆直径圆形].*)?$", result.model_code):
+            result.is_stock = True
+    后果：当输入是圆形现货编码（如 吸水皮革-标准-圆直径80-花型;圆直径80）时，is_stock 不会被设为 True，后续可能错误地附加 CM 单位或处理为定制格式。
+    修复方案：
+        if result.color_code == "标准":
+            if re.match(r"^[\d.]+[xX×*][\d.]+(?:[圆直径圆形].*)?$", result.model_code) \
+               or re.match(r"^(?:圆|圆形|圆直径|直径)\d+(?:\.\d+)?$", result.model_code):
+                result.is_stock = True
+
+Bug 5: core/parser.py:172-185 - 编码格式判断缺少分号校验
+    问题：parse_remark 的"情况1"只检查 len(parts) >= 4，没有检查最后一段是否包含分号。而 extract_multiple_remarks 中的同类判断（line 466）有 ";" in parts[-1] 校验：
+        # parse_remark 中（缺少分号校验）
+        if "-" in text and not text.startswith("定制") and not text.startswith("现货"):
+            parts = text.split("-")
+            if len(parts) >= 4:  # ← 没检查分号
+                ...
+
+        # extract_multiple_remarks 中（有分号校验）
+        if "-" in text and not text.startswith("定制") and not text.startswith("现货"):
+            parts = text.split("-")
+            if len(parts) >= 4 and ";" in parts[-1]:  # ← 有检查
+    后果：像 双面格-标准-33x120-塞纳时光（无分号）这种非编码文本会被误判为编码格式，picture_code 错误地设为 塞纳时光 而不是 塞纳时光;33x120。
+    修复方案：在 parse_remark 中也加上分号校验：
+        if "-" in text and not text.startswith("定制") and not text.startswith("现货"):
+            parts = text.split("-")
+            if len(parts) >= 4 and ";" in parts[-1]:
+                ...
+
+
+二、死代码/冗余代码
+1. adapter.py:1142-1206 - _handle_gift_item 方法从未被调用   ---   直接删除该方法
+2. adapter.py:388 - expected_skus_set 变量从未被使用  ---   直径删除 expected_skus_set 行
+3. adapter.py:491-495 - valid_indices 重复定义   ---   删除重复定义
+4. engine.py:750-752 - 不可达的死代码   ---   删除line 750-752 的else分支
+
+
+三、修复完成总结
+🔴 高优先级 Bug 修复
+Bug 1 — 空列表访问 IndexError
+    文件：core/engine.py:366
+    修复：在访问 parsed_list[0].success 前增加 parsed_list and 判空，避免订单只有补差价行时触发 IndexError。
+
+Bug 2 — 合并订单补差价分组漏处理
+    文件：core/engine.py:633-651
+    修复：在 if regular_items_in_group: 后补充 else 分支，处理分组内没有普通商品行、只有补差价行的情况，将解析结果正确分配给补差价行而不是遗漏。
+
+Bug 3 — 快递编码始终为空导致重复请求
+    文件：adapters/fangguo/adapter.py:146
+    修复：在 query_orders 的详情补充条件中增加 not order.current_cp_code，确保快递编码为空时也会调用详情接口，避免后续重复调用快递更新接口。
+
+🟠 中优先级 Bug 修复
+Bug 4 — 圆形现货尺寸未识别为现货
+    文件：core/parser.py:182-187
+    修复：现货编码判断中新增圆形尺寸正则 ^(?:直径|圆|圆形|圆直径)\d+(?:\.\d+)?$，支持 直径30、圆30、圆形30、圆直径30 等格式正确识别为 is_stock=True。
+
+Bug 5 — 编码格式判断缺少分号校验
+    文件：core/parser.py:175
+    修复：在情况1（编码格式匹配）的条件中增加 ";" in parts[-1] 校验，与 extract_multiple_remarks 中的判断保持一致，避免非编码文本被误匹配。
+
+🟢 死代码清理
+    Issue	        文件	                                清理内容
+    Issue 6	    adapter.py	            删除从未被调用的 _handle_gift_item 方法（约65行死代码）
+    Issue 7	    adapter.py:388	        删除未使用的 expected_skus_set 变量
+    Issue 8	    adapter.py:491-495	    删除重复定义的 valid_indices 变量
+    Issue 9	    engine.py:769-771	    删除不可达的 else 死分支（前面已有相同判断并 return）

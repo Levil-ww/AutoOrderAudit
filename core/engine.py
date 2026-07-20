@@ -363,7 +363,7 @@ class AutoAuditEngine:
                 print(f"  ⏭️  跳过：订单所有商品行已作废")
                 self.stats["skipped"] += 1
             elif ok:
-                if parsed_list[0].success:
+                if parsed_list and parsed_list[0].success:
                     print(f"  ✅ 修改成功！新编码: {parsed_list[0].shop_mapping_sku}")
                     if len(parsed_list) > 1:
                         print(f"  📦 包含 {len(parsed_list)} 个尺寸，已拆分处理")
@@ -630,6 +630,25 @@ class AutoAuditEngine:
                                 'remark': group_remark,
                                 'ship': True,
                             })
+                    else:
+                        # 没有普通商品行，所有解析结果分配给补差价行
+                        successful_parsed = [p for p in parsed_list if p.success]
+                        if successful_parsed:
+                            print(f"        📝 补差价分组，{len(successful_parsed)} 条解析结果分配给补差价行")
+                            price_diff_updates.append({
+                                'tid': tid,
+                                'items': diff_items,
+                                'remark': group_remark,
+                                'ship': True,
+                                'parsed_list': successful_parsed,
+                            })
+                        else:
+                            price_diff_updates.append({
+                                'tid': tid,
+                                'items': diff_items,
+                                'remark': group_remark,
+                                'ship': True,
+                            })
 
                     all_parsed_list.extend(parsed_list)
                     
@@ -747,9 +766,6 @@ class AutoAuditEngine:
                     print(f"  ❌ 修改失败")
                     self.stats["failed"] += 1
                     self.stats["errors"].append(f"订单 {order.trade_id}: 接口返回失败")
-            else:
-                print(f"  ⏭️  跳过：所有分组均无法解析")
-                self.stats["skipped"] += 1
         except Exception as e:
             print(f"  ❌ 请求异常: {e}")
             self.stats["failed"] += 1
