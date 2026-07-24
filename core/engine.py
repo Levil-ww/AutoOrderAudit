@@ -278,11 +278,26 @@ class AutoAuditEngine:
             return
 
     def _is_price_difference_item(self, item: OrderItem) -> bool:
-        """判断商品行是否为补差价商品"""
+        """判断商品行是否为补差价商品
+
+        检测方式（任一满足即为补差价）：
+        1. 商品标题包含补差价关键词
+        2. shop_mapping_sku 为"定制-定制-补差价-不打印"
+        3. 商品行备注为"差价"、"补差价"或包含"差价不发货"/"不打印"等补差价特征
+        """
         if item.title:
             for keyword in _PRICE_DIFF_KEYWORDS:
                 if keyword in item.title:
                     return True
+        sku = item.shop_mapping_sku or ''
+        if '定制-定制-补差价-不打印' in sku:
+            return True
+        remark = item.shop_remark or ''
+        stripped = remark.strip()
+        if stripped in ('差价', '补差价'):
+            return True
+        if '差价不发货' in remark or '不打印' in remark or '不用发' in remark:
+            return True
         return False
 
     def _process_normal_order_logic(self, order: Order, price_diff_updates: list = None, parsed_list_override: list = None):

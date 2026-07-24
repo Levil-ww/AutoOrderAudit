@@ -457,6 +457,13 @@ class FangguoAdapter(ErpAdapter):
                     if not item_matched and item.shop_mapping_sku:
                         all_matched = False
                         break
+                
+                # 兜底：如果按 original_tid 分组匹配失败，尝试全局 SKU 集合匹配
+                # （新创建的手工单可能因ERP分配新oid导致original_tid变化，从而分组错误）
+                if not all_matched:
+                    current_sku_num_set = {(item.shop_mapping_sku, item.num) for item in valid_items if item.shop_mapping_sku}
+                    all_matched = current_sku_num_set == expected_sku_num_set
+                
                 is_already_correct = all_matched
             else:
                 # 普通订单：比较SKU和数量
@@ -542,6 +549,17 @@ class FangguoAdapter(ErpAdapter):
                             if item.original_tid == p.original_tid:
                                 matched_item_idx = idx
                                 match_method = "original_tid"
+                                break
+
+                # 兜底：如果按 original_tid 没匹配到，尝试按 SKU 匹配
+                # （新创建的手工单可能因ERP分配新oid导致original_tid变化）
+                if matched_item_idx is None:
+                    for idx in valid_indices:
+                        if idx not in used_item_indices:
+                            item = order.items[idx]
+                            if item.shop_mapping_sku == p.shop_mapping_sku and item.num == p.num:
+                                matched_item_idx = idx
+                                match_method = "sku"
                                 break
 
                 # 如果没有匹配到，按顺序使用未使用的有效商品行
@@ -1247,11 +1265,27 @@ class FangguoAdapter(ErpAdapter):
         return False
 
     def _is_price_difference_item(self, item: OrderItem) -> bool:
-        """判断商品行是否为补差价商品"""
+        """判断商品行是否为补差价商品
+
+        检测方式（任一满足即为补差价）：
+        1. 商品标题包含补差价关键词
+        2. shop_mapping_sku 为"定制-定制-补差价-不打印"
+        3. 商品行备注为"差价"、"补差价"或包含"差价不发货"/"不打印"等补差价特征
+        """
         if item.title:
             for keyword in self._PRICE_DIFF_KEYWORDS:
                 if keyword in item.title:
                     return True
+        sku = item.shop_mapping_sku or ''
+        clean_sku = re.sub(r'<[^>]+>', '', sku)
+        if clean_sku == '定制-定制-补差价-不打印':
+            return True
+        remark = item.shop_remark or ''
+        stripped = remark.strip()
+        if stripped in ('差价', '补差价'):
+            return True
+        if '差价不发货' in remark or '不打印' in remark or '不用发' in remark:
+            return True
         return False
 
     # -------------------------------------------------------------------
