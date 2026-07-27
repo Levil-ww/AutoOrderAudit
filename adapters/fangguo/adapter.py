@@ -6,7 +6,7 @@
 
 import re
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any, Optional
 
 import requests
@@ -407,11 +407,9 @@ class FangguoAdapter(ErpAdapter):
         # 对于只有赠品信息、没有有效商品解析的情况，不修改商品编码
         product_parsed_list = [p for p in effective_list if p and p.success]
 
-        # 获取期望的商品编码集合（包含数量）
-        expected_sku_num_set = {(p.shop_mapping_sku, p.num) for p in product_parsed_list}
-        
+        # 获取期望的商品编码计数（包含数量）
+        expected_sku_num_counts = Counter((p.shop_mapping_sku, p.num) for p in product_parsed_list)
 
-        
         # 判断是否为"只有补差价但应作为普通订单处理"的情况
         price_diff_items_count = sum(1 for item in order.items if self._is_price_difference_item(item))
         has_only_price_diff = price_diff_items_count > 0 and price_diff_items_count == len(order.items)
@@ -458,17 +456,17 @@ class FangguoAdapter(ErpAdapter):
                         all_matched = False
                         break
                 
-                # 兜底：如果按 original_tid 分组匹配失败，尝试全局 SKU 集合匹配
+                # 兜底：如果按 original_tid 分组匹配失败，尝试全局 SKU 计数匹配
                 # （新创建的手工单可能因ERP分配新oid导致original_tid变化，从而分组错误）
                 if not all_matched:
-                    current_sku_num_set = {(item.shop_mapping_sku, item.num) for item in valid_items if item.shop_mapping_sku}
-                    all_matched = current_sku_num_set == expected_sku_num_set
+                    current_sku_num_counts = Counter((item.shop_mapping_sku, item.num) for item in valid_items if item.shop_mapping_sku)
+                    all_matched = current_sku_num_counts == expected_sku_num_counts
                 
                 is_already_correct = all_matched
             else:
-                # 普通订单：比较SKU和数量
-                current_sku_num_set = {(item.shop_mapping_sku, item.num) for item in valid_items if item.shop_mapping_sku}
-                is_already_correct = current_sku_num_set == expected_sku_num_set
+                # 普通订单：比较SKU数量计数
+                current_sku_num_counts = Counter((item.shop_mapping_sku, item.num) for item in valid_items if item.shop_mapping_sku)
+                is_already_correct = current_sku_num_counts == expected_sku_num_counts
         
         if is_already_correct:
             # 检查补差价商品行是否也已经正确
@@ -581,7 +579,7 @@ class FangguoAdapter(ErpAdapter):
                     used_item_indices.add(matched_item_idx)
                 elif template_item:
                     # 超出原有效行数，创建新商品行
-                    new_item = self._build_new_item(order, p)
+                    new_item = self._build_new_item(order, p, template_item=template_item)
                 else:
                     # 没有模板，使用默认构造
                     new_item = self._build_default_item(order, p)
@@ -782,12 +780,13 @@ class FangguoAdapter(ErpAdapter):
                             new_item['filmGiftCode'] = ''
                             new_item['giftCodeName'] = None
                             new_item['filmGiftNum'] = 0
+                            new_item['shopRemark'] = ""
                             order_items.append(new_item)
                             used_item_indices.add(matched_diff_idx)
                             diff_matched += 1
                         else:
                             # 没有可覆盖的补差价行，创建新手工单
-                            new_item = self._build_new_item(order, p)
+                            new_item = self._build_new_item(order, p, template_item=template_item)
                             order_items.append(new_item)
 
                     # 剩余未匹配的补差价行：仅修改数量为1
@@ -818,6 +817,9 @@ class FangguoAdapter(ErpAdapter):
                             order_items.append(new_item)
                             used_item_indices.add(item_idx)
 
+        # 当构建的 order_items 中包含新创建的商品行（type==1）时，方果侧需要将
+        # allManualOrder 标记为 True，表示存在手工单行，否则平台可能不会在前端显示手工单。
+        has_manual_items = any(item.get('type') == 1 for item in order_items)
         payload = {
             "orderType": 0,
             "id": order.trade_id,
@@ -826,7 +828,7 @@ class FangguoAdapter(ErpAdapter):
             "factoryId": order.factory_id,
             "platform": 0,
             "platformDesc": "",
-            "allManualOrder": False,
+            "allManualOrder": True if has_manual_items else False,
             "sysTid": order.sys_tid,
             "tid": order.tid,
             "dfStatus": 0,
@@ -841,6 +843,13 @@ class FangguoAdapter(ErpAdapter):
 
 
 
+        # 调试输出：打印 payload 摘要，便于排查前端未显示的问题
+        try:
+            print(f"  ▶ 提交 saveProduct: allManualOrder={has_manual_items}, totalCount={len(order_items)}")
+            for i, it in enumerate(order_items[:6]):
+                print(f"    - item[{i}]: type={it.get('type')}, id={it.get('id')}, oid={it.get('oid')}, shopMappingSku={str(it.get('shopMappingSku'))[:60]}, num={it.get('num')}")
+        except Exception:
+            pass
         resp = self._session.post(fg_config.API_SAVE_PRODUCT, json=payload, timeout=30)
         resp.raise_for_status()
         result = resp.json()
@@ -878,7 +887,10 @@ class FangguoAdapter(ErpAdapter):
         # 合并订单优先使用子订单号（item.oid）和子订单备注
         tid = item.oid or order.tid
         origin_trade_id = item.order_id or order.trade_id
-        if parsed and parsed.shop_remark:
+        # 新建手工单（id 为 None）不携带任何备注，仅保留编码和数量
+        if item.id is None:
+            shop_remark = ""
+        elif parsed and parsed.shop_remark:
             shop_remark = parsed.shop_remark
         elif item.shop_remark:
             shop_remark = item.shop_remark
@@ -1012,17 +1024,44 @@ class FangguoAdapter(ErpAdapter):
         item['shopRemark'] = ""
         return item
 
-    def _build_new_item(self, order: Order, parsed: ParsedRemark) -> dict:
-        """超出原订单商品行数时，构建新商品行（所有标识字段置空，ERP创建新行）"""
+    def _build_new_item(self, order: Order, parsed: ParsedRemark, template_item: Optional[OrderItem] = None) -> dict:
+        """超出原订单商品行数时，构建新商品行。
+
+        当传入模板商品行时，优先复用其 originalSkuId / originalGoodsId，
+        这样新建的手工单行会继承原始 SKU 关联信息，避免 ERP 生成全新、无关联的商品行。
+
+        关键：新建商品行必须将 id 和 sys_oid 置空，否则 ERP 会将新行与模板行
+        视为同一商品行（id相同），导致后者覆盖前者，界面只显示一条。
+        """
         original_tid = parsed.original_tid if parsed else ""
-        item = self._build_order_item(
-            OrderItem(id=None, order_id=original_tid or order.trade_id,
-                      oid=original_tid or order.tid, sys_oid=None,
-                      original_sku_id=None, original_goods_id=None,
-                      title=None, merchandise_pic_path=None,
-                      price=0, num=parsed.num),
-            order, parsed,
-        )
+        if template_item:
+            source_item = OrderItem(
+                id=None,
+                order_id=template_item.order_id or order.trade_id,
+                oid=original_tid or template_item.oid or order.tid,
+                sys_oid=None,
+                original_sku_id=template_item.original_sku_id,
+                original_goods_id=template_item.original_goods_id,
+                title=template_item.title,
+                merchandise_pic_path=template_item.merchandise_pic_path,
+                price=template_item.price,
+                num=parsed.num,
+                sku_properties_name=template_item.sku_properties_name,
+            )
+        else:
+            source_item = OrderItem(
+                id=None,
+                order_id=original_tid or order.trade_id,
+                oid=original_tid or order.tid,
+                sys_oid=None,
+                original_sku_id=None,
+                original_goods_id=None,
+                title=None,
+                merchandise_pic_path=None,
+                price=0,
+                num=parsed.num,
+            )
+        item = self._build_order_item(source_item, order, parsed)
         item['shopMappingSku'] = f'<font color="red">{item["shopMappingSku"]}</font>'
         item['type'] = 1
         item['shopRemark'] = ""
@@ -1396,6 +1435,8 @@ class FangguoAdapter(ErpAdapter):
                         "shopRemark": item.shop_remark or "",
                     })
         
+        # 同样地：当存在新建商品行（type==1）时，将 allManualOrder 标记为 True
+        has_manual_items = any(item.get('type') == 1 for item in order_items)
         payload = {
             "orderType": 0,
             "id": order.trade_id,
@@ -1404,7 +1445,7 @@ class FangguoAdapter(ErpAdapter):
             "factoryId": order.factory_id,
             "platform": 0,
             "platformDesc": "",
-            "allManualOrder": False,
+            "allManualOrder": True if has_manual_items else False,
             "sysTid": order.sys_tid,
             "tid": order.tid,
             "dfStatus": 0,
@@ -1417,6 +1458,13 @@ class FangguoAdapter(ErpAdapter):
             "shopId": "",
         }
         
+        # 调试输出：打印 payload 摘要，便于排查前端未显示的问题
+        try:
+            print(f"  ▶ 提交 saveProduct: allManualOrder={has_manual_items}, totalCount={len(order_items)}")
+            for i, it in enumerate(order_items[:6]):
+                print(f"    - item[{i}]: type={it.get('type')}, id={it.get('id')}, oid={it.get('oid')}, shopMappingSku={str(it.get('shopMappingSku'))[:60]}, num={it.get('num')}")
+        except Exception:
+            pass
         resp = self._session.post(fg_config.API_SAVE_PRODUCT, json=payload, timeout=30)
         resp.raise_for_status()
         result = resp.json()

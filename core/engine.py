@@ -27,6 +27,7 @@ _SKIP_KEYWORDS = [
     "仓库发",
     "工厂发",
     "补发",
+    "正常发",
 ]
 
 
@@ -132,14 +133,9 @@ class AutoAuditEngine:
     def _is_price_difference_order(self, order: Order) -> bool:
         """
         判断订单是否为补差价订单
-        通过检查商品行标题是否包含补差价相关关键字
+        通过检查每个商品行是否满足补差价商品条件。
         """
-        for item in order.items:
-            if item.title:
-                for keyword in _PRICE_DIFF_KEYWORDS:
-                    if keyword in item.title:
-                        return True
-        return False
+        return any(self._is_price_difference_item(item) for item in order.items)
 
     @staticmethod
     def _is_no_ship_remark(remark: str) -> bool:
@@ -640,14 +636,25 @@ class AutoAuditEngine:
                 groups[tid] = {
                     'items': [],
                     'remark': '',
+                    'price_diff_remark': '',
+                    'regular_remark': '',
                     'is_price_diff': False,
                 }
             groups[tid]['items'].append(item)
             # 确保 item.original_tid 与分组键一致（处理空值情况）
             item.original_tid = tid
-            # 收集该组的备注（优先使用商品行级别的备注）
-            if item.shop_remark:
-                groups[tid]['remark'] = item.shop_remark
+            # 收集该组的备注：区分补差价商品行和普通商品行。
+            # 合并订单里 ERP 常把订单级备注复制到所有商品行，
+            # 若直接用普通商品行的订单级备注覆盖补差价行备注，
+            # 会导致补差价行被错误解析并改编码。
+            # 此外，手工单行（type==1）的备注常被ERP自动关联为订单级备注，
+            # 若以此作为解析来源，会导致反复创建手工单（反复增值）。
+            is_manual_item = item.raw and item.raw.get('type') == 1
+            if item.shop_remark and not is_manual_item:
+                if self._is_price_difference_item(item):
+                    groups[tid]['price_diff_remark'] = item.shop_remark
+                else:
+                    groups[tid]['regular_remark'] = item.shop_remark
             # 检测是否为补差价分组
             if self._is_price_difference_item(item):
                 groups[tid]['is_price_diff'] = True
@@ -662,7 +669,12 @@ class AutoAuditEngine:
         gift_no_ship_tids = []
         
         for tid, group in groups.items():
-            group_remark = group['remark']
+            # 补差价分组必须优先使用补差价商品行的备注，避免被普通商品行上的
+            # 订单级备注覆盖后错误解析；普通分组则优先使用普通商品行备注。
+            if group['is_price_diff']:
+                group_remark = group['price_diff_remark'] or group['regular_remark']
+            else:
+                group_remark = group['regular_remark'] or group['price_diff_remark']
             is_price_diff = group['is_price_diff']
             print(f"    原始订单 {tid[:16]}...: 备注='{group_remark[:40]}...' {'(补差价)' if is_price_diff else ''}")
             
@@ -703,12 +715,13 @@ class AutoAuditEngine:
                         material_matcher=material_matcher,
                     )
                     
-                    if not parsed_list:
+                    if not parsed_list or not any(p.success for p in parsed_list):
                         print(f"        ⏭️  跳过：无法解析备注")
                         continue
                     
                     for p in parsed_list:
                         p.original_tid = tid
+                        p.shop_remark = ""
 
                     # 如果分组内同时有普通商品行和补差价行（混合分组）
                     if regular_items_in_group:
@@ -783,7 +796,7 @@ class AutoAuditEngine:
                     material_matcher=material_matcher,
                 )
                 
-                if not parsed_list:
+                if not parsed_list or not any(p.success for p in parsed_list):
                     print(f"      ⏭️  跳过：无法解析备注")
                     continue
                 
