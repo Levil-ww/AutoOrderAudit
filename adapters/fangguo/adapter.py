@@ -6,6 +6,7 @@
 
 import re
 import json
+import uuid as _uuid
 from collections import Counter, defaultdict
 from typing import Any, Optional
 
@@ -407,6 +408,10 @@ class FangguoAdapter(ErpAdapter):
         # 对于只有赠品信息、没有有效商品解析的情况，不修改商品编码
         product_parsed_list = [p for p in effective_list if p and p.success]
 
+        # 辅助：清理 HTML 高亮标签（手工单行的 shopMappingSku 会被 ERP 带上 <font color="red">）
+        def _clean_sku(sku: str) -> str:
+            return re.sub(r'<[^>]+>', '', sku or '')
+
         # 获取期望的商品编码计数（包含数量）
         expected_sku_num_counts = Counter((p.shop_mapping_sku, p.num) for p in product_parsed_list)
 
@@ -449,7 +454,7 @@ class FangguoAdapter(ErpAdapter):
                     parsed_list_for_tid = parsed_by_tid.get(item.original_tid, [])
                     # 当前商品行只要能匹配该子订单的任一解析结果即可
                     item_matched = any(
-                        item.shop_mapping_sku == p.shop_mapping_sku and item.num == p.num
+                        _clean_sku(item.shop_mapping_sku) == p.shop_mapping_sku and item.num == p.num
                         for p in parsed_list_for_tid
                     )
                     if not item_matched and item.shop_mapping_sku:
@@ -459,13 +464,13 @@ class FangguoAdapter(ErpAdapter):
                 # 兜底：如果按 original_tid 分组匹配失败，尝试全局 SKU 计数匹配
                 # （新创建的手工单可能因ERP分配新oid导致original_tid变化，从而分组错误）
                 if not all_matched:
-                    current_sku_num_counts = Counter((item.shop_mapping_sku, item.num) for item in valid_items if item.shop_mapping_sku)
+                    current_sku_num_counts = Counter((_clean_sku(item.shop_mapping_sku), item.num) for item in valid_items if item.shop_mapping_sku)
                     all_matched = current_sku_num_counts == expected_sku_num_counts
-                
+
                 is_already_correct = all_matched
             else:
                 # 普通订单：比较SKU数量计数
-                current_sku_num_counts = Counter((item.shop_mapping_sku, item.num) for item in valid_items if item.shop_mapping_sku)
+                current_sku_num_counts = Counter((_clean_sku(item.shop_mapping_sku), item.num) for item in valid_items if item.shop_mapping_sku)
                 is_already_correct = current_sku_num_counts == expected_sku_num_counts
         
         if is_already_correct:
@@ -480,7 +485,7 @@ class FangguoAdapter(ErpAdapter):
                                 break
                         else:
                             expected_sku = "定制-定制-补差价-不打印"
-                            if item.shop_mapping_sku != expected_sku or item.num != 1:
+                            if _clean_sku(item.shop_mapping_sku) != expected_sku or item.num != 1:
                                 price_diff_already_correct = False
                                 break
                     if not price_diff_already_correct:
@@ -494,13 +499,13 @@ class FangguoAdapter(ErpAdapter):
                         if self._is_gift_item(item):
                             item_tid = item.original_tid or ""
                             if item_tid in gift_no_ship_tids:
-                                if item.shop_mapping_sku != "定制-定制-补差价-不打印":
+                                if _clean_sku(item.shop_mapping_sku) != "定制-定制-补差价-不打印":
                                     gift_no_ship_already_correct = False
                                     break
                 elif gift_no_ship:
                     for item in order.items:
                         if self._is_gift_item(item):
-                            if item.shop_mapping_sku != "定制-定制-补差价-不打印":
+                            if _clean_sku(item.shop_mapping_sku) != "定制-定制-补差价-不打印":
                                 gift_no_ship_already_correct = False
                                 break
                 
@@ -555,7 +560,7 @@ class FangguoAdapter(ErpAdapter):
                     for idx in valid_indices:
                         if idx not in used_item_indices:
                             item = order.items[idx]
-                            if item.shop_mapping_sku == p.shop_mapping_sku and item.num == p.num:
+                            if _clean_sku(item.shop_mapping_sku) == p.shop_mapping_sku and item.num == p.num:
                                 matched_item_idx = idx
                                 match_method = "sku"
                                 break
@@ -1012,7 +1017,11 @@ class FangguoAdapter(ErpAdapter):
         }
 
     def _build_default_item(self, order: Order, parsed: ParsedRemark) -> dict:
-        """没有商品行时的默认构造（新建行，ERP会创建新行）"""
+        """没有商品行时的默认构造（新建行，ERP会创建新行）
+
+        优先从订单已有商品行中选取一个作为复制源（sourceSysOid），
+        使新建的手工单行能继承平台订单关联，支持抖音扫描发货。
+        """
         original_tid = parsed.original_tid if parsed else ""
         item = self._build_order_item(
             OrderItem(id=None, order_id=original_tid or order.trade_id,
@@ -1022,6 +1031,15 @@ class FangguoAdapter(ErpAdapter):
         item['shopMappingSku'] = f'<font color="red">{item["shopMappingSku"]}</font>'
         item['type'] = 1
         item['shopRemark'] = ""
+        item['uuid'] = item.get('uuid') or str(_uuid.uuid4())
+        source = None
+        for it in order.items:
+            if not it.is_void and it.sys_oid and not self._is_gift_item(it) and not self._is_price_difference_item(it):
+                source = it
+                break
+        if source and source.sys_oid:
+            item['sourceSysOid'] = source.sys_oid
+            item['isCopy'] = True
         return item
 
     def _build_new_item(self, order: Order, parsed: ParsedRemark, template_item: Optional[OrderItem] = None) -> dict:
@@ -1065,6 +1083,10 @@ class FangguoAdapter(ErpAdapter):
         item['shopMappingSku'] = f'<font color="red">{item["shopMappingSku"]}</font>'
         item['type'] = 1
         item['shopRemark'] = ""
+        item['uuid'] = item.get('uuid') or str(_uuid.uuid4())
+        if template_item and template_item.sys_oid:
+            item['sourceSysOid'] = template_item.sys_oid
+            item['isCopy'] = True
         return item
 
     def _build_gift_item(self, item: OrderItem, order: Order, material_code: str, gift_name: str, gift_num: int, is_new: bool = False, original_tid: str = "", shop_remark: str = "") -> dict:
@@ -1111,7 +1133,7 @@ class FangguoAdapter(ErpAdapter):
         trade_id = original_tid or item.order_id or order.trade_id
         remark = shop_remark or item.shop_remark or order.shop_remark or ""
 
-        return {
+        result = {
             "materialId": None,
             "materialCode": gift_material,
             "materialCodeName": None,
@@ -1228,6 +1250,12 @@ class FangguoAdapter(ErpAdapter):
             "check": True,
             "loaded": True,
         }
+        if is_new:
+            result['uuid'] = str(_uuid.uuid4())
+            if item and item.sys_oid:
+                result['sourceSysOid'] = item.sys_oid
+                result['isCopy'] = True
+        return result
 
     _PRICE_DIFF_KEYWORDS = ["补差价专拍", "差价专用", "少几元拍几个"]
 
@@ -1258,6 +1286,11 @@ class FangguoAdapter(ErpAdapter):
         # 方式4：检查 price 为0 且标题包含"垫"（常见赠品）
         # 排除明显的非赠品关键词（桌垫/餐垫/杯垫/地垫/鼠标垫等普通商品）
         if item.price == 0 and '垫' in title:
+            # 手工单行/复制创建行（type==1）且商家编码不是赠品编码 → 不视为赠品
+            if item.raw and item.raw.get('type') == 1:
+                clean_sku = re.sub(r'<[^>]+>', '', sku)
+                if clean_sku and not self._is_gift_sku(clean_sku):
+                    return False
             non_gift_keywords = ['桌垫', '餐垫', '杯垫', '地垫', '鼠标垫', '脚垫']
             if not any(kw in title for kw in non_gift_keywords):
                 return True
