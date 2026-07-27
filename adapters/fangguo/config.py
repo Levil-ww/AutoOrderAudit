@@ -29,6 +29,7 @@ API_SAVE_PRODUCT = f"{BASE_URL}/fgapp/order/shop/trade/order/saveProduct"
 API_ORDER_DETAIL = f"{BASE_URL}/fgapp/order/shop/trade/getDetailsByPage"
 API_MATERIAL_LIST = f"{BASE_URL}/fgapp/order/shop/trade/order/materialColorsNew"
 API_UPDATE_LOGISTICS = f"{BASE_URL}/fgapp/order/shop/trade/logistics/update"
+API_DELETE_ORDER = f"{BASE_URL}/fgapp/order/shop/trade/order/deleteTradeOrder"
 
 # ========== 查询配置 ==========
 QUERY_STATUS = 1       # 1=待整理
@@ -57,6 +58,7 @@ MATERIAL_MAP = {
     "镜面革": "镜面皮革",
     "镜面": "镜面皮革",
     "镜面皮革卷材": "镜面皮革卷材",
+    "高回弹": "镜面皮革卷材",
     "泡泡绒兔毛": "泡泡绒兔毛",
     "软玻璃" : "软玻璃",
     "丝圈": "丝圈",

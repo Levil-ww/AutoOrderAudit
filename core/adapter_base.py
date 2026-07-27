@@ -66,7 +66,7 @@ class ErpAdapter(ABC):
         ...
 
     @abstractmethod
-    def update_merchant_code(self, order: Order, parsed: "ParsedRemark") -> bool:
+    def update_merchant_code(self, order: Order, parsed: "ParsedRemark", *args, **kwargs) -> bool:
         """修改订单中商品的商家编码，返回是否成功"""
         ...
 

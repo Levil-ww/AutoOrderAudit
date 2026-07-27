@@ -3,6 +3,7 @@
 通用的自动审单流程，通过 ErpAdapter 接口与具体 ERP 解耦。
 """
 
+import re
 import time
 from datetime import datetime
 from typing import Callable, Optional
@@ -286,7 +287,8 @@ class AutoAuditEngine:
                 if keyword in item.title:
                     return True
         sku = item.shop_mapping_sku or ''
-        if '定制-定制-补差价-不打印' in sku:
+        clean_sku = re.sub(r'<[^>]+>', '', sku)
+        if clean_sku == '定制-定制-补差价-不打印':
             return True
         remark = item.shop_remark or ''
         stripped = remark.strip()
@@ -431,6 +433,7 @@ class AutoAuditEngine:
                     print(f"  🔶 DRY RUN: 补差价订单 -> {action}")
             if gift_no_ship:
                 print(f"  🔶 DRY RUN: 赠品不发货 -> 修改赠品行编码为'定制-定制-补差价-不打印'")
+            self._update_skip_cache(order, expected_key)
             self.stats["success"] += 1
             return
 
@@ -649,8 +652,11 @@ class AutoAuditEngine:
             # 会导致补差价行被错误解析并改编码。
             # 此外，手工单行（type==1）的备注常被ERP自动关联为订单级备注，
             # 若以此作为解析来源，会导致反复创建手工单（反复增值）。
+            # 赠品行同样会被ERP复制订单级备注，若以其备注作为解析来源，
+            # 会导致解析出其他分组的商品信息并创建重复行。
             is_manual_item = item.raw and item.raw.get('type') == 1
-            if item.shop_remark and not is_manual_item:
+            is_gift_item = self.adapter._is_gift_item(item)
+            if item.shop_remark and not is_manual_item and not is_gift_item:
                 if self._is_price_difference_item(item):
                     groups[tid]['price_diff_remark'] = item.shop_remark
                 else:
