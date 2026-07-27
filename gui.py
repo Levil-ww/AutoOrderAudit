@@ -257,7 +257,7 @@ class TextRedirector(io.StringIO):
 class AutoAuditGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("方果ERP · 自动审单工具V2.1")
+        self.root.title("方果ERP · 自动审单工具V2.2")
         self.root.geometry("950x720")
         self.root.resizable(True, True)
         self.root.configure(bg=COLORS["bg"])
@@ -349,7 +349,7 @@ class AutoAuditGUI:
         mode_fg = COLORS["warning"] if DRY_RUN else COLORS["success"]
         self._make_badge(badge_frame, mode_text, mode_bg, mode_fg).pack(side=tk.RIGHT, padx=(6, 0))
 
-        self._make_badge(badge_frame, "V2.1", COLORS["info_bg"], COLORS["info"]).pack(side=tk.RIGHT)
+        self._make_badge(badge_frame, "V2.2", COLORS["info_bg"], COLORS["info"]).pack(side=tk.RIGHT)
 
     def _make_badge(self, parent, text, bg, fg):
         return tk.Label(
@@ -1123,7 +1123,7 @@ class ExpressConfigDialog:
         # 说明文字
         tk.Label(
             container,
-            text="• 备注关键词优先级高于省份规则\\n• 下方可修改各省份默认快递，也可添加新的快递公司",
+            text="• 备注关键词优先级高于省份规则\n• 下方可修改各省份默认快递，也可添加新的快递公司",
             font=(FONT, 9),
             bg=COLORS["card_bg"], fg=COLORS["label_fg"],
             justify=tk.LEFT,
@@ -1301,7 +1301,7 @@ class ExpressConfigDialog:
         item = selected[0]
         values = self.express_tree.item(item, "values")
         name = values[0]
-        if messagebox.askyesno("确认删除", f"确定删除快递类型 '{name}' 吗？\\n（使用该快递的省份规则也会被清除）", parent=self.dialog):
+        if messagebox.askyesno("确认删除", f"确定删除快递类型 '{name}' 吗？\n（使用该快递的省份规则也会被清除）", parent=self.dialog):
             ec.remove_express_type(name)
             self._refresh_express_list(ec)
             # 刷新省份页的下拉框需要重建，简单处理是提示用户重新打开
