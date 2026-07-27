@@ -42,6 +42,33 @@ def test_price_diff_detection():
         result = engine._is_price_difference_order(order)
         status = '✅' if result == expected else '❌'
         print(f"{status} 标题='{title}' -> 检测结果={result}, 期望={expected}")
+
+    # 额外回归测试：补差价行应当同时支持 SKU 和 shop_remark 识别
+    extra_cases = [
+        ('定制-定制-补差价-不打印', '', True),
+        ('', '差价', True),
+        ('', '补差价', True),
+    ]
+    for sku, remark, expected in extra_cases:
+        order = Order(
+            id='test',
+            trade_id='test_order',
+            tid='test_order',
+            shop_remark='',
+        )
+        order.items.append(OrderItem(
+            id='item_sku',
+            order_id='test_order',
+            oid='test_order',
+            title='普通商品标题',
+            shop_mapping_sku=sku,
+            shop_remark=remark,
+            num=1,
+            price=1.0,
+        ))
+        result = engine._is_price_difference_order(order)
+        status = '✅' if result == expected else '❌'
+        print(f"{status} SKU='{sku}' remark='{remark}' -> 检测结果={result}, 期望={expected}")
     
     print()
 
@@ -519,6 +546,85 @@ def test_mixed_order_price_diff_with_remark():
     print()
 
 
+def test_merged_order_price_diff_remark_not_overwritten():
+    """合并订单中，补差价分组的备注不应被普通商品行的订单级备注覆盖。
+
+    场景：子订单A是混合分组，包含
+      - 补差价商品行，商品行备注为 '补的差价'
+      - 普通商品行，商品行备注为子订单B的长备注（ERP常把订单级备注复制到所有行）
+    期望：补差价分组使用 '补的差价' 作为分组备注，补差价行仅修改数量为1，
+          不会被解析成普通商品编码。
+    """
+    print('=' * 80)
+    print('测试十二：合并订单补差价分组备注不被普通商品行备注覆盖')
+    print('=' * 80)
+
+    adapter = FangguoAdapter()
+    engine = AutoAuditEngine(adapter, dry_run=True)
+
+    long_remark = (
+        "定制双面革蝴蝶契约;31x194cm-1张，52x59cm-2张，26x93cm-1张，"
+        "现货双面革青黛花卷;直径140cm-1张，直径90cm-1张，"
+        "定制吸水皮革克罗印花;57.5x170cm-1张，44x57.5cm-1张，"
+        "57.5x239.5cm裁剪有图-1张，共计9张"
+    )
+
+    order = Order(
+        id='test',
+        trade_id='A&B',
+        tid='A&B',
+        shop_remark=long_remark,
+    )
+
+    # 子订单A：补差价行 + 普通商品行（普通商品行备注被ERP复制为长备注）
+    order.items.append(OrderItem(
+        id='item_a_diff',
+        order_id='test_order_012',
+        oid='A',
+        title='花沫 补运费专拍 补差价专拍 少几元拍几个',
+        num=2,
+        price=1.0,
+        shop_remark='补的差价',
+        original_tid='A',
+    ))
+    order.items.append(OrderItem(
+        id='item_a_regular',
+        order_id='test_order_012',
+        oid='A',
+        title='轻奢高级感法式皮革桌垫电视柜垫',
+        num=1,
+        price=52.8,
+        shop_remark=long_remark,
+        original_tid='A',
+    ))
+
+    # 子订单B：普通商品行，长备注
+    order.items.append(OrderItem(
+        id='item_b_regular',
+        order_id='test_order_012',
+        oid='B',
+        title='法式高级感客餐厅圆桌桌垫',
+        num=1,
+        price=88.0,
+        shop_remark=long_remark,
+        original_tid='B',
+    ))
+
+    print(f"订单号: {order.trade_id}")
+    print(f"补差价商品行备注: '{order.items[0].shop_remark}'")
+    print(f"普通商品行备注长度: {len(order.items[1].shop_remark)}")
+    print()
+
+    engine.stats = {"total": 0, "success": 0, "skipped": 0, "failed": 0, "errors": [], "cancelled": 0}
+    material_map = adapter.material_map
+    material_matcher = adapter.get_material_matcher()
+    engine._process_merged_order(order, material_map, material_matcher)
+
+    assert engine.stats['success'] == 1, f"期望成功处理1个订单，实际success={engine.stats['success']}, skipped={engine.stats['skipped']}"
+    print('✅ 测试通过：补差价分组备注未被普通商品行备注覆盖')
+    print()
+
+
 def test_merged_order_price_diff_empty_remark():
     """测试十一：合并订单补差价分组备注为空 -> 编码改为不打印、数量1"""
     print('=' * 80)
@@ -598,8 +704,9 @@ if __name__ == '__main__':
     test_price_diff_no_print_engine_flow()
     test_merged_order_price_diff_no_print()
     test_mixed_order_price_diff_with_remark()
+    test_merged_order_price_diff_remark_not_overwritten()
     test_merged_order_price_diff_empty_remark()
-    
+
     print('=' * 80)
     print('🎉 所有测试通过！')
     print('=' * 80)
