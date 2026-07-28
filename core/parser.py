@@ -193,11 +193,18 @@ def parse_remark(
             result.num = _extract_qty(text)
             result.success = True
             # 现货编码特征：color="标准" 且 model为纯尺寸（数字x数字 或 直径/圆形尺寸），无cm/CM
-            if result.color_code == "标准" and (
-                re.match(r"^[\d.]+[xX×*][\d.]+(?:[圆直径圆形].*)?$", result.model_code)
-                or re.match(r"^(?:直径|圆|圆形|圆直径)\d+(?:\.\d+)?$", result.model_code)
-            ):
-                result.is_stock = True
+            # 同时检查 picture_code 的尺寸部分也不带 cm/CM 单位
+            if result.color_code == "标准":
+                model_is_stock = bool(
+                    re.match(r"^[\d.]+[xX×*][\d.]+(?:[圆直径圆形].*)?$", result.model_code)
+                    or re.match(r"^(?:直径|圆|圆形|圆直径)\d+(?:\.\d+)?$", result.model_code)
+                )
+                pic_has_cm = False
+                if ";" in result.picture_code:
+                    pic_size_part = result.picture_code.split(";", 1)[1]
+                    pic_has_cm = bool(re.search(r"(cm|CM|厘米)", pic_size_part))
+                if model_is_stock and not pic_has_cm:
+                    result.is_stock = True
             return result
 
     # 情况2：解析备注
@@ -995,7 +1002,12 @@ def _parse_simple(body: str, result: ParsedRemark, is_custom: bool,
     return result
 
 
-def _parse_material(text, result, material_map, material_matcher=None):
+def _parse_material(
+    text: str,
+    result: ParsedRemark,
+    material_map: dict[str, str],
+    material_matcher: Optional[Callable[[str], tuple[Optional[str], str]]] = None,
+) -> None:
     """从文本中提取材质信息"""
     text = text.strip()
     if not text:
@@ -1088,6 +1100,9 @@ def _extract_qty(text: str) -> int:
 def _extract_gift(text: str) -> tuple[str, int]:
     """
     从文本中提取赠品信息，返回 (gift_name, gift_num)
+    
+    注意：此函数已被 _extract_multiple_gifts 替代，仅保留用于向后兼容。
+    主业务流程请使用 _extract_multiple_gifts。
     
     支持的格式：
     - "送防滑垫一张" → ("防滑垫", 1)
@@ -1920,21 +1935,28 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
         else:
             # 花型名相同或没有花型名，是同花型的不同尺寸
             # 为每个尺寸创建独立段，但保留完整的花型信息
-            # 提取共同的花型名
+            # 提取第一个分号前的完整前缀（包含定制/现货 + 材质 + 花型），供第一个段使用
+            full_prefix = ""
             common_pattern = ""
             if semi_positions:
                 first_semi = semi_positions[0]
-                # 从开始到第一个分号，提取花型名
-                pattern_text = text[:first_semi].strip()
-                # 如果包含"定制"，从"定制"开始处理
+                # 从开始到第一个分号，作为完整前缀
+                full_prefix = text[:first_semi].strip()
+                # 提取花型名（去掉定制/现货和材质）
+                pattern_text = full_prefix
                 custom_pos = pattern_text.find("定制")
+                stock_pos = pattern_text.find("现货")
                 if custom_pos != -1:
                     pattern_text = pattern_text[custom_pos:]
-                if pattern_text.startswith("定制"):
+                elif stock_pos != -1:
+                    pattern_text = pattern_text[stock_pos:]
+                if pattern_text.startswith("定制") or pattern_text.startswith("现货"):
                     for key in ["双面革", "吸水皮革", "双面格", "镜面皮革", "丝圈", "软玻璃"]:
                         if key in pattern_text:
-                            common_pattern = pattern_text.replace("定制", "").replace(key, "").strip()
+                            common_pattern = pattern_text.replace("定制", "").replace("现货", "").replace(key, "").strip()
                             break
+                    else:
+                        common_pattern = pattern_text.replace("定制", "").replace("现货", "").strip()
             
             for i, (size_start, size_end) in enumerate(all_sizes_pos):
                 # 找到该尺寸前面的分号
@@ -1951,6 +1973,11 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
                 
                 # 提取该尺寸的完整描述（从尺寸开始到下一个尺寸开始）
                 size_desc = text[size_start:next_size_start].strip()
+                
+                # 先去掉数量汇总信息（必须在单个数量之前，避免"共2张"→"共"残留）
+                size_desc = re.sub(r'总?共(?:计)?\d+[张个件套米]', '', size_desc).strip()
+                size_desc = re.sub(r'总?共(?:计)?[一二两三四五六七八九十]+[张个件套米]', '', size_desc).strip()
+                size_desc = _RE_QTY_SUMMARY.sub("", size_desc).strip()
                 
                 size_desc = re.sub(r"[-*×]\d+[张个件套米]", "", size_desc).strip()
                 size_desc = re.sub(r"\d+[张个件套米]", "", size_desc).strip()
@@ -1972,7 +1999,11 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
                         prefix_text = text[comma_after_prev + 1:size_start].strip().strip("-;,、")
                         size_desc = f"{prefix_text}{size_desc}"
                 
-                if common_pattern:
+                if i == 0 and full_prefix:
+                    # 第一个段使用完整前缀（包含定制/现货 + 材质 + 花型）
+                    segment = f"{full_prefix};{size_desc}"
+                elif common_pattern:
+                    # 后续段使用花型名，材质由上层继承
                     segment = f"{common_pattern};{size_desc}"
                 else:
                     segment = size_desc
@@ -2167,12 +2198,14 @@ def _clean_segment(segment: str) -> str:
     if gift_pos != -1:
         segment = segment[:gift_pos].strip()
     
+    # 先去掉数量汇总信息（如"共计2张"、"共三张"、"总共2张"），必须在单个数量之前
+    segment = re.sub(r'总?共(?:计)?\d+[张个件套米]', '', segment).strip()
+    segment = re.sub(r'总?共(?:计)?[一二两三四五六七八九十]+[张个件套米]', '', segment).strip()
+    segment = _RE_QTY_SUMMARY.sub("", segment).strip()
+    
     # 去掉数量标记（如"-1张"）
     segment = re.sub(r"[-*×]\d+[张个件套米]", "", segment).strip()
     segment = re.sub(r"\d+[张个件套米]", "", segment).strip()
-    
-    # 去掉数量汇总信息（如"共计2张"、"共三张"）
-    segment = _RE_QTY_SUMMARY.sub("", segment).strip()
     
     # 过滤掉"到货返xx"这种无关备注
     segment = _RE_ARRIVAL_REFUND.sub("", segment).strip()

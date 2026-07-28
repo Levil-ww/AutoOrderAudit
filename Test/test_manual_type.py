@@ -61,7 +61,7 @@ def test_build_gift_item_type(adapter, base_order):
     gift_new = adapter._build_gift_item(item, base_order, '吸水皮革', '圆垫', 1, is_new=True)
     gift_update = adapter._build_gift_item(item, base_order, '吸水皮革', '圆垫', 1, is_new=False)
     assert gift_new['type'] == 1
-    assert gift_update['type'] == 0
+    assert gift_update['type'] == 1
 
 
 def test_build_order_item_keeps_existing_type(adapter, base_order, parsed):

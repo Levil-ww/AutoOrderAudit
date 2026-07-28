@@ -318,51 +318,51 @@ class FangguoAdapter(ErpAdapter):
         if not order.items:
             items = detail.get("orderItems") or detail.get("items") or []
             for it in items:
-                    is_void = it.get("discardStatus") or it.get("cancelStatus") or it.get("isVoid") or False
-                    refund_status = it.get("refundStatus") or it.get("refundStatusDesc") or ""
-                    if isinstance(is_void, int):
-                        is_void = is_void != 0
-                    if isinstance(refund_status, int):
-                        refund_status = refund_status != 0
-                    if isinstance(refund_status, str):
-                        is_void = is_void or ("已退款" in refund_status)
-                    
-                    item_remark = self._extract_field(it, [
-                        "shopRemark", "sellerRemark", "remark",
-                        "备注", "卖家备注", "shop_remark",
-                    ])
-                    
-                    # 优先选择不包含&的子订单号
-                    tid_val = str(it.get("tid") or "")
-                    oid_val = str(it.get("oid") or "")
-                    sys_oid_val = str(it.get("sysOid") or "")
-                    if tid_val and "&" not in tid_val:
-                        original_tid = tid_val
-                    elif oid_val and "&" not in oid_val:
-                        original_tid = oid_val
-                    elif sys_oid_val and "&" not in sys_oid_val:
-                        original_tid = sys_oid_val
-                    else:
-                        original_tid = tid_val or oid_val or sys_oid_val
-                    
-                    order.items.append(OrderItem(
-                        id=str(it.get("id") or ""),
-                        order_id=str(it.get("orderId") or order.trade_id),
-                        sys_oid=str(it.get("sysOid") or ""),
-                        oid=str(it.get("oid") or order.tid),
-                        title=str(it.get("title") or ""),
-                        sku_properties_name=str(it.get("skuPropertiesName") or ""),
-                        shop_mapping_sku=str(it.get("shopMappingSku") or ""),
-                        original_sku_id=str(it.get("originalSkuId") or ""),
-                        original_goods_id=str(it.get("originalGoodsId") or ""),
-                        merchandise_pic_path=str(it.get("merchandisePicPath") or ""),
-                        num=int(it.get("num") or 1),
-                        price=float(it.get("price") or 0),
-                        is_void=bool(is_void),
-                        raw=it,
-                        shop_remark=item_remark,
-                        original_tid=original_tid,
-                    ))
+                is_void = it.get("discardStatus") or it.get("cancelStatus") or it.get("isVoid") or False
+                refund_status = it.get("refundStatus") or it.get("refundStatusDesc") or ""
+                if isinstance(is_void, int):
+                    is_void = is_void != 0
+                if isinstance(refund_status, int):
+                    refund_status = refund_status != 0
+                if isinstance(refund_status, str):
+                    is_void = is_void or ("已退款" in refund_status)
+                
+                item_remark = self._extract_field(it, [
+                    "shopRemark", "sellerRemark", "remark",
+                    "备注", "卖家备注", "shop_remark",
+                ])
+                
+                # 优先选择不包含&的子订单号
+                tid_val = str(it.get("tid") or "")
+                oid_val = str(it.get("oid") or "")
+                sys_oid_val = str(it.get("sysOid") or "")
+                if tid_val and "&" not in tid_val:
+                    original_tid = tid_val
+                elif oid_val and "&" not in oid_val:
+                    original_tid = oid_val
+                elif sys_oid_val and "&" not in sys_oid_val:
+                    original_tid = sys_oid_val
+                else:
+                    original_tid = tid_val or oid_val or sys_oid_val
+                
+                order.items.append(OrderItem(
+                    id=str(it.get("id") or ""),
+                    order_id=str(it.get("orderId") or order.trade_id),
+                    sys_oid=str(it.get("sysOid") or ""),
+                    oid=str(it.get("oid") or order.tid),
+                    title=str(it.get("title") or ""),
+                    sku_properties_name=str(it.get("skuPropertiesName") or ""),
+                    shop_mapping_sku=str(it.get("shopMappingSku") or ""),
+                    original_sku_id=str(it.get("originalSkuId") or ""),
+                    original_goods_id=str(it.get("originalGoodsId") or ""),
+                    merchandise_pic_path=str(it.get("merchandisePicPath") or ""),
+                    num=int(it.get("num") or 1),
+                    price=float(it.get("price") or 0),
+                    is_void=bool(is_void),
+                    raw=it,
+                    shop_remark=item_remark,
+                    original_tid=original_tid,
+                ))
         return order
 
     # -------------------------------------------------------------------
@@ -924,8 +924,8 @@ class FangguoAdapter(ErpAdapter):
 
             existing_idx = 0
             for gift_name, gift_num, gift_tid, gift_material, gift_remark in all_gifts:
-                # 赠品材质统一默认为吸水皮革，绝不允许继承普通商品段的材质
-                effective_material_code = "吸水皮革"
+                # 赠品材质：优先使用解析结果中收集的材质，默认使用"吸水皮革"
+                effective_material_code = gift_material if gift_material else "吸水皮革"
                 if existing_idx < len(existing_gift_indices):
                     existing_gift_idx = existing_gift_indices[existing_idx]
                     new_gift = self._build_gift_item(order.items[existing_gift_idx], order, effective_material_code, gift_name, gift_num, is_new=False, original_tid=gift_tid, shop_remark=gift_remark)
@@ -974,6 +974,70 @@ class FangguoAdapter(ErpAdapter):
                                 "num": item.num,
                                 "price": item.price,
                             })
+
+        # 第二步五：全局重复行检测与清理
+        # 扫描所有非作废商品行，按标准化 SKU+数量 分组，
+        # 每组只保留1个（优先 type=0 原始行），其余标记作废。
+        # 这样即使某些行被误判为赠品或补差价，也能清理重复。
+        duplicate_groups = defaultdict(list)
+        for idx, item in enumerate(order.items):
+            if item.is_void:
+                continue
+            item_sku = _clean_sku(item.shop_mapping_sku)
+            if not item_sku:
+                continue
+            norm_sku = _normalize_sku_for_duplicate(item_sku)
+            if not norm_sku:
+                continue
+            if self._is_gift_sku(item_sku):
+                continue
+            if '补差价' in item_sku or '不打印' in item_sku:
+                continue
+            duplicate_groups[(norm_sku, item.num)].append(idx)
+
+        removed_dup_count = 0
+        for key, indices in duplicate_groups.items():
+            if len(indices) <= 1:
+                continue
+            norm_sku, item_num = key
+            sorted_indices = sorted(indices, key=lambda i: (
+                0 if (order.items[i].raw and order.items[i].raw.get('type') == 0) else 1,
+                0 if order.items[i].id and not order.items[i].id.startswith('new_') else 1,
+                i
+            ))
+            keep_idx = sorted_indices[0]
+            for dup_idx in sorted_indices[1:]:
+                if dup_idx in used_item_indices:
+                    continue
+                dup_item = order.items[dup_idx]
+                dup_sku = _clean_sku(dup_item.shop_mapping_sku)
+                removed_dup_count += 1
+                if dup_item.raw:
+                    void_item = dict(dup_item.raw)
+                else:
+                    void_item = {
+                        "id": dup_item.id,
+                        "orderId": dup_item.order_id,
+                        "sysOid": dup_item.sys_oid,
+                        "oid": dup_item.oid,
+                        "title": dup_item.title,
+                        "skuPropertiesName": dup_item.sku_properties_name,
+                        "shopMappingSku": dup_item.shop_mapping_sku,
+                        "originalSkuId": dup_item.original_sku_id,
+                        "originalGoodsId": dup_item.original_goods_id,
+                        "merchandisePicPath": dup_item.merchandise_pic_path,
+                        "num": dup_item.num,
+                        "price": dup_item.price,
+                        "shopRemark": dup_item.shop_remark or "",
+                    }
+                void_item['cancelStatus'] = True
+                void_item['discardStatus'] = 2
+                order_items.append(void_item)
+                used_item_indices.add(dup_idx)
+
+        if removed_dup_count > 0:
+            remaining = len(order.items) - removed_dup_count
+            print(f"全局去重：移除 {removed_dup_count} 个重复商品行，剩余 {remaining} 个")
 
         # 第三步：保留未匹配的非作废、非赠品商品行（保持原样，不修改）
         # 这对于合并订单非常重要：被跳过的子订单的商品行需要保留
@@ -1202,9 +1266,8 @@ class FangguoAdapter(ErpAdapter):
 
         # 调试输出：打印 payload 摘要，便于排查前端未显示的问题
         try:
-            print(f"  ▶ 提交 saveProduct: allManualOrder={has_manual_items}, totalCount={len(order_items)}")
-            for i, it in enumerate(order_items[:6]):
-                print(f"    - item[{i}]: type={it.get('type')}, id={it.get('id')}, oid={it.get('oid')}, shopMappingSku={str(it.get('shopMappingSku'))[:60]}, num={it.get('num')}")
+            active_count = len([it for it in order_items if not it.get('cancelStatus') and not it.get('discardStatus')])
+            print(f"提交订单：{active_count} 个商品行，allManualOrder={has_manual_items}")
         except Exception:
             pass
         resp = self._session.post(fg_config.API_SAVE_PRODUCT, json=payload, timeout=30)
@@ -1214,6 +1277,9 @@ class FangguoAdapter(ErpAdapter):
         # ===== 判断 API 返回结果 =====
         # 方果返回: {"code": 0, "data": true, "msg": ""}
         if result.get("code") == 0 and result.get("data") is True:
+            modified_count = len(product_parsed_list) if product_parsed_list else 0
+            if modified_count > 0:
+                print(f"修改成功！共 {modified_count} 个编码")
             return True
         else:
             error_msg = result.get("msg", "未知错误")
@@ -1375,25 +1441,32 @@ class FangguoAdapter(ErpAdapter):
         使新建的手工单行能继承平台订单关联，支持抖音扫描发货。
         """
         original_tid = parsed.original_tid if parsed else ""
+        source = None
+        for it in order.items:
+            if not it.is_void and it.sys_oid and not self._is_gift_item(it) and not self._is_price_difference_item(it):
+                source = it
+                break
+        if not source:
+            for it in order.items:
+                if not it.is_void and not self._is_gift_item(it) and not self._is_price_difference_item(it):
+                    source = it
+                    break
+        base_price = source.price if source and source.price and source.price > 0 else 0
         item = self._build_order_item(
             OrderItem(id=None, order_id=original_tid or order.trade_id,
-                      oid=original_tid or order.tid, sys_oid=None, num=parsed.num),
+                      oid=original_tid or order.tid, sys_oid=None, 
+                      num=parsed.num, price=base_price,
+                      title=source.title if source else None,
+                      merchandise_pic_path=source.merchandise_pic_path if source else None),
             order, parsed,
         )
         item['shopMappingSku'] = f'<font color="red">{item["shopMappingSku"]}</font>'
         item['type'] = 1
         item['shopRemark'] = ""
         item['uuid'] = item.get('uuid') or str(_uuid.uuid4())
-        source = None
-        for it in order.items:
-            if not it.is_void and it.sys_oid and not self._is_gift_item(it) and not self._is_price_difference_item(it):
-                source = it
-                break
         if source and source.sys_oid:
             item['sourceSysOid'] = source.sys_oid
             item['isCopy'] = True
-        if source and source.raw:
-            item['outerIid'] = source.raw.get('outerIid', '')
         return item
 
     def _build_new_item(self, order: Order, parsed: ParsedRemark, template_item: Optional[OrderItem] = None) -> dict:
@@ -1412,8 +1485,8 @@ class FangguoAdapter(ErpAdapter):
                 order_id=template_item.order_id or order.trade_id,
                 oid=original_tid or template_item.oid or order.tid,
                 sys_oid=None,
-                original_sku_id=template_item.original_sku_id,
-                original_goods_id=template_item.original_goods_id,
+                original_sku_id="",
+                original_goods_id="",
                 title=template_item.title,
                 merchandise_pic_path=template_item.merchandise_pic_path,
                 price=template_item.price,
@@ -1441,8 +1514,6 @@ class FangguoAdapter(ErpAdapter):
         if template_item and template_item.sys_oid:
             item['sourceSysOid'] = template_item.sys_oid
             item['isCopy'] = True
-        if template_item and template_item.raw:
-            item['outerIid'] = template_item.raw.get('outerIid', '')
         return item
 
     # 赠品类型映射（title、商品ID、SKUID 必须与 ERP 中一致）
@@ -1451,15 +1522,17 @@ class FangguoAdapter(ErpAdapter):
             'model_code': '赠品沥水垫小圆或小方',
             'picture_code': '赠品沥水垫小圆或小方',
             'title': '赠品沥水垫小圆或小方',
-            'original_goods_id': '3806984491654840639',
+            'original_goods_id': '3806988491654840639',
             'original_sku_id': '3644348072270850',
+            'outer_iid': '赠品沥水垫小圆或小方',
         },
         'square': {
             'model_code': '30x50',
             'picture_code': '随机发；30x50',
             'title': '赠品沥水垫30x50cm',
-            'original_goods_id': '3806985099191386298',
-            'original_sku_id': '3644313731257858',
+            'original_goods_id': '380698509919186298',
+            'original_sku_id': '364431371257858',
+            'outer_iid': '赠品沥水垫30x50cm',
         },
     }
 
@@ -1620,23 +1693,23 @@ class FangguoAdapter(ErpAdapter):
             "cancelStatus": False,
             "realModelCode": model_code,
             "realModelId": None,
-            "type": 1 if is_new else 0,
+            "type": 1,
             "showRemarkInfo": True,
             "check": True,
             "loaded": True,
         }
-        if is_new:
-            result['uuid'] = str(_uuid.uuid4())
-            # 新建赠品行继承模板商品行的 sourceSysOid 和 isCopy，
-            # 使ERP将其识别为平台商品的复制行，从而加载商品信息（图片、商品ID/SKUID）
-            if item and item.sys_oid:
-                result['sourceSysOid'] = item.sys_oid
-                result['isCopy'] = True
+        result['uuid'] = str(_uuid.uuid4())
 
-        # 关键：为新建赠品行继承 outerIid，确保能关联到原订单，支持扫描发货
-        if item and item.raw:
+        if is_new:
+            result['outerIid'] = gift_info.get('outer_iid', '')
+        elif item and item.raw:
             result['outerIid'] = item.raw.get('outerIid', '')
-            
+
+        # 新建赠品行：继承原模板行的 sys_oid 以支持抖音扫描发货
+        if is_new and item and item.sys_oid:
+            result['sourceSysOid'] = item.sys_oid
+            result['isCopy'] = True
+
         return result
 
     _PRICE_DIFF_KEYWORDS = ["补差价专拍", "差价专用", "少几元拍几个"]
@@ -1673,6 +1746,9 @@ class FangguoAdapter(ErpAdapter):
                 clean_sku = re.sub(r'<[^>]+>', '', sku)
                 if clean_sku and not self._is_gift_sku(clean_sku):
                     return False
+            clean_sku = re.sub(r'<[^>]+>', '', sku)
+            if clean_sku and self._is_normal_product_sku(clean_sku) and not self._is_gift_sku(clean_sku):
+                return False
             non_gift_keywords = ['桌垫', '餐垫', '杯垫', '地垫', '鼠标垫', '脚垫']
             if not any(kw in title for kw in non_gift_keywords):
                 return True
@@ -1696,6 +1772,27 @@ class FangguoAdapter(ErpAdapter):
         if re.search(r"^吸水皮革-标准-30\s*[xX×]\s*50-随机发；30\s*[xX×]\s*50$", clean_sku):
             return True
         return False
+
+    def _is_normal_product_sku(self, sku: str) -> bool:
+        """判断商家编码是否为正常商品编码格式（材质-颜色-款式-图案）
+        用于防止将正常商品误识别为赠品。
+        正常编码格式：包含3个以上"-"分隔段，且不是补差价/赠品等特殊编码
+        """
+        if not sku:
+            return False
+        clean_sku = re.sub(r'<[^>]+>', '', sku)
+        # 去除尺寸后缀（如 ;60x110cm 或 ;60*110cm）
+        base_sku = re.split(r'[；;]', clean_sku)[0]
+        # 按"-"分段
+        parts = [p for p in base_sku.split('-') if p]
+        if len(parts) < 3:
+            return False
+        # 排除特殊编码
+        if '补差价' in base_sku:
+            return False
+        if '赠品' in base_sku:
+            return False
+        return True
 
     def _looks_like_gift_item(self, item: OrderItem) -> bool:
         """宽松判断商品行是否可能是赠品行（用于赠品换赠品场景兜底）
@@ -1811,7 +1908,8 @@ class FangguoAdapter(ErpAdapter):
             else:
                 # ship=False: 检查编码是否为"定制-定制-补差价-不打印"且数量为1
                 expected_sku = "定制-定制-补差价-不打印"
-                if item.shop_mapping_sku != expected_sku or item.num != 1:
+                clean_sku = re.sub(r'<[^>]+>', '', item.shop_mapping_sku or '')
+                if clean_sku != expected_sku or item.num != 1:
                     is_already_correct = False
                     break
         
@@ -1875,9 +1973,8 @@ class FangguoAdapter(ErpAdapter):
         
         # 调试输出：打印 payload 摘要，便于排查前端未显示的问题
         try:
-            print(f"  ▶ 提交 saveProduct: allManualOrder={has_manual_items}, totalCount={len(order_items)}")
-            for i, it in enumerate(order_items[:6]):
-                print(f"    - item[{i}]: type={it.get('type')}, id={it.get('id')}, oid={it.get('oid')}, shopMappingSku={str(it.get('shopMappingSku'))[:60]}, num={it.get('num')}")
+            active_count = len([it for it in order_items if not it.get('cancelStatus') and not it.get('discardStatus')])
+            print(f"提交订单：{active_count} 个商品行，allManualOrder={has_manual_items}")
         except Exception:
             pass
         resp = self._session.post(fg_config.API_SAVE_PRODUCT, json=payload, timeout=30)
