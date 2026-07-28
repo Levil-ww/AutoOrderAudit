@@ -1,5 +1,5 @@
 import sys
-sys.path.insert(0, 'd:\\AutoOrderAudit')
+sys.path.insert(0, '/')
 from unittest.mock import MagicMock
 from core.adapter_base import Order, OrderItem
 from adapters.fangguo.adapter import FangguoAdapter

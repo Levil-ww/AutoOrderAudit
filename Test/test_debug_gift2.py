@@ -1,5 +1,5 @@
 import sys
-sys.path.insert(0, 'd:\\AutoOrderAudit')
+sys.path.insert(0, '/')
 from core.adapter_base import OrderItem
 from adapters.fangguo.adapter import FangguoAdapter
 import re
