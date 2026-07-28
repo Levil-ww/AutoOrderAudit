@@ -1,4 +1,5 @@
 import sys
+import io
 sys.path.insert(0, 'd:\\AutoOrderAudit')
 
 from core.parser import parse_remark, extract_multiple_remarks
@@ -693,6 +694,173 @@ def test_merged_order_price_diff_empty_remark():
     print()
 
 
+def test_merged_order_mixed_group_price_diff_empty_remark():
+    """合并订单中同一子订单同时包含普通商品行和补差价行，且补差价行备注为空。
+
+    场景：子订单A包含
+      - 普通商品行，商品行备注含定制信息
+      - 补差价商品行，商品行备注为空
+    期望：补差价分组使用空备注，补差价行编码改为"定制-定制-补差价-不打印"，数量改为1，
+          不会被普通商品行备注解析成普通商品编码。
+    """
+    print('=' * 80)
+    print('测试十三：合并订单同分组混合+补差价行空备注 -> 编码改为不打印')
+    print('=' * 80)
+
+    adapter = FangguoAdapter()
+    engine = AutoAuditEngine(adapter, dry_run=True)
+
+    remark = '定制吸水皮革素华牡丹;55x60cm-1张'
+    order = Order(
+        id='test',
+        trade_id='A&B',
+        tid='A&B',
+        shop_remark=remark,
+    )
+
+    # 子订单A：普通商品行 + 补差价行（备注为空）
+    order.items.append(OrderItem(
+        id='item_a_regular',
+        order_id='test_order_013',
+        oid='A',
+        title='DMF厨房台面专用沥水垫',
+        num=1,
+        price=23.86,
+        shop_remark=remark,
+        original_tid='A',
+        raw={
+            "materialCode": "吸水皮革",
+            "modelCode": "定制尺寸",
+            "colorCode": "定制",
+            "pictureCode": "素华牡丹;55x60CM",
+        },
+    ))
+    order.items.append(OrderItem(
+        id='item_a_diff',
+        order_id='test_order_013',
+        oid='A',
+        title='DMF 补运费专拍 补差价专拍 少几元拍几个',
+        num=8,
+        price=1.0,
+        shop_remark='',
+        original_tid='A',
+        raw={
+            "materialCode": "",
+            "modelCode": "",
+            "colorCode": "",
+            "pictureCode": "",
+        },
+    ))
+
+    # 子订单B：普通商品行，避免被跳过
+    order.items.append(OrderItem(
+        id='item_b_regular',
+        order_id='test_order_013',
+        oid='B',
+        title='其他普通商品',
+        num=1,
+        price=10.0,
+        shop_remark='',
+        original_tid='B',
+        raw={
+            "materialCode": "",
+            "modelCode": "",
+            "colorCode": "",
+            "pictureCode": "",
+        },
+    ))
+
+    engine.stats = {"total": 0, "success": 0, "skipped": 0, "failed": 0, "errors": [], "cancelled": 0}
+
+    # 捕获引擎输出，验证补差价行走了不发货分支
+    old_stdout = sys.stdout
+    sys.stdout = io.StringIO()
+
+    material_map = adapter.material_map
+    material_matcher = adapter.get_material_matcher()
+    engine._process_merged_order(order, material_map, material_matcher)
+
+    output = sys.stdout.getvalue()
+    sys.stdout = old_stdout
+    print(output)
+
+    assert "备注为空" in output, "期望检测到补差价行备注为空"
+    assert "修改编码为'定制-定制-补差价-不打印'，数量改为1" in output, "期望补差价行编码改为不打印"
+    assert "仅修改数量为1" not in output, "补差价行不应仅修改数量"
+    print('✅ 测试通过：同分组混合场景下补差价行空备注已正确改为不打印')
+    print()
+
+
+def test_mixed_order_price_diff_no_extra_parsed():
+    """普通混合订单中，订单备注只有普通商品行的定制信息，补差价行未获得定制信息。
+
+    场景：订单包含1个普通商品行 + 1个补差价行，
+          订单备注仅包含普通商品行的定制信息。
+    期望：补差价行按不发货处理，编码改为"定制-定制-补差价-不打印"，数量改为1，
+          而不是仅修改数量。
+    """
+    print('=' * 80)
+    print('测试十四：普通混合订单补差价行未获得定制信息 -> 编码改为不打印')
+    print('=' * 80)
+
+    adapter = FangguoAdapter()
+    engine = AutoAuditEngine(adapter, dry_run=True)
+
+    remark = '定制吸水皮革素华牡丹;55x60cm-1张'
+    order = Order(
+        id='test',
+        trade_id='test_order_014',
+        tid='test_order_014',
+        shop_remark=remark,
+    )
+
+    order.items.append(OrderItem(
+        id='item1',
+        order_id='test_order_014',
+        oid='test_order_014',
+        title='DMF厨房台面专用沥水垫',
+        num=1,
+        price=23.86,
+        raw={
+            "materialCode": "吸水皮革",
+            "modelCode": "定制尺寸",
+            "colorCode": "定制",
+            "pictureCode": "素华牡丹;55x60CM",
+        },
+    ))
+    order.items.append(OrderItem(
+        id='item2',
+        order_id='test_order_014',
+        oid='test_order_014',
+        title='DMF 补运费专拍 补差价专拍 少几元拍几个',
+        num=8,
+        price=1.0,
+        raw={
+            "materialCode": "",
+            "modelCode": "",
+            "colorCode": "",
+            "pictureCode": "",
+        },
+    ))
+
+    engine.stats = {"total": 0, "success": 0, "skipped": 0, "failed": 0, "errors": [], "cancelled": 0}
+
+    old_stdout = sys.stdout
+    sys.stdout = io.StringIO()
+
+    engine._process_order(order)
+
+    output = sys.stdout.getvalue()
+    sys.stdout = old_stdout
+    print(output)
+
+    assert "混合订单备注含信息，解析备注并按补差价逻辑处理补差价行" in output, "期望进入混合订单补差价处理"
+    assert "修改编码为'定制-定制-补差价-不打印'" in output, "期望补差价行编码改为不打印"
+    assert "仅修改数量为1" not in output, "补差价行不应仅修改数量"
+    print('✅ 测试通过：普通混合订单补差价行未获得定制信息已正确改为不打印')
+    print()
+
+
 if __name__ == '__main__':
     test_price_diff_detection()
     test_price_diff_only_empty_remark()
@@ -706,6 +874,8 @@ if __name__ == '__main__':
     test_mixed_order_price_diff_with_remark()
     test_merged_order_price_diff_remark_not_overwritten()
     test_merged_order_price_diff_empty_remark()
+    test_merged_order_mixed_group_price_diff_empty_remark()
+    test_mixed_order_price_diff_no_extra_parsed()
 
     print('=' * 80)
     print('🎉 所有测试通过！')
