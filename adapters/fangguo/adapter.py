@@ -499,16 +499,22 @@ class FangguoAdapter(ErpAdapter):
                         clean_item_sku = _clean_sku(item.shop_mapping_sku)
                         if not clean_item_sku:
                             continue
-                        if (clean_item_sku, item.num) in expected_counter:
-                            base_current_counter[(clean_item_sku, item.num)] += 1
-                        else:
+                        normalized_sku = _normalize_sku_for_duplicate(clean_item_sku)
+                        normalized_current_counter[(normalized_sku, item.num)] += 1
+                        matched_base_key = None
+                        for p in product_parsed_list:
+                            p_norm_full = _normalize_sku_for_duplicate(p.shop_mapping_sku)
+                            p_norm_base = _normalize_sku_for_duplicate(p.base_shop_mapping_sku)
+                            if normalized_sku == p_norm_full or (p_norm_base and normalized_sku == p_norm_base):
+                                matched_base_key = (p.base_shop_mapping_sku, item.num)
+                                break
+                        if matched_base_key is None:
                             for p in product_parsed_list:
                                 if item.num == p.num and clean_item_sku.startswith(p.base_shop_mapping_sku):
-                                    base_current_counter[(p.base_shop_mapping_sku, item.num)] += 1
+                                    matched_base_key = (p.base_shop_mapping_sku, item.num)
                                     break
-                        normalized_sku = _normalize_sku_for_duplicate(clean_item_sku)
-                        if normalized_sku:
-                            normalized_current_counter[(normalized_sku, item.num)] += 1
+                        if matched_base_key is not None:
+                            base_current_counter[matched_base_key] += 1
                     duplicate_found = False
                     for sku_num, expected_cnt in expected_counter.items():
                         if current_counter.get(sku_num, 0) > expected_cnt:
@@ -572,25 +578,32 @@ class FangguoAdapter(ErpAdapter):
                     normalized_expected_counter = Counter(
                         (_normalize_sku_for_duplicate(p.shop_mapping_sku), p.num) for p in product_parsed_list
                     )
+
+                    # 为每个 item 找到其对应的 parsed SKU key（用于统一计数）
+                    # 匹配优先级：normalized_full 精确匹配 > normalized_base 精确匹配 > startswith(base)
                     base_current_counter = Counter()
                     normalized_current_counter = Counter()
                     for item in valid_items:
                         clean_item_sku = _clean_sku(item.shop_mapping_sku)
                         if not clean_item_sku:
                             continue
-                        # 优先匹配完整 SKU
-                        if (clean_item_sku, item.num) in expected_counter:
-                            base_current_counter[(clean_item_sku, item.num)] += 1
-                        else:
-                            # 尝试匹配 base_shop_mapping_sku
+                        normalized_sku = _normalize_sku_for_duplicate(clean_item_sku)
+                        normalized_current_counter[(normalized_sku, item.num)] += 1
+                        # 为 base_current_counter 找到对应的 parsed base_shop_mapping_sku
+                        matched_base_key = None
+                        for p in product_parsed_list:
+                            p_norm_full = _normalize_sku_for_duplicate(p.shop_mapping_sku)
+                            p_norm_base = _normalize_sku_for_duplicate(p.base_shop_mapping_sku)
+                            if normalized_sku == p_norm_full or (p_norm_base and normalized_sku == p_norm_base):
+                                matched_base_key = (p.base_shop_mapping_sku, item.num)
+                                break
+                        if matched_base_key is None:
                             for p in product_parsed_list:
                                 if item.num == p.num and clean_item_sku.startswith(p.base_shop_mapping_sku):
-                                    base_current_counter[(p.base_shop_mapping_sku, item.num)] += 1
+                                    matched_base_key = (p.base_shop_mapping_sku, item.num)
                                     break
-                        # 标准化SKU计数
-                        normalized_sku = _normalize_sku_for_duplicate(clean_item_sku)
-                        if normalized_sku:
-                            normalized_current_counter[(normalized_sku, item.num)] += 1
+                        if matched_base_key is not None:
+                            base_current_counter[matched_base_key] += 1
 
                     duplicate_found = False
                     for sku_num, expected_cnt in expected_counter.items():
@@ -823,13 +836,32 @@ class FangguoAdapter(ErpAdapter):
                     new_item['giftCodeName'] = None
                     new_item['filmGiftNum'] = 0
                     used_item_indices.add(matched_item_idx)
-                elif template_item:
-                    # 超出原有效行数，创建新商品行
-                    new_item = self._build_new_item(order, p, template_item=template_item)
+                    order_items.append(new_item)
                 else:
-                    # 没有模板，使用默认构造
-                    new_item = self._build_default_item(order, p)
-                order_items.append(new_item)
+                    # 未匹配到现有商品行：先做全局重复检测，防止因合并订单的
+                    # 订单级备注污染而创建重复商品行（同一SKU已存在于其他子订单）
+                    parsed_norm = _normalize_sku_for_duplicate(p.shop_mapping_sku)
+                    is_dup_global = False
+                    for idx in valid_indices:
+                        item = order.items[idx]
+                        if item.num != p.num:
+                            continue
+                        clean_item_sku = _clean_sku(item.shop_mapping_sku)
+                        if not clean_item_sku:
+                            continue
+                        if _normalize_sku_for_duplicate(clean_item_sku) == parsed_norm:
+                            is_dup_global = True
+                            print(f"    ⚠️ 跳过重复创建：解析结果 {p.shop_mapping_sku[:50]} 与现有商品行 {clean_item_sku[:50]} 等价（可能来自合并订单备注污染）")
+                            break
+                    if is_dup_global:
+                        continue
+                    if template_item:
+                        # 超出原有效行数，创建新商品行
+                        new_item = self._build_new_item(order, p, template_item=template_item)
+                    else:
+                        # 没有模板，使用默认构造
+                        new_item = self._build_default_item(order, p)
+                    order_items.append(new_item)
         else:
             # 没有解析成功的商品行（只有赠品或备注无法解析）
             # 保留所有原商品行不变，只处理赠品部分

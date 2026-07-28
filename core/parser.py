@@ -124,7 +124,7 @@ _RE_QTY_SUMMARY = re.compile(rf"共(?:计)?{_CHINESE_NUMBERS}[张个件套米]")
 _RE_ARRIVAL_REFUND = re.compile(r"(到货返|到货返差价|到货退差价|确认收货返差价|返差价|返现)\d+(?:\.\d+)?[元]?")
 
 # 无关词语匹配（如"桌垫"、"地垫"等，作为后缀时应过滤）
-_RE_IRRELEVANT_SUFFIX = re.compile(r"(桌垫|地垫)[，,；;]?")
+_RE_IRRELEVANT_SUFFIX = re.compile(r"(桌垫|地垫|沙发扶手垫|床头柜垫|餐边柜)[，,；;]?")
 
 # 快递信息匹配（如"发中通"、"发顺丰"、"发德邦"等，过滤掉发后面的快递选择）
 _RE_EXPRESS_DELIVERY = re.compile(r"发(?:中通|顺丰|德邦|京东|邮政|极兔|圆通|韵达|申通|天天|EMS|SF|DHL|UPS|FedEx|优速|速尔|全峰|国通|快捷|宅急送|跨越|中铁|中邮|龙邦|安能|天地华宇|佳吉|百世)(?:快递|速递|速运|物流|特快)?[，,；;。]?")
@@ -304,13 +304,15 @@ def parse_remark(
             round_size_end = sizes_with_pos[0][3] + body_offset_for_remark
             after_cm = text[round_size_end:]
             after_cm = re.sub(r"[-*×]\d+[张个件套米]", "", after_cm).strip()
-            after_cm = re.sub(r"\d+[张个件套米]", "", after_cm).strip()
+            after_cm = re.sub(r"\d+[张件套米]", "", after_cm).strip()
+            after_cm = re.sub(r"\d+个(?![\u4e00-\u9fff])", "", after_cm).strip()
             after_cm = _RE_QTY_SUMMARY.sub("", after_cm).strip()
             after_cm = re.sub(r"总?共(?:计)?\d+[张个件套米]", "", after_cm).strip()
             after_cm = re.sub(r"总?共(?:计)?[一二两三四五六七八九十]+[张个件套米]", "", after_cm).strip()
             after_cm = re.sub(r"各\d+[张个件套米]", "", after_cm).strip()
             after_cm = re.sub(r"各[一二两三四五六七八九十]+[张个件套米]", "", after_cm).strip()
-            after_cm = re.sub(r"(?:[一二两三四五六七八九十]|一)[张个件套米]", "", after_cm).strip()
+            after_cm = re.sub(r"(?:[一二两三四五六七八九十]|一)[张件套米]", "", after_cm).strip()
+            after_cm = re.sub(r"(?:[一二两三四五六七八九十]|一)个(?![\u4e00-\u9fff])", "", after_cm).strip()
             after_cm = _RE_ARRIVAL_REFUND.sub("", after_cm).strip()
             after_cm = _RE_IRRELEVANT_SUFFIX.sub("", after_cm).strip()
             after_cm = _RE_EXPRESS_DELIVERY.sub("", after_cm).strip()
@@ -323,6 +325,20 @@ def parse_remark(
                 after_cm = re.sub(r"[-*×]\d+[张个件套米]", "", after_cm).strip()
                 # 去掉数量汇总信息（如"共计2张"、"共三张"）
                 after_cm = _RE_QTY_SUMMARY.sub("", after_cm).strip()
+                # 去掉总?共前缀的数量（如"总共2张"、"共三张"）
+                after_cm = re.sub(r"总?共(?:计)?\d+[张个件套米]", "", after_cm).strip()
+                after_cm = re.sub(r"总?共(?:计)?[一二两三四五六七八九十]+[张个件套米]", "", after_cm).strip()
+                # 去掉"各X张"模式
+                after_cm = re.sub(r"各\d+[张个件套米]", "", after_cm).strip()
+                after_cm = re.sub(r"各[一二两三四五六七八九十]+[张个件套米]", "", after_cm).strip()
+                # 去掉独立数字数量词（如"1张"、"2个"）
+                # 注意："个"只有在后面不跟中文字符时才删（避免误删"4个圆角"这类描述）
+                after_cm = re.sub(r"\d+[张件套米]", "", after_cm).strip()
+                after_cm = re.sub(r"\d+个(?![\u4e00-\u9fff])", "", after_cm).strip()
+                # 去掉独立中文数量词（如"一张"、"两件"、"三套"）
+                # 注意："个"只有在后面不跟中文字符时才删（避免误删"四个圆角"这类描述）
+                after_cm = re.sub(r"(?:[一二两三四五六七八九十]|一)[张件套米]", "", after_cm).strip()
+                after_cm = re.sub(r"(?:[一二两三四五六七八九十]|一)个(?![\u4e00-\u9fff])", "", after_cm).strip()
                 # 过滤掉"到货返xx"这种无关备注
                 after_cm = _RE_ARRIVAL_REFUND.sub("", after_cm).strip()
                 # 过滤掉"桌垫"、"地垫"等无关词语
@@ -439,8 +455,9 @@ def parse_remark(
     if not pattern_name:
         pattern_name = _extract_pattern(body, material_map)
 
-    # 提取材质
-    _parse_material(body, result, material_map, material_matcher)
+    # 提取材质（使用完整 text 而非 body，避免 "定制" 之前的材质名被忽略）
+    # 例如 "双面皮革定制中古花园;33x43-1张"：材质在 "定制" 之前
+    _parse_material(text, result, material_map, material_matcher)
 
     if is_custom:
         result.color_code = "定制"
@@ -635,6 +652,17 @@ def extract_multiple_remarks(
                 # 再清理一次可能的数量汇总残留（兼容"总"字残留：总共X张）
                 clean_remark = re.sub(r'总?共(?:计)?\d+[张个件套米]', '', clean_remark).strip().strip('，,、;；')
                 clean_remark = re.sub(r'总?共(?:计)?[一二两三四五六七八九十]+[张个件套米]', '', clean_remark).strip().strip('，,、;；')
+                # 去掉"各X张"模式
+                clean_remark = re.sub(r'各\d+[张个件套米]', '', clean_remark).strip().strip('，,、;；')
+                clean_remark = re.sub(r'各[一二两三四五六七八九十]+[张个件套米]', '', clean_remark).strip().strip('，,、;；')
+                # 去掉独立数字数量词（如"1张"、"2个"）
+                # 注意："个"只有在后面不跟中文字符时才删（避免误删"4个圆角"这类描述）
+                clean_remark = re.sub(r'\d+[张件套米]', '', clean_remark).strip().strip('，,、;；')
+                clean_remark = re.sub(r'\d+个(?![\u4e00-\u9fff])', '', clean_remark).strip().strip('，,、;；')
+                # 去掉独立中文数量词（如"一张"、"两件"）
+                # 注意："个"只有在后面不跟中文字符时才删（避免误删"四个圆角"这类描述）
+                clean_remark = re.sub(r'(?:[一二两三四五六七八九十]|一)[张件套米]', '', clean_remark).strip().strip('，,、;；')
+                clean_remark = re.sub(r'(?:[一二两三四五六七八九十]|一)个(?![\u4e00-\u9fff])', '', clean_remark).strip().strip('，,、;；')
                 # 过滤掉过滤后剩下的单字无意义残留（如"总"）
                 if clean_remark and len(clean_remark) > 1:
                     if ";" in parsed.picture_code:
@@ -877,6 +905,14 @@ def _parse_multi_size_direct(
         after_cm = cm_match.group(1)
         after_cm = re.sub(r"[-*×]\d+[张个件套米]", "", after_cm).strip()
         after_cm = _RE_QTY_SUMMARY.sub("", after_cm).strip()
+        after_cm = re.sub(r"总?共(?:计)?\d+[张个件套米]", "", after_cm).strip()
+        after_cm = re.sub(r"总?共(?:计)?[一二两三四五六七八九十]+[张个件套米]", "", after_cm).strip()
+        after_cm = re.sub(r"各\d+[张个件套米]", "", after_cm).strip()
+        after_cm = re.sub(r"各[一二两三四五六七八九十]+[张个件套米]", "", after_cm).strip()
+        after_cm = re.sub(r"\d+[张件套米]", "", after_cm).strip()
+        after_cm = re.sub(r"\d+个(?![\u4e00-\u9fff])", "", after_cm).strip()
+        after_cm = re.sub(r"(?:[一二两三四五六七八九十]|一)[张件套米]", "", after_cm).strip()
+        after_cm = re.sub(r"(?:[一二两三四五六七八九十]|一)个(?![\u4e00-\u9fff])", "", after_cm).strip()
         after_cm = _RE_ARRIVAL_REFUND.sub("", after_cm).strip()
         after_cm = _RE_IRRELEVANT_SUFFIX.sub("", after_cm).strip()
         remark_after_size = after_cm.strip().strip(";，,、")

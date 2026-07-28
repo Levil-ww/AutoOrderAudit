@@ -260,15 +260,17 @@ class AutoAuditEngine:
                     'tid': order.tid,
                     'items': price_diff_items,
                     'remark': remark,
-                    'ship': True,  # 未分配到解析结果的补差价行仅修改数量为1
+                    'ship': True,  # 有剩余解析结果时按解析结果编码
                     'parsed_list': extra_parsed,  # 分配给补差价行的解析结果
                 }]
             else:
+                # 备注中的定制信息已全部分配给普通商品行，
+                # 补差价行未获得定制信息，按不发货处理。
                 price_diff_updates = [{
                     'tid': order.tid,
                     'items': price_diff_items,
                     'remark': remark,
-                    'ship': True,
+                    'ship': False,
                 }]
 
             self._process_normal_order_logic(order, price_diff_updates, parsed_list_override=parsed_list)
@@ -402,11 +404,13 @@ class AutoAuditEngine:
                             'parsed_list': extra_parsed,
                         }]
                     else:
+                        # 备注中的定制信息已全部分配给普通商品行，
+                        # 补差价行未获得定制信息，按不发货处理。
                         price_diff_updates = [{
                             'tid': order.tid,
                             'items': price_diff_items,
                             'remark': remark,
-                            'ship': True,
+                            'ship': False,
                         }]
 
         # ---- 缓存检查：如果订单已正确，直接跳过 ----
@@ -678,7 +682,10 @@ class AutoAuditEngine:
             # 补差价分组必须优先使用补差价商品行的备注，避免被普通商品行上的
             # 订单级备注覆盖后错误解析；普通分组则优先使用普通商品行备注。
             if group['is_price_diff']:
-                group_remark = group['price_diff_remark'] or group['regular_remark']
+                # 补差价分组必须使用补差价商品行自身的备注；
+                # 当补差价行备注为空时，按"补差价不发货"处理，
+                # 不能回退使用同一分组内普通商品行的备注。
+                group_remark = group['price_diff_remark']
             else:
                 group_remark = group['regular_remark'] or group['price_diff_remark']
             is_price_diff = group['is_price_diff']
@@ -748,12 +755,13 @@ class AutoAuditEngine:
                                 'parsed_list': extra_parsed,
                             })
                         else:
-                            # 无剩余解析结果，补差价行仅修改数量为1
+                            # 备注中的定制信息已全部分配给普通商品行，
+                            # 补差价行未获得定制信息，按不发货处理。
                             price_diff_updates.append({
                                 'tid': tid,
                                 'items': diff_items,
                                 'remark': group_remark,
-                                'ship': True,
+                                'ship': False,
                             })
                     else:
                         # 没有普通商品行，所有解析结果分配给补差价行
@@ -819,6 +827,108 @@ class AutoAuditEngine:
                         all_gifts.append((p.gift_name, p.gift_num))
 
         all_gifts = list(dict.fromkeys(all_gifts))
+
+        # ===== 合并订单解析结果净化 =====
+        # 合并订单中 ERP 常把订单级备注复制到多个商品行，导致：
+        # 1. 单个分组的备注解析出其他子订单的商品（跨分组污染）
+        # 2. 多个分组解析出相同 SKU 但带有不同 original_tid（重复解析）
+        # 本环节做两步净化：
+        #   a. 跨分组污染过滤：若某分组的解析结果与「其他分组的现有商品行」SKU 等价，
+        #      说明是订单级备注带进来的其他子订单商品，直接剔除。
+        #   b. 同 SKU 去重：若多个分组产生相同 SKU，保留与现有商品行 original_tid
+        #      匹配的那个，确保每个 SKU 只属于正确的子订单。
+        def _normalize_sku_for_dup(sku: str) -> str:
+            if not sku:
+                return sku
+            sku = re.sub(r'(\d+(?:\.\d+)?)\s*[xX×*]\s*(\d+(?:\.\d+)?)\s*(?:cm|CM|厘米)',
+                         r'\1x\2', sku, flags=re.IGNORECASE)
+            sku = re.sub(r'(直径|圆|圆形|圆直径|尺寸)(\d+(?:\.\d+)?)\s*(?:cm|CM|厘米)',
+                         r'\1\2', sku, flags=re.IGNORECASE)
+            return sku
+
+        # 构建现有商品行的 (normalized_sku, num) -> set of original_tid 映射
+        existing_sku_tids = {}
+        for item in order.items:
+            if item.is_void or self.adapter._is_gift_item(item) or self._is_price_difference_item(item):
+                continue
+            norm_sku = _normalize_sku_for_dup(item.shop_mapping_sku or '')
+            if norm_sku:
+                key = (norm_sku, item.num)
+                if key not in existing_sku_tids:
+                    existing_sku_tids[key] = set()
+                existing_sku_tids[key].add(item.original_tid or '')
+
+        # --- a. 跨分组污染过滤 ---
+        # 对每个解析结果，检查其 SKU 是否已经存在于「其他 original_tid 的商品行」。
+        # 若存在则说明是订单级备注带进来的外组商品，剔除。
+        # 注意：只有当该 SKU 对应的现有商品行 tid 与解析结果的 tid 不同时才剔除；
+        #       如果该 SKU 在本组也有对应商品（已正确编码），那是本组自己的商品，不应剔除。
+        filtered_parsed = []
+        contamination_count = 0
+        for p in all_parsed_list:
+            if not p or not p.success:
+                filtered_parsed.append(p)
+                continue
+            norm_sku = _normalize_sku_for_dup(p.shop_mapping_sku)
+            key = (norm_sku, p.num)
+            existing_tids = existing_sku_tids.get(key, set())
+            if existing_tids:
+                # 该 SKU 已有商品行存在
+                if p.original_tid and p.original_tid in existing_tids:
+                    # 本组已有该 SKU 的商品行 → 这是本组自己的商品，保留
+                    filtered_parsed.append(p)
+                else:
+                    # 该 SKU 的商品行都在其他组 → 是订单级备注污染，剔除
+                    contamination_count += 1
+            else:
+                # 该 SKU 没有现有商品行 → 可能是新尺寸/新商品，保留
+                filtered_parsed.append(p)
+
+        if contamination_count > 0:
+            print(f"  🧹 合并订单净化：过滤掉 {contamination_count} 个跨分组污染的解析结果")
+
+        # --- b. 同 SKU 去重（多分组各解析出同一个 SKU 的情况） ---
+        success_parsed = [p for p in filtered_parsed if p and p.success]
+        non_success_parsed = [p for p in filtered_parsed if p and not p.success]
+
+        dedup_groups = {}
+        for p in success_parsed:
+            norm_sku = _normalize_sku_for_dup(p.shop_mapping_sku)
+            key = (norm_sku, p.num)
+            if key not in dedup_groups:
+                dedup_groups[key] = []
+            dedup_groups[key].append(p)
+
+        deduped_parsed = []
+        dup_removed = 0
+        for key, candidates in dedup_groups.items():
+            if len(candidates) == 1:
+                deduped_parsed.append(candidates[0])
+                continue
+            dup_removed += len(candidates) - 1
+            # 多个候选：优先选择 original_tid 与现有商品行匹配的
+            best = None
+            best_score = -1
+            expected_tids = existing_sku_tids.get(key, set())
+            expected_tid = next(iter(expected_tids)) if expected_tids else ''
+            for p in candidates:
+                score = 0
+                if expected_tid and p.original_tid == expected_tid:
+                    score = 100  # 与现有商品行的 original_tid 完全匹配
+                elif p.original_tid and "&" not in p.original_tid:
+                    score = 50   # 有明确的子订单号（不含&）
+                else:
+                    score = 0    # 含合并号或空
+                if score > best_score:
+                    best_score = score
+                    best = p
+            if best:
+                deduped_parsed.append(best)
+
+        if dup_removed > 0:
+            print(f"  🧹 合并订单去重：移除 {dup_removed} 个重复解析结果")
+
+        all_parsed_list = deduped_parsed + non_success_parsed
 
         if not all_parsed_list and not price_diff_updates and not gift_no_ship_tids and not all_gifts:
             print(f"  ⏭️  跳过：所有分组均无法解析")
