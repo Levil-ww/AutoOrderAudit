@@ -712,6 +712,24 @@ class AutoAuditEngine:
         # 合并订单中，每个原始订单使用自己的商品行备注
         # 不回退使用订单级备注，因为订单级备注可能属于另一个原始订单
         
+        # 快速路径：简单合并订单（1个正常分组 + 1个纯补差价分组，且补差价备注为空）
+        # 按普通订单逻辑处理，避免补差价行因分组备注为空而被错误改为不打印
+        normal_tids = [tid for tid, g in groups.items() if not g['is_price_diff']]
+        price_diff_tids = [tid for tid, g in groups.items() if g['is_price_diff']]
+        if (len(normal_tids) == 1 and len(price_diff_tids) == 1
+                and not groups[price_diff_tids[0]]['price_diff_remark'].strip()
+                and order.shop_remark.strip()):
+            # 额外检查：补差价分组内部不能包含普通商品行（混合分组不走快速路径）
+            diff_group = groups[price_diff_tids[0]]
+            regular_in_diff_group = [
+                item for item in diff_group['items']
+                if not self._is_price_difference_item(item)
+            ]
+            if not regular_in_diff_group:
+                print(f"  📝 检测到简单合并订单（1正常分组+1纯补差价分组，补差价备注为空），按普通订单逻辑处理")
+                self._process_normal_order_logic(order)
+                return
+        
         # 处理每个分组
         all_parsed_list = []
         all_gifts = []
