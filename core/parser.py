@@ -152,9 +152,42 @@ _PATTERN_KEYWORDS = ["花幔", "卢浮梦境", "安妮森林", "暗夜缪斯", "
 # 赠品关键词
 _GIFT_KEYWORDS = ["送", "赠品", "附赠", "加送"]
 
+# 赠品名称白名单：只识别这四类赠品
+# 圆垫、沥水垫25cm -> 编码 round
+# 方垫、30x50 -> 编码 square
+# 其他（防滑垫、小垫子等）一律跳过不处理
+_GIFT_NAME_WHITELIST = [
+    "圆垫",
+    "沥水垫25cm",
+    "方垫",
+    "30x50",
+]
+
 # 中文数字映射（一到十）
 _CHINESE_NUM_MAP = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
                     "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
+
+def _is_whitelisted_gift(gift_text: str) -> bool:
+    """判断赠品名称是否在白名单中
+
+    匹配规则（任一命中即视为白名单）：
+    - 包含"圆垫"
+    - 包含"沥水垫25cm"
+    - 包含"方垫"
+    - 包含"30x50"（忽略大小写和分隔符）
+    """
+    if not gift_text:
+        return False
+    if "圆垫" in gift_text:
+        return True
+    if "沥水垫25cm" in gift_text:
+        return True
+    if "方垫" in gift_text:
+        return True
+    if re.search(r"30\s*[xX×*]\s*50", gift_text):
+        return True
+    return False
 
 
 def parse_remark(
@@ -264,14 +297,41 @@ def parse_remark(
         if first_size_start > 0:
             # 提取尺寸前面的文本（到分号为止）
             before_size = body[:first_size_start].strip()
-            # 找到最后一个分号的位置
-            last_semi = before_size.rfind(";")
+            # 找到最后一个分号的位置（同时支持英文分号";"和中文分号"；"）
+            last_semi_en = before_size.rfind(";")
+            last_semi_cn = before_size.rfind("；")
+            last_semi = max(last_semi_en, last_semi_cn)
             if last_semi != -1:
-                size_prefix = before_size[last_semi + 1:].strip().strip("-;,、")
+                # 有分号：取分号之后到尺寸之前的文本
+                size_prefix = before_size[last_semi + 1:].strip().strip("-;,、，；")
+            else:
+                # 没有分号：直接使用尺寸之前的文本（去掉"定制"/"现货"/材质前缀后作为尺寸前缀候选）
+                candidate = before_size
+                # 去掉"定制"、"现货"前缀
+                while candidate.startswith("定制") or candidate.startswith("现货"):
+                    if candidate.startswith("定制"):
+                        candidate = candidate[2:].strip()
+                    elif candidate.startswith("现货"):
+                        candidate = candidate[2:].strip()
+                # 去掉材质名（支持任意位置出现的材质名，而非只是开头）
+                for mat in sorted(_HEURISTIC_MATERIALS, key=len, reverse=True):
+                    if mat in candidate:
+                        candidate = candidate.replace(mat, "").strip()
+                candidate = candidate.strip().strip("-;,、，；")
+                # 安全校验：只有候选看起来像"尺寸前缀"时才采用，避免把花型误判为前缀
+                # 尺寸前缀特征：包含"版/形/向/款"等标志性汉字，且长度较短（<=6字）
+                # 例如：竖版、横版、方形、圆形、大版、小版、横向、纵向、长款、短款
+                is_size_prefix_like = bool(candidate) and len(candidate) <= 6 and (
+                    any(ch in candidate for ch in ["版", "形", "向", "款"])
+                    or candidate in ["正", "反", "长", "短", "大", "小", "方", "圆", "竖", "横"]
+                )
+                # 额外排除：匹配已知花型关键词的候选不能作为尺寸前缀
+                if is_size_prefix_like and candidate not in _PATTERN_KEYWORDS:
+                    size_prefix = candidate
 
     # 去掉尺寸前缀中的"规格"
     if size_prefix.startswith("规格"):
-        size_prefix = size_prefix[2:].strip().strip("-;,、")
+        size_prefix = size_prefix[2:].strip().strip("-;,、，；")
 
     # 现货尺寸不带 cm/CM 单位；定制尺寸带 CM 单位
     # 圆形尺寸前缀：圆、圆直径、直径、圆形、尺寸
@@ -656,6 +716,50 @@ def extract_multiple_remarks(
                 clean_remark = _RE_IRRELEVANT_SUFFIX.sub("", clean_remark).strip().strip("-;,、，")
                 # 过滤掉快递信息（如"发中通"、"发顺丰"等）
                 clean_remark = _RE_EXPRESS_DELIVERY.sub("", clean_remark).strip().strip("-;,、，")
+                # 过滤掉赠品信息（包括白名单和非白名单的所有"送/赠品..."），
+                # 确保非白名单赠品（如防滑垫、小垫子等）不会作为后缀添加到商品编码中
+                gift_pos_in_trailing = -1
+                for kw in _GIFT_KEYWORDS:
+                    pos = clean_remark.find(kw)
+                    if pos != -1 and (gift_pos_in_trailing == -1 or pos < gift_pos_in_trailing):
+                        gift_pos_in_trailing = pos
+                if gift_pos_in_trailing != -1:
+                    clean_remark = clean_remark[:gift_pos_in_trailing].strip().strip("-;,、，")
+                # 进一步清理：即使没有"送/赠品"前缀，残留的白名单赠品名
+                # （圆垫/方垫/沥水垫25cm/30x50）也应从尾部备注中剔除，
+                # 这些是赠品语义内容，不应附加到商品编码后缀
+                for gift_kw in ["圆垫", "方垫", "沥水垫25cm"]:
+                    pos = clean_remark.find(gift_kw)
+                    if pos != -1:
+                        # 从该关键字位置向前找到上一个分隔符，从分隔符处截断
+                        sep_pos = -1
+                        for sep in ["，", ",", "；", ";", "、", " "]:
+                            p = clean_remark.rfind(sep, 0, pos)
+                            if p > sep_pos:
+                                sep_pos = p
+                        if sep_pos != -1:
+                            clean_remark = clean_remark[:sep_pos].strip().strip("-;,、，")
+                        else:
+                            # 没有分隔符，从开头截断
+                            clean_remark = ""
+                # 单独处理 30x50（避免误伤包含30x50的商品尺寸描述）
+                # 仅当"30x50"前后是中文（如"方垫30x50"、"沥水垫30x50"）时才视为赠品残留
+                m_30x50 = re.search(r"[\u4e00-\u9fff]30\s*[xX×*]\s*50|30\s*[xX×*]\s*50[\u4e00-\u9fff]", clean_remark)
+                if m_30x50:
+                    pos = m_30x50.start()
+                    # 取中文字符的起始位置
+                    if re.match(r"30", clean_remark[pos:]):
+                        # 30x50后跟中文，30x50前一位是中文
+                        pos = pos + 1  # 跳过中文字符，但为了安全直接从该中文位置截断
+                    sep_pos = -1
+                    for sep in ["，", ",", "；", ";", "、", " "]:
+                        p = clean_remark.rfind(sep, 0, pos)
+                        if p > sep_pos:
+                            sep_pos = p
+                    if sep_pos != -1:
+                        clean_remark = clean_remark[:sep_pos].strip().strip("-;,、，")
+                    else:
+                        clean_remark = ""
                 # 再清理一次可能的数量汇总残留（兼容"总"字残留：总共X张）
                 clean_remark = re.sub(r'总?共(?:计)?\d+[张个件套米]', '', clean_remark).strip().strip('，,、;；')
                 clean_remark = re.sub(r'总?共(?:计)?[一二两三四五六七八九十]+[张个件套米]', '', clean_remark).strip().strip('，,、;；')
@@ -1185,7 +1289,9 @@ def _extract_multiple_gifts(text: str) -> list[tuple[str, int]]:
             if qty_before_match:
                 prev_sep_pos = match.start() - 1
                 start_pos = prev_sep_pos
-                while start_pos >= 0 and text[start_pos] not in "，,；;、":
+                # 更严格的边界：除了标点符号，也在"张/个/件/套/米"等数量词处停止，
+                # 避免跨过前面的商品"-1张"把商品描述吞进来
+                while start_pos >= 0 and text[start_pos] not in "，,；;、张个件套米":
                     start_pos -= 1
                 start_pos += 1
                 if start_pos < prev_sep_pos:
@@ -1193,7 +1299,13 @@ def _extract_multiple_gifts(text: str) -> list[tuple[str, int]]:
                     before_text = re.sub(r"[一二两三四五六七八九十]+[张个件套米]", "", before_text).strip()
                     before_text = re.sub(r"\d+[张个件套米]", "", before_text).strip()
                     before_text = before_text.replace("总共", "").strip()
-                    if before_text and before_text not in ["送", keyword]:
+                    # 只有当前面确实包含"总/共"时才使用 before_text 替换（"小垫子总共送2个" 这种模式）；
+                    # 如果前面包含尺寸（x/X/*），说明是商品描述，应该使用"送"后面的 gift_text。
+                    has_total_marker = ("共" in text[start_pos:match.start()] or
+                                        "总" in text[start_pos:match.start()])
+                    has_size_before = bool(re.search(r"\d+\s*[xX×*]\s*\d+", text[start_pos:match.start()]))
+                    if (before_text and before_text not in ["送", keyword]
+                            and has_total_marker and not has_size_before):
                         gift_text = before_text
         
         gift_text = re.sub(r"\d+[张个件套米]", "", gift_text).strip()
@@ -1231,7 +1343,12 @@ def _extract_multiple_gifts(text: str) -> list[tuple[str, int]]:
         else:
             unique_gifts[gift_name] = gift_num
     gifts = [(name, num) for name, num in unique_gifts.items()]
-    
+
+    # 白名单过滤：只保留圆垫、沥水垫25cm、方垫、30x50 四类赠品，
+    # 其他（防滑垫、小垫子、抹布、收纳袋等）一律丢弃，不识别为赠品，
+    # 也不作为后缀添加到商品编码中
+    gifts = [(name, num) for name, num in gifts if _is_whitelisted_gift(name)]
+
     return gifts
 
 
@@ -1991,13 +2108,37 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
                 
                 if i > 0:
                     prev_end = all_sizes_pos[i - 1][1]
+                    # 先找中英文逗号
                     comma_after_prev = text.find("，", prev_end)
-                    if comma_after_prev == -1:
-                        comma_after_prev = text.find(",", prev_end)
+                    comma_after_prev_en = text.find(",", prev_end)
+                    if comma_after_prev == -1 or (comma_after_prev_en != -1 and comma_after_prev_en < comma_after_prev):
+                        comma_after_prev = comma_after_prev_en
                     
                     if comma_after_prev != -1 and comma_after_prev < size_start:
-                        prefix_text = text[comma_after_prev + 1:size_start].strip().strip("-;,、")
-                        size_desc = f"{prefix_text}{size_desc}"
+                        # 找到了逗号：取逗号之后、尺寸之前的文本
+                        prefix_text = text[comma_after_prev + 1:size_start].strip().strip("-;,、，；")
+                        if prefix_text:
+                            size_desc = f"{prefix_text}{size_desc}"
+                    else:
+                        # 没找到逗号：直接从上一个尺寸结束后、当前尺寸开始之前提取前缀
+                        between_text = text[prev_end:size_start].strip()
+                        # 去掉数量标记（如"-1张"、"1张"等）和分隔符
+                        between_text = re.sub(r"[-*×]\d+[张个件套米]", "", between_text).strip()
+                        between_text = re.sub(r"\d+[张个件套米]", "", between_text).strip()
+                        between_text = between_text.strip("-;,、，；")
+                        # 去掉可能残留的"剪裁有图/剪裁无图"等model词（这些是尺寸后缀，不是前缀）
+                        prefix_candidate = between_text
+                        for cut_kw in ["剪裁有图", "裁剪有图", "剪裁无图", "裁剪无图"]:
+                            if prefix_candidate.endswith(cut_kw):
+                                prefix_candidate = prefix_candidate[:-len(cut_kw)].strip().strip("-;,、，；")
+                        # 安全校验：只有候选看起来像"尺寸前缀"时才采用（与parse_remark中标准一致）
+                        # 尺寸前缀特征：包含"版/形/向/款"等标志性汉字，且长度较短（<=6字）
+                        is_prefix_like = bool(prefix_candidate) and len(prefix_candidate) <= 6 and (
+                            any(ch in prefix_candidate for ch in ["版", "形", "向", "款"])
+                            or prefix_candidate in ["正", "反", "长", "短", "大", "小", "方", "圆", "竖", "横"]
+                        )
+                        if is_prefix_like and prefix_candidate not in _PATTERN_KEYWORDS:
+                            size_desc = f"{prefix_candidate}{size_desc}"
                 
                 if i == 0 and full_prefix:
                     # 第一个段使用完整前缀（包含定制/现货 + 材质 + 花型）

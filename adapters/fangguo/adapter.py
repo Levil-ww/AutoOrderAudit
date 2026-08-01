@@ -707,9 +707,9 @@ class FangguoAdapter(ErpAdapter):
                         existing_gift_items = [item for item in order.items if self._is_gift_item(item)]
 
                         def _get_gift_sku(gift_name):
-                            if "圆垫" in gift_name:
+                            if "圆垫" in gift_name or "沥水垫25cm" in gift_name:
                                 gift_type = 'round'
-                            elif "方垫" in gift_name or re.search(r"30\s*[xX×]\s*50", gift_name):
+                            elif "方垫" in gift_name or re.search(r"30\s*[xX×*]\s*50", gift_name):
                                 gift_type = 'square'
                             else:
                                 gift_type = 'round'
@@ -1544,14 +1544,18 @@ class FangguoAdapter(ErpAdapter):
                     如果为False，保留原商品行的标识字段，用于更新现有赠品行
             original_tid: 赠品所属的原始订单号，用于合并订单场景
             shop_remark: 赠品商品行的备注，合并订单时使用子订单备注
+
+        赠品编码规则：
+        - 包含"圆垫"或"沥水垫25cm" -> 吸水皮革-标准-赠品沥水垫小圆或小方-赠品沥水垫小圆或小方
+        - 包含"方垫"或"30x50"   -> 吸水皮革-标准-30x50-随机发；30x50
         """
         gift_material = material_code or "吸水皮革"
-        if "圆垫" in gift_name:
+        if "圆垫" in gift_name or "沥水垫25cm" in gift_name:
             gift_type = 'round'
-        elif "方垫" in gift_name or re.search(r"30\s*[xX×]\s*50", gift_name):
-            # 包含"方垫"或"30x50"尺寸的赠品都视为30x50规格，使用方垫编码
+        elif "方垫" in gift_name or re.search(r"30\s*[xX×*]\s*50", gift_name):
             gift_type = 'square'
         else:
+            # 白名单后理论上不会出现未知类型，兜底使用 round
             gift_type = 'round'
 
         gift_info = self._GIFT_TYPE_MAP[gift_type]
