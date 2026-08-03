@@ -906,33 +906,56 @@ class FangguoAdapter(ErpAdapter):
                 all_gifts.append((name, num, tid, gift_info['material_code'], gift_info['shop_remark']))
 
         if all_gifts:
-            existing_gift_indices = []
+            # 收集现有赠品行，并按 original_tid 分组以便精确匹配
+            # 关键修复：不再按顺序匹配，而是按子订单号精确匹配，
+            # 避免子订单A的赠品行被子订单B的赠品覆盖修改
+            existing_gifts_by_tid = {}  # {original_tid: [idx, idx...]}
             for idx, item in enumerate(order.items):
                 if idx not in used_item_indices and self._is_gift_item(item):
-                    existing_gift_indices.append(idx)
+                    item_tid = item.original_tid or ""
+                    if item_tid not in existing_gifts_by_tid:
+                        existing_gifts_by_tid[item_tid] = []
+                    existing_gifts_by_tid[item_tid].append(idx)
+
+            all_existing_gift_indices = set()
+            for tid_indices in existing_gifts_by_tid.values():
+                all_existing_gift_indices.update(tid_indices)
 
             # 赠品换赠品场景：如果严格检测未找到原赠品行，尝试宽松检测，
             # 避免原赠品行未被识别时生成新的赠品行，导致出现多个赠品行
-            if not existing_gift_indices:
+            if not all_existing_gift_indices:
                 remark_text = order.shop_remark or ""
                 is_gift_exchange = "换赠品" in remark_text or "赠品换" in remark_text
                 if is_gift_exchange:
                     for idx, item in enumerate(order.items):
                         if idx not in used_item_indices and self._looks_like_gift_item(item):
-                            existing_gift_indices.append(idx)
+                            item_tid = item.original_tid or ""
+                            if item_tid not in existing_gifts_by_tid:
+                                existing_gifts_by_tid[item_tid] = []
+                            existing_gifts_by_tid[item_tid].append(idx)
+                            all_existing_gift_indices.add(idx)
                             break
 
-            existing_idx = 0
             for gift_name, gift_num, gift_tid, gift_material, gift_remark in all_gifts:
                 # 赠品材质：优先使用解析结果中收集的材质，默认使用"吸水皮革"
                 effective_material_code = gift_material if gift_material else "吸水皮革"
-                if existing_idx < len(existing_gift_indices):
-                    existing_gift_idx = existing_gift_indices[existing_idx]
-                    new_gift = self._build_gift_item(order.items[existing_gift_idx], order, effective_material_code, gift_name, gift_num, is_new=False, original_tid=gift_tid, shop_remark=gift_remark)
+
+                # 按 original_tid 精确查找匹配的现有赠品行
+                matched_existing_idx = None
+                search_tid = gift_tid or ""
+                if search_tid and search_tid in existing_gifts_by_tid and existing_gifts_by_tid[search_tid]:
+                    matched_existing_idx = existing_gifts_by_tid[search_tid].pop(0)
+                    if not existing_gifts_by_tid[search_tid]:
+                        del existing_gifts_by_tid[search_tid]
+
+                if matched_existing_idx is not None:
+                    existing_item = order.items[matched_existing_idx]
+                    new_gift = self._build_gift_item(existing_item, order, effective_material_code, gift_name, gift_num, is_new=False, original_tid=gift_tid, shop_remark=gift_remark)
                     order_items.append(new_gift)
-                    used_item_indices.add(existing_gift_idx)
-                    existing_idx += 1
+                    used_item_indices.add(matched_existing_idx)
+                    print(f"    🔧 在原赠品行上修改: tid={gift_tid[-6:]} {existing_item.shop_mapping_sku[:40]} -> {gift_name} x{gift_num}")
                 else:
+                    # 找不到对应 tid 的现有赠品行，必须新建赠品行（不能乱改其他子订单的赠品行）
                     if template_item:
                         new_gift = self._build_gift_item(template_item, order, effective_material_code, gift_name, gift_num, is_new=True, original_tid=gift_tid, shop_remark=gift_remark)
                     else:
@@ -941,6 +964,42 @@ class FangguoAdapter(ErpAdapter):
                             order, effective_material_code, gift_name, gift_num, is_new=True, original_tid=gift_tid, shop_remark=gift_remark,
                         )
                     order_items.append(new_gift)
+                    print(f"    ➕ 新建赠品行: tid={gift_tid[-6:]} {gift_name} x{gift_num}")
+
+            # 处理完所有解析赠品后，剩余未被匹配的现有赠品行必须保留原样
+            # （这些是没有备注赠品说明的子订单原赠品行，不应该被修改或删除）
+            for tid, indices in existing_gifts_by_tid.items():
+                for idx in indices:
+                    if idx in used_item_indices:
+                        continue
+                    item = order.items[idx]
+                    item_tid = item.original_tid or ""
+                    should_no_ship = False
+                    if gift_no_ship_tids and item_tid in gift_no_ship_tids:
+                        should_no_ship = True
+                    elif gift_no_ship and not gift_no_ship_tids:
+                        should_no_ship = True
+                    if should_no_ship:
+                        new_item = self._build_price_diff_no_ship_item(item, order)
+                        new_item['num'] = item.num
+                        order_items.append(new_item)
+                        used_item_indices.add(idx)
+                    else:
+                        if item.raw:
+                            order_items.append(item.raw)
+                        else:
+                            order_items.append({
+                                "id": item.id,
+                                "orderId": item.order_id,
+                                "sysOid": item.sys_oid,
+                                "oid": item.oid,
+                                "title": item.title,
+                                "shopMappingSku": item.shop_mapping_sku,
+                                "num": item.num,
+                                "price": item.price,
+                            })
+                        used_item_indices.add(idx)
+                    print(f"    🔒 保留原赠品行不变: tid={item_tid[-6:]} {item.shop_mapping_sku[:50]} (num={item.num})")
 
         # 第二步.5：如果备注中没有赠品信息，但订单中存在赠品行，保留现有赠品行不变
         # 这确保赠品行在没有备注说明时保持原样，不会被误修改或删除

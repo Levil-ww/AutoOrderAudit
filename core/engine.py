@@ -845,9 +845,10 @@ class AutoAuditEngine:
                     
                     for p in parsed_list:
                         if p.gifts:
-                            all_gifts.extend(p.gifts)
+                            for gname, gnum in p.gifts:
+                                all_gifts.append((gname, gnum, tid))
                         elif p.gift_name and p.gift_num > 0:
-                            all_gifts.append((p.gift_name, p.gift_num))
+                            all_gifts.append((p.gift_name, p.gift_num, tid))
             else:
                 skip_reason = None
                 for keyword in _SKIP_KEYWORDS:
@@ -880,11 +881,20 @@ class AutoAuditEngine:
 
                 for p in parsed_list:
                     if p.gifts:
-                        all_gifts.extend(p.gifts)
+                        for gname, gnum in p.gifts:
+                            all_gifts.append((gname, gnum, tid))
                     elif p.gift_name and p.gift_num > 0:
-                        all_gifts.append((p.gift_name, p.gift_num))
+                        all_gifts.append((p.gift_name, p.gift_num, tid))
 
-        all_gifts = list(dict.fromkeys(all_gifts))
+        # 赠品去重：按 (赠品名, tid) 合并数量，不同子订单的赠品不合并
+        gift_merged = {}
+        for gname, gnum, gtid in all_gifts:
+            key = (gname, gtid)
+            if key in gift_merged:
+                gift_merged[key] += gnum
+            else:
+                gift_merged[key] = gnum
+        all_gifts = [(name, num, gtid) for (name, gtid), num in gift_merged.items()]
 
         # ===== 合并订单解析结果净化 =====
         # 合并订单中 ERP 常把订单级备注复制到多个商品行，导致：
@@ -963,11 +973,65 @@ class AutoAuditEngine:
             if len(candidates) == 1:
                 deduped_parsed.append(candidates[0])
                 continue
+
+            # 获取该 SKU 对应的现有商品行的 original_tid 集合
+            expected_tids = existing_sku_tids.get(key, set())
+
+            # 关键修复：如果现有商品行包含多个不同的 original_tid，
+            # 说明是不同子订单拥有相同 SKU，应保留与现有 tid 匹配的所有候选
+            if len(expected_tids) > 1:
+                # 按 original_tid 分组候选
+                candidates_by_tid = {}
+                for p in candidates:
+                    tid = p.original_tid or ''
+                    if tid not in candidates_by_tid:
+                        candidates_by_tid[tid] = []
+                    candidates_by_tid[tid].append(p)
+
+                # 保留与现有商品行 tid 匹配的候选（每个 tid 保留一个最优的）
+                kept_tids = set()
+                for tid, group in candidates_by_tid.items():
+                    if tid in expected_tids or not expected_tids:
+                        # 该 tid 的商品行存在于现有订单中，保留
+                        best = None
+                        best_score = -1
+                        for p in group:
+                            score = 0
+                            if p.original_tid and "&" not in p.original_tid:
+                                score = 50
+                            else:
+                                score = 0
+                            if score > best_score:
+                                best_score = score
+                                best = p
+                        if best:
+                            deduped_parsed.append(best)
+                            kept_tids.add(tid)
+
+                # 对于与任何现有 tid 都不匹配的候选，按原逻辑选择最优的
+                unmatched_candidates = [p for p in candidates if p.original_tid not in kept_tids]
+                if unmatched_candidates:
+                    best = None
+                    best_score = -1
+                    for p in unmatched_candidates:
+                        score = 0
+                        if p.original_tid and "&" not in p.original_tid:
+                            score = 50
+                        else:
+                            score = 0
+                        if score > best_score:
+                            best_score = score
+                            best = p
+                    if best:
+                        deduped_parsed.append(best)
+
+                dup_removed += len(candidates) - len(kept_tids) - (1 if unmatched_candidates else 0)
+                continue
+
+            # 原有逻辑：单个 tid 的去重（纯重复解析）
             dup_removed += len(candidates) - 1
-            # 多个候选：优先选择 original_tid 与现有商品行匹配的
             best = None
             best_score = -1
-            expected_tids = existing_sku_tids.get(key, set())
             expected_tid = next(iter(expected_tids)) if expected_tids else ''
             for p in candidates:
                 score = 0
@@ -1003,7 +1067,7 @@ class AutoAuditEngine:
             )
             print(summary)
             
-            for gift_name, gift_num in all_gifts:
+            for gift_name, gift_num, _ in all_gifts:
                 print(f"  🎁 赠品: {gift_name} x {gift_num}")
         
         # ---- 缓存检查：如果订单已正确，直接跳过 ----
@@ -1035,7 +1099,7 @@ class AutoAuditEngine:
             changes = []
             for p in all_parsed_list:
                 changes.append(f"新编码: {p.shop_mapping_sku}")
-            for gift_name, gift_num in all_gifts:
+            for gift_name, gift_num, _ in all_gifts:
                 changes.append(f"赠品: {gift_name} x {gift_num}")
             for update in price_diff_updates:
                 action = "修改编码为'定制-定制-补差价-不打印'" if not update['ship'] else "仅修改数量为1"
