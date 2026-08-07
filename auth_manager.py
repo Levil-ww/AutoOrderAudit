@@ -121,7 +121,12 @@ def load_auth() -> AuthInfo:
 
 
 def save_auth(auth: AuthInfo) -> bool:
-    """保存鉴权信息到 token.json"""
+    """保存鉴权信息到 token.json
+    
+    安全措施：
+    - token.json 包含敏感凭据，已在 .gitignore 中排除
+    - 写入后设置文件权限仅当前用户可读
+    """
     try:
         data = {
             "authorization": auth.authorization,
@@ -135,6 +140,12 @@ def save_auth(auth: AuthInfo) -> bool:
         }
         with open(TOKEN_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        # 写入后收紧文件权限（Windows下尽力而为）
+        try:
+            import stat
+            os.chmod(TOKEN_FILE, stat.S_IRUSR | stat.S_IWUSR)
+        except Exception:
+            pass
         return True
     except IOError:
         return False
@@ -163,7 +174,13 @@ def auto_login(username: str, password: str) -> LoginResult:
         )
 
         print(f"🔍 新Token信息: tenant={auth.tenant_id}, user={auth.username} (API返回mainUsername={result.main_username})")
-        print(f"🔍 新Token前缀: {auth.authorization[:25]}...")
+        if result.expires_time > 0:
+            from datetime import datetime as _dt
+            expire_dt = _dt.fromtimestamp(result.expires_time / 1000)
+            print(f"🔍 API返回过期时间: {expire_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+        else:
+            print(f"⚠️ API未返回expiresTime，使用默认7天有效期")
+        print(f"🔍 新Token获取成功: auth={'✓' if auth.authorization else '✗'}, cookie={'✓' if auth.cookie_str else '✗'}")
 
         saved = save_auth(auth)
         print(f"🔍 save_auth() 返回值 = {saved} {'✅' if saved else '❌ 写入失败！'}")
@@ -180,7 +197,14 @@ def auto_login(username: str, password: str) -> LoginResult:
 
 
 def _compute_expires_at(result: LoginResult) -> str:
-    """根据登录结果计算过期日期（默认7天后）"""
+    """根据登录结果计算过期日期。
+
+    优先使用 API 返回的 expiresTime（毫秒时间戳），
+    若未获取到则回退为默认7天后过期。
+    """
+    if result.expires_time > 0:
+        expire_dt = datetime.fromtimestamp(result.expires_time / 1000)
+        return expire_dt.strftime("%Y-%m-%d")
     return (date.today() + timedelta(days=7)).strftime("%Y-%m-%d")
 
 
@@ -222,13 +246,13 @@ def create_token_template():
         return
 
     save_auth(AuthInfo(
-        authorization="Bearer e3528ed7ea544b1f811a5e227b4d864d",
-        cookie_str="JSESSIONID=B24BFB2F112398FACD5C8EC60E497187",
+        authorization="Bearer <示例Token-请通过登录功能获取>",
+        cookie_str="JSESSIONID=<示例Cookie-请通过登录功能获取>",
         tenant_id="5068663",
-        expires_at="2026-07-14",
-        note="示例Token，请替换为实际值",
+        expires_at="<通过登录获取>",
+        note="示例Token模板，请通过程序内的「登录」功能获取真实Token",
     ))
-    print(f"✅ 已创建 Token 配置文件: {TOKEN_FILE}")
+    print(f"✅ 已创建 Token 配置文件: {TOKEN_FILE}（模板，请通过登录功能获取真实Token）")
 
 
 # ========== 便捷函数 ==========
@@ -260,7 +284,7 @@ def is_logged_in() -> bool:
 if __name__ == "__main__":
     # 命令行测试
     auth = load_auth()
-    print(f"Authorization: {auth.authorization[:30]}..." if auth.authorization else "❌ 未配置")
-    print(f"Cookie: {auth.cookie_str[:30]}..." if auth.cookie_str else "❌ 未配置")
+    print(f"Authorization: {'✓' if auth.authorization else '❌ 未配置'}")
+    print(f"Cookie: {'✓' if auth.cookie_str else '❌ 未配置'}")
     print(f"Tenant ID: {auth.tenant_id}")
     print(f"状态: {auth.status_text}")

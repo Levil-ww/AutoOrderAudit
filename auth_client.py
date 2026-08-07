@@ -9,6 +9,7 @@ API 端点: POST /fgapp/basic/system/auth/login
 """
 
 import requests
+import time
 from typing import Optional
 
 
@@ -26,6 +27,7 @@ class LoginResult:
         main_username: str = "",
         jsessionid: str = "",
         msg: str = "",
+        expires_time: int = 0,
     ):
         self.success = success
         self.access_token = access_token
@@ -33,13 +35,15 @@ class LoginResult:
         self.main_username = main_username
         self.jsessionid = jsessionid
         self.msg = msg
+        self.expires_time = expires_time
 
     def __repr__(self) -> str:
         if self.success:
             return (
                 f"LoginResult(success=True, user='{self.main_username}', "
                 f"tenant={self.tenant_id}, token={self.access_token[:20]}..., "
-                f"jsessionid={self.jsessionid[:20]}...)"
+                f"jsessionid={self.jsessionid[:20]}..., "
+                f"expires_time={self.expires_time})"
             )
         return f"LoginResult(success=False, msg='{self.msg}')"
 
@@ -113,6 +117,8 @@ def login(username: str, password: str) -> LoginResult:
 
     jsessionid = resp.cookies.get("JSESSIONID", "")
 
+    expires_time = _extract_expires_time(data)
+
     if not access_token:
         return LoginResult(success=False, msg="登录成功但未获取到Token，请联系技术人员")
 
@@ -137,7 +143,29 @@ def login(username: str, password: str) -> LoginResult:
         main_username=main_username,
         jsessionid=jsessionid,
         msg="登录成功",
+        expires_time=expires_time,
     )
+
+
+def _extract_expires_time(data: dict) -> int:
+    """
+    从登录响应 data 中提取过期时间戳（毫秒）。
+
+    兼容三种格式：
+    - expiresTime: 毫秒级绝对时间戳（如 178668621336）
+    - expiresIn / expires_in / ttl: 秒级间隔（如 604800 表示7天）
+    """
+    expires_time = data.get("expiresTime")
+    if expires_time is not None:
+        return int(expires_time)
+
+    for key in ("expiresIn", "expires_in", "ttl"):
+        val = data.get(key)
+        if val is not None:
+            seconds = int(val)
+            return int(time.time() * 1000) + seconds * 1000
+
+    return 0
 
 
 def _find_shop_tenant(access_token: str, jsessionid: str) -> Optional[int]:
