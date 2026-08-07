@@ -1,0 +1,3 @@
+# Sensitive files - do not commit
+token.json
+auth_credentials.enc
