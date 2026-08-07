@@ -78,7 +78,16 @@ class AutoAuditEngine:
         gift_no_ship_tids=None,
         order: Order = None,
     ):
-        """计算订单的期望编码签名，用于缓存比对"""
+        """计算订单的期望编码签名，用于缓存比对
+        
+        签名维度：
+        1. 解析出的商品编码+数量
+        2. 赠品名称+数量
+        3. 补差价行编码
+        4. 赠品不送标记
+        5. 订单备注（shop_remark + buyer_remark）
+        6. 现有商品行作废状态（防止外部作废后缓存命中跳过）
+        """
         parts = []
 
         # 普通商品编码+数量
@@ -124,6 +133,23 @@ class AutoAuditEngine:
             for tid in sorted(gift_no_ship_tids):
                 parts.append(("ns", tid))
 
+        # 订单备注（防止备注措辞变化但SKU不变时缓存命中）
+        if order:
+            shop_remark = order.shop_remark or ""
+            buyer_remark = order.buyer_remark or ""
+            if shop_remark or buyer_remark:
+                parts.append(("rm", hash(shop_remark + "|" + buyer_remark)))
+
+        # 现有商品行作废状态摘要（防止外部作废后缓存命中跳过）
+        if order:
+            void_summary = tuple(
+                sorted(
+                    (item.original_tid or str(item.id), item.is_void or False)
+                    for item in order.items
+                )
+            )
+            parts.append(("void", void_summary))
+
         return frozenset(parts)
 
     def _check_skip_cache(self, order: Order, expected_key) -> bool:
@@ -139,8 +165,8 @@ class AutoAuditEngine:
         return False
 
     def _update_skip_cache(self, order: Order, expected_key):
-        """将订单期望签名写入缓存"""
-        if expected_key:
+        """将订单期望签名写入缓存（dry_run 模式下不写入）"""
+        if expected_key and not self.dry_run:
             self.skip_cache[order.trade_id] = expected_key
 
     def _is_price_difference_order(self, order: Order) -> bool:
@@ -515,9 +541,12 @@ class AutoAuditEngine:
                 self.stats["failed"] += 1
                 self.stats["errors"].append(f"订单 {order.trade_id}: 接口返回失败")
         except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
             print(f"  ❌ 请求异常: {e}")
+            print(tb)
             self.stats["failed"] += 1
-            self.stats["errors"].append(f"订单 {order.trade_id}: {e}")
+            self.stats["errors"].append(f"订单 {order.trade_id}: {e}\n{tb}")
 
     def run(self, page_no=1, page_size=500, query_status=1, time_begin="", time_end=""):
         print("=" * 60)
@@ -560,8 +589,11 @@ class AutoAuditEngine:
                 self._update_express_for_order(order)
             except Exception as e:
                 self.stats["failed"] += 1
-                self.stats["errors"].append(str(e))
+                import traceback
+                tb = traceback.format_exc()
+                self.stats["errors"].append(f"订单 {order.trade_id}: {e}\n{tb}")
                 print(f"  ❌ 订单处理异常: {e}")
+                print(tb)
 
             time.sleep(self.interval)
 
@@ -659,23 +691,61 @@ class AutoAuditEngine:
     def _process_merged_order(self, order, material_map, material_matcher):
         """
         处理合并订单：按商品行的 original_tid 分组，每组使用自己的备注单独处理
+        
+        分组策略：
+        1. 优先使用不含&的 original_tid / oid 作为分组键
+        2. 含&时，先收集所有唯一ID，检查是否存在前缀碰撞
+        3. 前缀碰撞时使用完整ID作为分组键，否则取&前的子订单号
+        4. 所有ID都不可用时，使用 item.id 兜底
         """
         print(f"  🔄 合并订单，按原始订单号分组处理")
+        
+        # 预收集：统计所有不含&的子订单号、所有含&的完整ID
+        clean_tids = set()       # 不含&的子订单号
+        amp_tids = set()         # 含&的完整ID
+        amp_tid_prefixes = {}    # prefix -> count (用于检测前缀碰撞)
+        for item in order.items:
+            if item.original_tid and "&" not in item.original_tid:
+                clean_tids.add(item.original_tid)
+            if item.oid and "&" not in item.oid:
+                clean_tids.add(item.oid)
+            if item.original_tid and "&" in item.original_tid:
+                amp_tids.add(item.original_tid)
+                prefix = item.original_tid.split("&")[0]
+                amp_tid_prefixes[prefix] = amp_tid_prefixes.get(prefix, 0) + 1
+            if item.oid and "&" in item.oid:
+                amp_tids.add(item.oid)
+                prefix = item.oid.split("&")[0]
+                amp_tid_prefixes[prefix] = amp_tid_prefixes.get(prefix, 0) + 1
+        
+        # 检测前缀碰撞：如果任何前缀对应多个含&的完整ID
+        has_prefix_collision = any(v > 1 for v in amp_tid_prefixes.values())
         
         # 按 original_tid 分组商品行
         groups = {}
         for idx, item in enumerate(order.items):
+            # 保存 ERP 原始 original_tid，避免后续处理丢失
+            if not hasattr(item, '_erp_original_tid'):
+                item._erp_original_tid = item.original_tid
+            
             # 优先使用不包含&的子订单号
             if item.original_tid and "&" not in item.original_tid:
                 tid = item.original_tid
             elif item.oid and "&" not in item.oid:
                 tid = item.oid
             elif item.original_tid and "&" in item.original_tid:
-                # original_tid 含&时，尝试取&前的子订单号
-                tid = item.original_tid.split("&")[0]
+                if has_prefix_collision:
+                    # 前缀碰撞：使用完整 original_tid 作为分组键
+                    # 同一完整ID的商品行归为一组，不同完整ID的分开
+                    tid = item.original_tid
+                else:
+                    # 无前缀碰撞：取&前的子订单号
+                    tid = item.original_tid.split("&")[0]
             elif item.oid and "&" in item.oid:
-                # oid 含&时，尝试取&前的子订单号
-                tid = item.oid.split("&")[0]
+                if has_prefix_collision:
+                    tid = item.oid
+                else:
+                    tid = item.oid.split("&")[0]
             else:
                 # 所有ID都含&或为空时，使用item.id作为兜底分组键
                 tid = str(item.id) if item.id else f"item_{idx}"
@@ -929,10 +999,24 @@ class AutoAuditEngine:
         # --- a. 跨分组污染过滤 ---
         # 对每个解析结果，检查其 SKU 是否已经存在于「其他 original_tid 的商品行」。
         # 若存在则说明是订单级备注带进来的外组商品，剔除。
-        # 注意：只有当该 SKU 对应的现有商品行 tid 与解析结果的 tid 不同时才剔除；
-        #       如果该 SKU 在本组也有对应商品（已正确编码），那是本组自己的商品，不应剔除。
+        # 关键修复：当解析结果的 original_tid 不在现有商品行的 tid 集合中时，
+        # 不能直接判定为污染——因为不同子订单可能合法拥有相同SKU。
+        # 只有当该子订单没有任何有效商品行时，才能确定是污染。
         filtered_parsed = []
         contamination_count = 0
+        
+        # 预计算每个 original_tid 是否有有效商品行（非作废、非赠品、非补差价）
+        has_valid_items_by_tid = {}
+        all_tids_in_order = set()  # 所有出现在订单中的 tid（包括全作废的子订单）
+        for item in order.items:
+            tid = item.original_tid or ''
+            if tid:
+                all_tids_in_order.add(tid)
+            if item.is_void or self.adapter._is_gift_item(item) or self._is_price_difference_item(item):
+                continue
+            if tid:
+                has_valid_items_by_tid[tid] = True
+        
         for p in all_parsed_list:
             if not p or not p.success:
                 filtered_parsed.append(p)
@@ -946,8 +1030,16 @@ class AutoAuditEngine:
                     # 本组已有该 SKU 的商品行 → 这是本组自己的商品，保留
                     filtered_parsed.append(p)
                 else:
-                    # 该 SKU 的商品行都在其他组 → 是订单级备注污染，剔除
-                    contamination_count += 1
+                    # 该 SKU 的商品行在其他组 → 检查当前子订单是否有有效商品行
+                    # 如果有，说明是合法商品（不同子订单相同SKU），保留
+                    # 如果没有，说明是订单级备注污染，剔除
+                    p_tid = p.original_tid or ''
+                    if p_tid and (has_valid_items_by_tid.get(p_tid, False) or p_tid in all_tids_in_order):
+                        # 该子订单有有效商品行，或存在但全作废 → 是合法商品，保留
+                        filtered_parsed.append(p)
+                    else:
+                        # 该子订单没有有效商品行 → 确定是污染，剔除
+                        contamination_count += 1
             else:
                 # 该 SKU 没有现有商品行 → 可能是新尺寸/新商品，保留
                 filtered_parsed.append(p)
@@ -959,85 +1051,34 @@ class AutoAuditEngine:
         success_parsed = [p for p in filtered_parsed if p and p.success]
         non_success_parsed = [p for p in filtered_parsed if p and not p.success]
 
+        # 关键修复：按 (normalized_sku, num, original_tid) 分组，
+        # 确保不同子订单的商品永不互斥去重。
+        # 同一子订单内的相同SKU才需要去重（数量合并或保留最优）。
         dedup_groups = {}
         for p in success_parsed:
             norm_sku = _normalize_sku_for_dup(p.shop_mapping_sku)
-            key = (norm_sku, p.num)
-            if key not in dedup_groups:
-                dedup_groups[key] = []
-            dedup_groups[key].append(p)
+            # 以 (SKU, 数量, original_tid) 为分组键，确保跨子订单不去重
+            dedup_key = (norm_sku, p.num, p.original_tid or '')
+            if dedup_key not in dedup_groups:
+                dedup_groups[dedup_key] = []
+            dedup_groups[dedup_key].append(p)
 
         deduped_parsed = []
         dup_removed = 0
-        for key, candidates in dedup_groups.items():
+        for dedup_key, candidates in dedup_groups.items():
+            norm_sku, num, group_tid = dedup_key
+            
             if len(candidates) == 1:
                 deduped_parsed.append(candidates[0])
                 continue
 
-            # 获取该 SKU 对应的现有商品行的 original_tid 集合
-            expected_tids = existing_sku_tids.get(key, set())
-
-            # 关键修复：如果现有商品行包含多个不同的 original_tid，
-            # 说明是不同子订单拥有相同 SKU，应保留与现有 tid 匹配的所有候选
-            if len(expected_tids) > 1:
-                # 按 original_tid 分组候选
-                candidates_by_tid = {}
-                for p in candidates:
-                    tid = p.original_tid or ''
-                    if tid not in candidates_by_tid:
-                        candidates_by_tid[tid] = []
-                    candidates_by_tid[tid].append(p)
-
-                # 保留与现有商品行 tid 匹配的候选（每个 tid 保留一个最优的）
-                kept_tids = set()
-                for tid, group in candidates_by_tid.items():
-                    if tid in expected_tids or not expected_tids:
-                        # 该 tid 的商品行存在于现有订单中，保留
-                        best = None
-                        best_score = -1
-                        for p in group:
-                            score = 0
-                            if p.original_tid and "&" not in p.original_tid:
-                                score = 50
-                            else:
-                                score = 0
-                            if score > best_score:
-                                best_score = score
-                                best = p
-                        if best:
-                            deduped_parsed.append(best)
-                            kept_tids.add(tid)
-
-                # 对于与任何现有 tid 都不匹配的候选，按原逻辑选择最优的
-                unmatched_candidates = [p for p in candidates if p.original_tid not in kept_tids]
-                if unmatched_candidates:
-                    best = None
-                    best_score = -1
-                    for p in unmatched_candidates:
-                        score = 0
-                        if p.original_tid and "&" not in p.original_tid:
-                            score = 50
-                        else:
-                            score = 0
-                        if score > best_score:
-                            best_score = score
-                            best = p
-                    if best:
-                        deduped_parsed.append(best)
-
-                dup_removed += len(candidates) - len(kept_tids) - (1 if unmatched_candidates else 0)
-                continue
-
-            # 原有逻辑：单个 tid 的去重（纯重复解析）
+            # 同一子订单内的纯重复解析 → 保留最优的一个
             dup_removed += len(candidates) - 1
             best = None
             best_score = -1
-            expected_tid = next(iter(expected_tids)) if expected_tids else ''
             for p in candidates:
                 score = 0
-                if expected_tid and p.original_tid == expected_tid:
-                    score = 100  # 与现有商品行的 original_tid 完全匹配
-                elif p.original_tid and "&" not in p.original_tid:
+                if p.original_tid and "&" not in p.original_tid:
                     score = 50   # 有明确的子订单号（不含&）
                 else:
                     score = 0    # 含合并号或空
@@ -1048,7 +1089,7 @@ class AutoAuditEngine:
                 deduped_parsed.append(best)
 
         if dup_removed > 0:
-            print(f"  🧹 合并订单去重：移除 {dup_removed} 个重复解析结果")
+            print(f"  🧹 合并订单去重：移除 {dup_removed} 个同子订单内的重复解析结果")
 
         all_parsed_list = deduped_parsed + non_success_parsed
 

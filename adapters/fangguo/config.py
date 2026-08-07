@@ -22,6 +22,13 @@ AUTHORIZATION = get_authorization()
 COOKIE_STR = get_cookie_str()
 TENANT_ID = get_tenant_id()
 
+# Token 版本号：每次 reload_auth 时递增，供 adapter 检测 token 变化重建 session
+_TOKEN_VERSION = 0
+
+def get_token_version() -> int:
+    """获取当前 Token 版本号"""
+    return _TOKEN_VERSION
+
 # ========== 接口地址 ==========
 BASE_URL = "https://fangguo.com"
 API_QUERY_ORDER  = f"{BASE_URL}/fgapp/order/shop/trade/queryForPageForTrade"
@@ -66,7 +73,9 @@ MATERIAL_MAP = {
     "有机硅": "有机硅",
     "真有机硅": "有机硅",
     "浴室吸水科技布": "浴室吸水科技布",
+    "科技布": "浴室吸水科技布",
     "浴室吸水植绒": "浴室吸水植绒",
+    "吸水植绒": "浴室吸水植绒",
     "珍珠纱": "珍珠纱",
     "珍珠纱小地垫": "珍珠纱小地垫",
 }
@@ -86,9 +95,11 @@ def reload_auth():
     """
     重新加载鉴权信息。
     登录成功后调用此函数，使新Token立即生效。
+    同时递增 Token 版本号，供 adapter 检测并重建 session。
     """
-    global AUTHORIZATION, COOKIE_STR, TENANT_ID
+    global AUTHORIZATION, COOKIE_STR, TENANT_ID, _TOKEN_VERSION
     from auth_manager import get_authorization, get_cookie_str, get_tenant_id
     AUTHORIZATION = get_authorization()
     COOKIE_STR = get_cookie_str()
     TENANT_ID = get_tenant_id()
+    _TOKEN_VERSION += 1

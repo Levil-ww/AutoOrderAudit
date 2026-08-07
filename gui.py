@@ -186,6 +186,7 @@ class LoginDialog:
 
     def _login_callback(self, result):
         self.login_btn.config(state=tk.NORMAL, text="登 录", bg=COLORS["accent"])
+        self.password_var.set("")
 
         if result.success:
             self.status_label.config(
@@ -199,6 +200,7 @@ class LoginDialog:
 
     def _error_callback(self, error_msg):
         self.login_btn.config(state=tk.NORMAL, text="登 录", bg=COLORS["accent"])
+        self.password_var.set("")
         self.status_label.config(text=f"❌ 登录异常: {error_msg}", fg=COLORS["danger"])
 
     def _close_success(self):
@@ -262,6 +264,7 @@ class AutoAuditGUI:
         self.root.resizable(True, True)
         self.root.configure(bg=COLORS["bg"])
         self._running = False
+        self._running_lock = threading.Lock()
         self._batch_confirm_decision = None
 
         # 自动监控相关状态
@@ -760,12 +763,17 @@ class AutoAuditGUI:
         event = threading.Event()
 
         def _show():
-            result[0] = messagebox.askyesno("是否一键自动审单", msg)
+            try:
+                result[0] = messagebox.askyesno("是否一键自动审单", msg)
+            except Exception:
+                result[0] = False
             event.set()
 
         # 调度到主线程显示
         self.root.after(0, _show)
-        event.wait()
+        if not event.wait(timeout=300):
+            print("⚠️ 确认弹窗超时（5分钟），默认跳过")
+            result[0] = False
 
         # 缓存本次批量决策，后续订单自动沿用
         self._batch_confirm_decision = result[0]
@@ -775,9 +783,10 @@ class AutoAuditGUI:
     #  开始审单
     # ------------------------------------------------------------
     def _start_audit(self):
-        if self._running:
-            messagebox.showinfo("提示", "正在审单中，请等待完成...")
-            return
+        with self._running_lock:
+            if self._running:
+                messagebox.showinfo("提示", "正在审单中，请等待完成...")
+                return
 
         auth = load_auth()
         if not auth.authorization:
@@ -792,7 +801,8 @@ class AutoAuditGUI:
                 self._open_login()
             return
 
-        self._running = True
+        with self._running_lock:
+            self._running = True
         self._batch_confirm_decision = None  # 重置批量确认决策
         self.start_btn.config(state=tk.DISABLED, text="⏳ 审单中...", bg="#9ca3af")
         self.progress.start()
@@ -837,7 +847,8 @@ class AutoAuditGUI:
             self.root.after(0, self._finish_audit)
 
     def _finish_audit(self):
-        self._running = False
+        with self._running_lock:
+            self._running = False
         self._batch_confirm_decision = None  # 清理批量决策缓存
         self.start_btn.config(state=tk.NORMAL, text="▶ 开始审单", bg=COLORS["success"])
         self.progress.stop()
@@ -914,7 +925,9 @@ class AutoAuditGUI:
                 self.root.after(0, self._stop_monitor)
                 return
 
-            if self._running:
+            with self._running_lock:
+                _is_running = self._running
+            if _is_running:
                 self._monitor_stop_event.wait(timeout=3)
                 continue
 
@@ -1013,7 +1026,8 @@ class AutoAuditGUI:
 
     def _execute_audit_cycle(self, skip_cache: dict) -> int:
         """执行一次完整的审单周期"""
-        self._running = True
+        with self._running_lock:
+            self._running = True
         self._batch_confirm_decision = None
         processed = 0
 
@@ -1043,7 +1057,8 @@ class AutoAuditGUI:
             import traceback
             print(traceback.format_exc())
         finally:
-            self._running = False
+            with self._running_lock:
+                self._running = False
             self._batch_confirm_decision = None
 
         return processed

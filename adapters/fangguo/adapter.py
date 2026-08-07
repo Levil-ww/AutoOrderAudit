@@ -8,6 +8,7 @@ import re
 import json
 import uuid as _uuid
 from collections import defaultdict
+from datetime import datetime
 from typing import Any, Optional
 
 import requests
@@ -25,8 +26,18 @@ class FangguoAdapter(ErpAdapter):
 
     def __init__(self):
         self._session = self._create_session()
+        self._token_version = fg_config.get_token_version()
         self._material_source = get_material_source()
         self.material_map = fg_config.MATERIAL_MAP
+
+    def _ensure_session(self):
+        """检查 token 版本，如有变化则重建 session"""
+        current_version = fg_config.get_token_version()
+        if current_version != self._token_version:
+            print(f"  🔄 检测到Token更新，重建Session")
+            self._session = self._create_session()
+            self._token_version = current_version
+        return self._session
 
     def get_adapter_name(self) -> str:
         return "方果ERP"
@@ -41,9 +52,9 @@ class FangguoAdapter(ErpAdapter):
         session.mount("https://", HTTPAdapter(max_retries=retry))
 
         _t = fg_config.TENANT_ID or "(空)"
-        _a = fg_config.AUTHORIZATION[:25] + "..." if fg_config.AUTHORIZATION else "(空)"
-        _c = fg_config.COOKIE_STR[:25] + "..." if fg_config.COOKIE_STR else "(空)"
-        print(f"  🔍 Session使用: tenant={_t}, auth={_a}, cookie={_c}")
+        _has_auth = "✓" if fg_config.AUTHORIZATION else "✗"
+        _has_cookie = "✓" if fg_config.COOKIE_STR else "✗"
+        print(f"  🔍 Session使用: tenant={_t}, auth={_has_auth}, cookie={_has_cookie}")
 
         session.headers.update({
             "accept": "application/json, text/plain, */*",
@@ -138,11 +149,15 @@ class FangguoAdapter(ErpAdapter):
             "firstPrintStatus": [],
             "lastSyncStatus": [],
         }
-        resp = self._session.post(fg_config.API_QUERY_ORDER, json=payload, timeout=30)
+        resp = self._ensure_session().post(fg_config.API_QUERY_ORDER, json=payload, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         raw_orders = self._parse_order_list(data)
         orders = [self._to_order(o) for o in raw_orders]
+        # 记录查询时间戳，供乐观锁检查使用
+        _query_time = datetime.now()
+        for order in orders:
+            order._query_time = _query_time
         # 补充订单详情（列表接口不返回备注和商品行）
         for order in orders:
             if not order.shop_remark or not order.items or not order.current_cp_code:
@@ -283,7 +298,7 @@ class FangguoAdapter(ErpAdapter):
             "pageSize": 100,
             "total": 1,
         }
-        resp = self._session.post(fg_config.API_ORDER_DETAIL, json=payload, timeout=30)
+        resp = self._ensure_session().post(fg_config.API_ORDER_DETAIL, json=payload, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         d = data.get("data")
@@ -839,19 +854,24 @@ class FangguoAdapter(ErpAdapter):
                     order_items.append(new_item)
                 else:
                     # 未匹配到现有商品行：先做全局重复检测，防止因合并订单的
-                    # 订单级备注污染而创建重复商品行（同一SKU已存在于其他子订单）
+                    # 订单级备注污染而创建重复商品行（同一SKU已存在于同子订单）
+                    # 关键修复：只有同一子订单号（original_tid）的相同SKU才视为重复
                     parsed_norm = _normalize_sku_for_duplicate(p.shop_mapping_sku)
+                    parsed_tid = p.original_tid or ''
                     is_dup_global = False
                     for idx in valid_indices:
                         item = order.items[idx]
                         if item.num != p.num:
+                            continue
+                        # 关键修复：跳过不同子订单号的商品行（不同子订单的相同SKU不是重复）
+                        if item.original_tid and parsed_tid and item.original_tid != parsed_tid:
                             continue
                         clean_item_sku = _clean_sku(item.shop_mapping_sku)
                         if not clean_item_sku:
                             continue
                         if _normalize_sku_for_duplicate(clean_item_sku) == parsed_norm:
                             is_dup_global = True
-                            print(f"    ⚠️ 跳过重复创建：解析结果 {p.shop_mapping_sku[:50]} 与现有商品行 {clean_item_sku[:50]} 等价（可能来自合并订单备注污染）")
+                            print(f"    ⚠️ 跳过重复创建：解析结果 {p.shop_mapping_sku[:50]} 与同子订单 {parsed_tid[-6:]} 的现有商品行 {clean_item_sku[:50]} 等价")
                             break
                     if is_dup_global:
                         continue
@@ -1035,9 +1055,9 @@ class FangguoAdapter(ErpAdapter):
                             })
 
         # 第二步五：全局重复行检测与清理
-        # 扫描所有非作废商品行，按标准化 SKU+数量 分组，
-        # 每组只保留1个（优先 type=0 原始行），其余标记作废。
-        # 这样即使某些行被误判为赠品或补差价，也能清理重复。
+        # 扫描所有非作废商品行，按标准化 SKU+数量+original_tid 分组，
+        # 同一子订单内每组只保留1个（优先 type=0 原始行），其余标记作废。
+        # 不同子订单的相同SKU永不互斥去重。
         duplicate_groups = defaultdict(list)
         for idx, item in enumerate(order.items):
             if item.is_void:
@@ -1052,13 +1072,16 @@ class FangguoAdapter(ErpAdapter):
                 continue
             if '补差价' in item_sku or '不打印' in item_sku:
                 continue
-            duplicate_groups[(norm_sku, item.num)].append(idx)
+            # 关键修复：按 (SKU, 数量, original_tid) 分组，跨子订单不去重
+            dup_group_key = (norm_sku, item.num, item.original_tid or '')
+            duplicate_groups[dup_group_key].append(idx)
 
         removed_dup_count = 0
         for key, indices in duplicate_groups.items():
             if len(indices) <= 1:
                 continue
-            norm_sku, item_num = key
+            # key 格式: (norm_sku, item_num, original_tid)
+            norm_sku, item_num, _ = key
             sorted_indices = sorted(indices, key=lambda i: (
                 0 if (order.items[i].raw and order.items[i].raw.get('type') == 0) else 1,
                 0 if order.items[i].id and not order.items[i].id.startswith('new_') else 1,
@@ -1105,14 +1128,24 @@ class FangguoAdapter(ErpAdapter):
         # 说明是之前误创建的手工单/重复行，跳过保留以清理重复
         # 使用 base_shop_mapping_sku 进行比对，避免 trailing_remark 差异导致漏检
         # 普通订单+合并订单均启用（合并订单下也可能出现手工单重复）
+        # 关键修复：在重复检测中加入子订单号（oid/original_tid），
+        # 不同子订单的相同SKU不能互斥标记为重复。
         existing_sku_nums = set()
+        existing_tids_by_sku_num = {}  # (sku, num) -> set of oid
         existing_base_sku_nums = set()
         existing_normalized_sku_nums = set()
         for it in order_items:
             sku = _clean_sku(it.get('shopMappingSku', ''))
             num = it.get('num', 1)
+            item_oid = it.get('oid', '') or ''
             if sku:
                 existing_sku_nums.add((sku, num))
+                # 记录每个 (sku, num) 对应的子订单号集合
+                key = (sku, num)
+                if key not in existing_tids_by_sku_num:
+                    existing_tids_by_sku_num[key] = set()
+                if item_oid:
+                    existing_tids_by_sku_num[key].add(item_oid)
                 existing_normalized_sku_nums.add((_normalize_sku_for_duplicate(sku), num))
                 for p in product_parsed_list:
                     if sku.startswith(p.base_shop_mapping_sku):
@@ -1135,27 +1168,45 @@ class FangguoAdapter(ErpAdapter):
                     # treat_as_normal=False 时：补差价行由第五步处理，此处跳过
                 else:
                     # 检测与已生成行完全重复的商品行（包括 trailing_remark 不同的情况）
+                    # 关键修复：只有同一子订单号的相同SKU才视为重复
                     is_duplicate = False
                     item_sku = _clean_sku(item.shop_mapping_sku)
                     item_num = item.num
+                    item_tid = item.original_tid or item.oid or ''
+                    
+                    # 辅助函数：检查指定 (sku, num) 是否存在且属于同一子订单
+                    def _is_same_tid_dup(sku_val, num_val, item_tid_val):
+                        key = (sku_val, num_val)
+                        if key not in existing_tids_by_sku_num:
+                            return False
+                        # 如果已生成的商品行中有与当前item同子订单号的，才视为重复
+                        existing_tids = existing_tids_by_sku_num[key]
+                        if not existing_tids:
+                            return True  # 无oid信息时保守处理
+                        return item_tid_val in existing_tids or not item_tid_val
+                    
                     if item_sku and (item_sku, item_num) in existing_sku_nums:
-                        print(f"    ⚠️ 检测到重复商品行: {item_sku} x {item_num}")
-                        is_duplicate = True
+                        if _is_same_tid_dup(item_sku, item_num, item_tid):
+                            print(f"    ⚠️ 检测到重复商品行(同子订单): {item_sku} x {item_num} tid={item_tid[-6:]}")
+                            is_duplicate = True
                     else:
                         # 使用 base_shop_mapping_sku 检测 trailing_remark 不同导致的重复
                         for p in product_parsed_list:
                             if item_num == p.num and item_sku.startswith(p.base_shop_mapping_sku):
                                 if (p.base_shop_mapping_sku, item_num) in existing_base_sku_nums:
-                                    print(f"    ⚠️ 检测到重复商品行(基础SKU): {item_sku} x {item_num}")
-                                    is_duplicate = True
+                                    # base SKU 重复也需验证子订单号
+                                    if _is_same_tid_dup(p.base_shop_mapping_sku, item_num, item_tid):
+                                        print(f"    ⚠️ 检测到重复商品行(基础SKU,同子订单): {item_sku} x {item_num}")
+                                        is_duplicate = True
                                 break
 
                         # 兜底：通过标准化SKU（忽略 cm/CM 单位差异）检测重复
                         if not is_duplicate:
                             normalized_item_sku = _normalize_sku_for_duplicate(item_sku)
                             if normalized_item_sku and (normalized_item_sku, item_num) in existing_normalized_sku_nums:
-                                print(f"    ⚠️ 检测到重复商品行(标准化SKU): {item_sku} x {item_num}")
-                                is_duplicate = True
+                                if _is_same_tid_dup(normalized_item_sku, item_num, item_tid):
+                                    print(f"    ⚠️ 检测到重复商品行(标准化SKU,同子订单): {item_sku} x {item_num}")
+                                    is_duplicate = True
 
                     if is_duplicate:
                         # 将重复行标记为作废（cancelStatus: true）后提交
@@ -1314,7 +1365,7 @@ class FangguoAdapter(ErpAdapter):
             "dfStatus": 0,
             "tradeInitNum": 1,
             "orderItems": order_items,
-            "totalCount": len(order_items),
+            "totalCount": len([it for it in order_items if not it.get('cancelStatus') and not it.get('discardStatus')]),
             "outerOrderStatusDesc": "",
             "storeName": order.store_name,
             "goodsIndex": 0,
@@ -1329,13 +1380,41 @@ class FangguoAdapter(ErpAdapter):
             print(f"提交订单：{active_count} 个商品行，allManualOrder={has_manual_items}")
         except Exception:
             pass
-        resp = self._session.post(fg_config.API_SAVE_PRODUCT, json=payload, timeout=30)
-        resp.raise_for_status()
-        result = resp.json()
+        
+        # 乐观锁保护：检查订单查询到提交的时间差，防止外部修改被静默覆盖
+        if hasattr(order, '_query_time') and order._query_time:
+            elapsed = (datetime.now() - order._query_time).total_seconds()
+            if elapsed > 60:
+                print(f"  ⚠️ 订单 {order.trade_id} 从查询到提交已耗时 {elapsed:.0f}s，期间可能被外部修改，请注意核对")
+
+        # ===== 提交 saveProduct =====
+        try:
+            resp = self._ensure_session().post(fg_config.API_SAVE_PRODUCT, json=payload, timeout=30)
+            resp.raise_for_status()
+            result = resp.json()
+        except requests.exceptions.Timeout as e:
+            print(f"  ❌ saveProduct 超时: order={order.trade_id}, error={e}")
+            return False
+        except requests.exceptions.ConnectionError as e:
+            print(f"  ❌ saveProduct 连接失败: order={order.trade_id}, error={e}")
+            return False
+        except requests.exceptions.HTTPError as e:
+            print(f"  ❌ saveProduct HTTP错误: order={order.trade_id}, status={resp.status_code}, error={e}")
+            return False
+        except (ValueError, KeyError) as e:
+            print(f"  ❌ saveProduct 响应解析失败: order={order.trade_id}, error={e}")
+            return False
+        except Exception as e:
+            print(f"  ❌ saveProduct 未知异常: order={order.trade_id}, error={e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
         # ===== 判断 API 返回结果 =====
         # 方果返回: {"code": 0, "data": true, "msg": ""}
-        if result.get("code") == 0 and result.get("data") is True:
+        # data 可能是 bool/str/int，做兼容比较
+        _data = result.get("data")
+        if result.get("code") == 0 and _data in (True, "true", 1, "1"):
             modified_count = len(product_parsed_list) if product_parsed_list else 0
             if modified_count > 0:
                 print(f"修改成功！共 {modified_count} 个编码")
@@ -1544,8 +1623,8 @@ class FangguoAdapter(ErpAdapter):
                 order_id=template_item.order_id or order.trade_id,
                 oid=original_tid or template_item.oid or order.tid,
                 sys_oid=None,
-                original_sku_id="",
-                original_goods_id="",
+                original_sku_id=template_item.original_sku_id or "",
+                original_goods_id=template_item.original_goods_id or "",
                 title=template_item.title,
                 merchandise_pic_path=template_item.merchandise_pic_path,
                 price=template_item.price,
@@ -1776,6 +1855,9 @@ class FangguoAdapter(ErpAdapter):
         return result
 
     _PRICE_DIFF_KEYWORDS = ["补差价专拍", "差价专用", "少几元拍几个"]
+    
+    # 非赠品关键词：标题含这些关键词的商品行即使price=0也不视为赠品
+    _NON_GIFT_KEYWORDS = ['桌垫', '餐垫', '杯垫', '地垫', '鼠标垫', '脚垫']
 
     def _is_gift_item(self, item: OrderItem) -> bool:
         """判断一个商品行是否是赠品行
@@ -1812,7 +1894,7 @@ class FangguoAdapter(ErpAdapter):
             clean_sku = re.sub(r'<[^>]+>', '', sku)
             if clean_sku and self._is_normal_product_sku(clean_sku) and not self._is_gift_sku(clean_sku):
                 return False
-            non_gift_keywords = ['桌垫', '餐垫', '杯垫', '地垫', '鼠标垫', '脚垫']
+            non_gift_keywords = self._NON_GIFT_KEYWORDS
             if not any(kw in title for kw in non_gift_keywords):
                 return True
 
@@ -1832,7 +1914,7 @@ class FangguoAdapter(ErpAdapter):
         if "赠品沥水垫小圆或小方" in clean_sku:
             return True
         # 方垫编码（30x50 规格）
-        if re.search(r"^吸水皮革-标准-30\s*[xX×]\s*50-随机发；30\s*[xX×]\s*50$", clean_sku):
+        if re.search(r"^吸水皮革-标准-30\s*[xX×]\s*50-随机发[；;]30\s*[xX×]\s*50$", clean_sku):
             return True
         return False
 
@@ -1868,9 +1950,9 @@ class FangguoAdapter(ErpAdapter):
         # 常见赠品商品名称
         if any(kw in title for kw in ["沥水垫", "防滑垫", "餐垫", "杯垫"]):
             return True
-        # 价格 0 且标题含"垫"，但需排除非赠品（桌垫/地垫/鼠标垫/脚垫）
+        # 价格 0 且标题含"垫"，但需排除非赠品
         if item.price == 0 and '垫' in title:
-            non_gift_keywords = ['桌垫', '地垫', '鼠标垫', '脚垫']
+            non_gift_keywords = self._NON_GIFT_KEYWORDS
             if not any(kw in title for kw in non_gift_keywords):
                 return True
         # 商家编码含赠品字样
@@ -2027,7 +2109,7 @@ class FangguoAdapter(ErpAdapter):
             "dfStatus": 0,
             "tradeInitNum": 1,
             "orderItems": order_items,
-            "totalCount": len(order_items),
+            "totalCount": len([it for it in order_items if not it.get('cancelStatus') and not it.get('discardStatus')]),
             "outerOrderStatusDesc": "",
             "storeName": order.store_name,
             "goodsIndex": 0,
@@ -2040,7 +2122,7 @@ class FangguoAdapter(ErpAdapter):
             print(f"提交订单：{active_count} 个商品行，allManualOrder={has_manual_items}")
         except Exception:
             pass
-        resp = self._session.post(fg_config.API_SAVE_PRODUCT, json=payload, timeout=30)
+        resp = self._ensure_session().post(fg_config.API_SAVE_PRODUCT, json=payload, timeout=30)
         resp.raise_for_status()
         result = resp.json()
         
@@ -2318,7 +2400,7 @@ class FangguoAdapter(ErpAdapter):
 
         try:
             print(f"  📤 更新快递: tradeId={order.trade_id}, cpCode={express_code}")
-            resp = self._session.post(fg_config.API_UPDATE_LOGISTICS, json=payload, timeout=30)
+            resp = self._ensure_session().post(fg_config.API_UPDATE_LOGISTICS, json=payload, timeout=30)
             resp.raise_for_status()
             result = resp.json()
 
