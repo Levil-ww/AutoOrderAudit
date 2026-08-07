@@ -1,0 +1,271 @@
+================================================================================
+  AutoOrderAudit 程序潜在风险与 Bug 优化清单
+  生成日期：2026-08-07
+  基于代码版本：commit 7c6a084 + 工作区未提交改动
+  涉及文件：core/engine.py、adapters/fangguo/adapter.py、adapters/fangguo/config.py
+            auth_client.py、auth_manager.py、gui.py
+================================================================================
+
+说明：本清单按【风险等级】分类，每项包含【问题描述】【涉及位置】【触发条件】
+      【影响】【优化建议】。等级划分：
+  [高] 可能导致订单商品行数据错误或功能异常
+  [中] 边缘场景触发或健壮性不足，影响可靠性
+  [低] 代码质量/可维护性问题，暂无数据风险
+
+
+================================================================================
+一、合并订单与去重逻辑
+================================================================================
+
+【风险 1】[高] 跨分组污染过滤对"全作废子订单"判断不够严谨
+  涉及位置：core/engine.py  _process_merged_order 污染过滤段（约 L999-L1045）
+  问题描述：
+    污染过滤逻辑预计算 has_valid_items_by_tid（非作废、非赠品、非补差价）和
+    all_tids_in_order（所有出现过的 tid，含全作废）。当解析结果 SKU 在其他组存在时，
+    判断条件为：
+        if p_tid and (has_valid_items_by_tid.get(p_tid, False) or p_tid in all_tids_in_order):
+            保留
+    即"该子订单有有效商品行"或"该 tid 曾出现在订单中"都判定为合法保留。
+  触发条件：
+    某子订单的所有商品行已被作废（cancelStatus=True），但订单中仍残留该 tid，
+    且其备注解析出的 SKU 与另一活跃子订单相同。
+  影响：
+    全作废子订单的解析结果会被保留并尝试写回 ERP，可能产生重复商品行或挂在
+    已作废子订单下的孤立行。
+  优化建议：
+    将"tid 曾出现"与"tid 有有效商品行"区分开。全作废子订单的解析结果应进入
+    二次校验：仅当其 SKU 不与任何活跃子订单冲突时才保留，否则按污染剔除。
+    即把 `p_tid in all_tids_in_order` 这一宽松兜底收紧为
+    `has_valid_items_by_tid.get(p_tid, False)`，并对全作废场景单独打日志确认。
+
+
+【风险 2】[中] _erp_original_tid 为动态注入属性，依赖运行时对象同一性
+  涉及位置：core/engine.py  _process_merged_order（约 L710-L715）
+  问题描述：
+    `if not hasattr(item, '_erp_original_tid'): item._erp_original_tid = item.original_tid`
+    该属性未在 OrderItem 类定义中声明，通过运行时动态注入保存 ERP 原始 tid。
+  触发条件：
+    若未来 OrderItem 引入 __slots__、被 deepcopy/序列化/跨进程传递，
+    该属性会静默丢失，后续依赖它的逻辑（如分组键回退）将拿到 None 或旧值。
+  影响：
+    当前进程内单次处理无碍；重构后可能出现分组错乱。
+  优化建议：
+    将 _erp_original_tid 纳入 OrderItem 类正式字段（dataclass 字段或 __init__ 参数），
+    消除动态属性依赖，提升类型安全。
+
+
+【风险 3】[低] 前缀碰撞检测仅基于 count>1，语义正确但可读性可加强
+  涉及位置：core/engine.py  _process_merged_order（约 L696-L740）
+  问题描述：
+    has_prefix_collision = any(v > 1 for v in amp_tid_prefixes.values())
+    逻辑正确：同一前缀对应多个含&完整ID即碰撞，改用完整ID分组。
+  影响：
+    无数据风险。仅注释可进一步说明"前缀相同且完整ID相同（同子订单多行）"
+    也归入此分支，结果是归为一组，行为正确。
+  优化建议：
+    补充单元测试覆盖"同前缀不同完整ID"与"同前缀同完整ID"两种碰撞子场景，
+    防止后续重构破坏。
+
+
+================================================================================
+二、缓存与幂等校验
+================================================================================
+
+【风险 4】[中] 期望签名使用 hash() 受 PYTHONHASHSEED 影响，跨进程不稳定
+  涉及位置：core/engine.py  _compute_expected_key（约 L136-L140）
+  问题描述：
+    `parts.append(("rm", hash(shop_remark + "|" + buyer_remark)))`
+    Python 内置 hash() 对字符串启用随机化，不同进程/不同启动结果不同。
+  触发条件：
+    当前 skip_cache 为进程内字典、不持久化，同一进程内一致，暂无问题。
+    一旦未来将 skip_cache 持久化到磁盘或跨进程共享，会全部失效或误判。
+  影响：
+    当前无；未来扩展时隐患大。
+  优化建议：
+    改用 hashlib（如 hashlib.md5(...).hexdigest()）生成稳定摘要，
+    为缓存持久化预留兼容性，同时避免 hash() 的 -1 哨兵陷阱。
+
+
+【风险 5】[低] dry_run 模式不写入 skip_cache，转正式运行会全量重处理
+  涉及位置：core/engine.py  _update_skip_cache（约 L166-L168）
+  问题描述：
+    `if expected_key and not self.dry_run: self.skip_cache[order.trade_id] = expected_key`
+    dry_run 时不写缓存，行为正确（避免测试态污染正式态）。
+  影响：
+    dry_run 验证后转正式运行，所有订单重新处理一遍，性能开销但无数据错误。
+  优化建议：
+    在 GUI/日志中提示"dry_run 不缓存，正式运行将重新处理全部订单"，
+    避免用户误以为 dry_run 已确认的订单会被跳过。
+
+
+================================================================================
+三、Token 与 Session 管理
+================================================================================
+
+【风险 6】[中] token.json 文件权限在 Windows 上收紧效果有限
+  涉及位置：auth_manager.py  save_auth（约 L140-L148）
+  问题描述：
+    `os.chmod(TOKEN_FILE, stat.S_IRUSR | stat.S_IWUSR)`
+    Windows 的 os.chmod 仅能切换"只读"位，无法像 Linux 那样限制其他用户访问，
+    NTFS ACL 才是 Windows 真正的权限模型。
+  影响：
+    同机其他用户仍可能读取 token.json 中的 Bearer Token 与 JSESSIONID。
+  优化建议：
+    Windows 下改用 icacls 命令或 pywin32 设置 ACL 仅当前用户可访问；
+    或将敏感凭据改存于系统凭据管理器（keyring/Credential Manager），
+    而非明文 JSON 文件。
+
+
+【风险 7】[低] _ensure_session 已覆盖全部 API，但新增方法易遗漏
+  涉及位置：adapters/fangguo/adapter.py（L33-L40，调用点 L152/301/1392/2125/2403）
+  问题描述：
+    当前 query_orders / order_detail / saveProduct(×2) / update_logistics 均通过
+    `self._ensure_session().post(...)` 调用，Token 版本变化能正确重建 session。
+    但该机制依赖每个新方法手动调用 _ensure_session()，无强制约束。
+  影响：
+    未来新增 API 方法若直接用 self._session.post 会绕过版本检测，
+    导致登录后新 Token 不生效。
+  优化建议：
+    将 self._session 改为 @property，getter 内自动调用 _ensure_session()，
+    使所有 `self._session.post(...)` 隐式检测版本，杜绝遗漏。
+
+
+【风险 8】[低] _TOKEN_VERSION 全局变量多线程无锁访问
+  涉及位置：adapters/fangguo/config.py（L26, L100-L105）
+  问题描述：
+    _TOKEN_VERSION 为模块级全局变量，reload_auth() 中 `_TOKEN_VERSION += 1`
+    非原子操作；get_token_version() 读取也无锁。
+  影响：
+    GIL 保护下整数读写最坏导致版本号偶尔少加一次，结果是多重建一次 session，
+    无数据错误。风险极低。
+  优化建议：
+    若追求严谨可加 threading.Lock 保护，或改用 itertools.count() 原子递增。
+
+
+================================================================================
+四、GUI 并发与健壮性
+================================================================================
+
+【风险 9】[中] _start_audit 的检查-设置两段加锁存在间隙
+  涉及位置：gui.py  _start_audit（约 L786-L803）
+  问题描述：
+    with self._running_lock:
+        if self._running: return          # 检查
+    ...（间隙）...
+    with self._running_lock:
+        self._running = True               # 设置
+    检查与设置分两次加锁，中间有窗口。
+  触发条件：
+    用户极快速连续点击"开始审单"，两个线程都通过检查后再各自设置。
+  影响：
+    可能启动两个审单线程，产生重复请求/日志混乱。实际人工点击难以触发。
+  优化建议：
+    合并为单次加锁：with self._running_lock:
+        if self._running: return
+        self._running = True
+    一次临界区内完成检查+设置，消除间隙。
+
+
+【风险 10】[中] 确认弹窗超时默认跳过，可能导致订单积压
+  涉及位置：gui.py  _show_confirm_dialog（约 L763-L775）
+  问题描述：
+    event.wait(timeout=300) 超时后 result[0]=False（跳过审单）。
+    遵循"安全优先"原则，但用户若离开屏幕，订单会持续积压不处理。
+  影响：
+    自动监控模式下长时间无人值守会导致订单延迟。
+  优化建议：
+    超时后给出醒目日志/声音提示；或提供配置项让用户选择超时行为
+    （跳过 / 自动确认），兼顾安全与效率。
+
+
+【风险 11】[低] 异常堆栈 print(tb) 可能泄露敏感信息
+  涉及位置：core/engine.py（约 L543-L548, L592-L597）
+  问题描述：
+    except 块内 `import traceback; tb = traceback.format_exc(); print(tb)`
+    将完整堆栈输出到控制台/GUI 日志，可能包含请求 URL、请求体、
+    Authorization 头等敏感字段。
+  影响：
+    调试有用，但生产日志若被共享可能泄露 Token。
+  优化建议：
+    对堆栈中的 authorization/cookie 字段脱敏后再打印；
+    或仅 DRY_RUN 模式打印完整堆栈，正式模式仅打印异常消息。
+
+
+================================================================================
+五、赠品处理
+================================================================================
+
+【风险 12】[中] 赠品换赠品宽松检测仅处理第一个匹配项
+  涉及位置：adapters/fangguo/adapter.py（约 L946-L957）
+  问题描述：
+    is_gift_exchange 场景下宽松检测 _looks_like_gift_item，匹配后立即 break，
+    只回收第一个疑似赠品行。
+  触发条件：
+    备注含"换赠品"且订单中存在多个未被严格识别的原赠品行。
+  影响：
+    多余的旧赠品行不会被回收，可能残留为重复赠品行。
+  优化建议：
+    移除 break，遍历收集所有 _looks_like_gift_item 的行加入
+    existing_gifts_by_tid，按子订单号分组参与后续精确匹配。
+
+
+================================================================================
+六、测试与代码质量
+================================================================================
+
+【风险 13】[中] 测试用 type() 动态构造解析结果对象，绕过真实类
+  涉及位置：Test/test_cross_suborder_dedup.py（L105-L134, L273-L287, L395-L409）
+  问题描述：
+    测试用 `type('Parsed', (), {...})()` 动态创建对象模拟 ParsedRemark，
+    而非使用真实的 ParsedRemark 类构造。
+  影响：
+    若 ParsedRemark 新增必填字段或改变行为，测试不会感知，
+    可能产生"测试通过但实际失败"的假阳性。
+  优化建议：
+    测试应直接 import 并构造 ParsedRemark 实例，保证字段一致性；
+    动态 mock 仅用于隔离外部依赖（如 material_matcher），不应替代被测数据模型。
+
+
+【风险 14】[低] traceback 在 except 块内局部重复 import
+  涉及位置：core/engine.py（L543, L592 等多处）
+  问题描述：
+    `import traceback` 在多个 except 块内局部导入，虽功能正确但风格不统一。
+  优化建议：
+    在文件顶部统一 `import traceback`，except 块内直接使用。
+
+
+【风险 15】[低] adapter.py / config.py 改动因 autocrlf 在 git diff 中不可见
+  涉及位置：仓库 git 配置 core.autocrlf=true
+  问题描述：
+    本机 core.autocrlf=true，导致 adapter.py、config.py 的内容改动在
+    `git diff`（非 -w）中有时输出为空，仅 git status 显示 modified，
+    影响 code review 与改动核查。
+  优化建议：
+    统一仓库 .gitattributes 指定 *.py text eol=lf，避免 CRLF 干扰 diff；
+    review 时使用 `git diff -w` 或 `git diff --ignore-cr-at-eol` 核查。
+
+
+================================================================================
+七、优化优先级建议
+================================================================================
+
+  立即处理（影响数据正确性）：
+    - 风险 1：全作废子订单污染过滤收紧
+    - 风险 9：_start_audit 检查-设置合并为单次加锁
+
+  近期处理（影响可靠性/安全）：
+    - 风险 6：token.json Windows ACL 收紧
+    - 风险 12：赠品换赠品宽松检测移除 break
+    - 风险 13：测试改用真实 ParsedRemark 类
+    - 风险 7：_session 改为 property 自动检测版本
+
+  后续迭代（健壮性/可维护性）：
+    - 风险 2：_erp_original_tid 纳入 OrderItem 字段
+    - 风险 4：缓存签名改用 hashlib
+    - 风险 10：确认弹窗超时行为可配置
+    - 风险 11：异常堆栈敏感字段脱敏
+    - 风险 14/15：代码风格与 git 配置规范化
+
+================================================================================
+  本清单随版本迭代持续更新，处理完成后请在对应项标注 [已修复] 及日期。
+================================================================================
