@@ -1686,8 +1686,11 @@ class FangguoAdapter(ErpAdapter):
         赠品编码规则：
         - 包含"圆垫"或"沥水垫25cm" -> 吸水皮革-标准-赠品沥水垫小圆或小方-赠品沥水垫小圆或小方
         - 包含"方垫"或"30x50"   -> 吸水皮革-标准-30x50-随机发；30x50
+        
+        注意：赠品材质固定为"吸水皮革"，不继承商品材质（与项目硬约束一致）
         """
-        gift_material = material_code or "吸水皮革"
+        # 硬约束：赠品材质固定为"吸水皮革"
+        gift_material = "吸水皮革"
         if "圆垫" in gift_name or "沥水垫25cm" in gift_name:
             gift_type = 'round'
         elif "方垫" in gift_name or re.search(r"30\s*[xX×*]\s*50", gift_name):
