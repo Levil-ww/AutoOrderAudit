@@ -216,7 +216,7 @@ def parse_remark(
     text = remark_text.strip()
 
     # 情况1：已经是编码格式 "材质-标准/定制-尺寸-花型;尺寸" 或 现货编码 "材质-标准-尺寸-花型;尺寸"
-    if "-" in text and not text.startswith("定制") and not text.startswith("现货"):
+    if "-" in text and not text.startswith("定制") and not text.startswith("现货") and not text.startswith("实际发"):
         parts = text.split("-")
         if len(parts) >= 4 and ";" in parts[-1]:
             result.material_code = _map_material(parts[0], material_map)
@@ -241,21 +241,25 @@ def parse_remark(
             return result
 
     # 情况2：解析备注
-    # 检测"定制"或"现货"关键字（处理"等通知发 定制..."这种情况）
+    # 检测"定制"、"现货"或"实际发"关键字（"实际发"与"现货"处理方式一致）
     custom_pos = text.find("定制")
     is_custom = custom_pos != -1
 
     stock_pos = text.find("现货")
-    is_stock = stock_pos != -1
+    actual_pos = text.find("实际发")
+    # "现货"和"实际发"均为现货编码格式
+    is_stock = (stock_pos != -1) or (actual_pos != -1)
 
-    # 优先级：定制优先于现货（如果同时存在，视为定制）
+    # 优先级：定制优先于现货/实际发（如果同时存在，视为定制）
     if is_custom and is_stock:
         is_stock = False
 
     if is_custom:
         body = text[custom_pos:]
     elif is_stock:
-        body = text[stock_pos:]
+        # 取最早出现的现货/实际发位置作为body起点
+        stock_starts = [p for p in [stock_pos, actual_pos] if p != -1]
+        body = text[min(stock_starts):]
     else:
         body = text
 
@@ -305,14 +309,16 @@ def parse_remark(
                 # 有分号：取分号之后到尺寸之前的文本
                 size_prefix = before_size[last_semi + 1:].strip().strip("-;,、，；")
             else:
-                # 没有分号：直接使用尺寸之前的文本（去掉"定制"/"现货"/材质前缀后作为尺寸前缀候选）
+                # 没有分号：直接使用尺寸之前的文本（去掉"定制"/"现货"/"实际发"/材质前缀后作为尺寸前缀候选）
                 candidate = before_size
-                # 去掉"定制"、"现货"前缀
-                while candidate.startswith("定制") or candidate.startswith("现货"):
+                # 去掉"定制"、"现货"、"实际发"前缀
+                while candidate.startswith("定制") or candidate.startswith("现货") or candidate.startswith("实际发"):
                     if candidate.startswith("定制"):
                         candidate = candidate[2:].strip()
                     elif candidate.startswith("现货"):
                         candidate = candidate[2:].strip()
+                    elif candidate.startswith("实际发"):
+                        candidate = candidate[3:].strip()
                 # 去掉材质名（支持任意位置出现的材质名，而非只是开头）
                 for mat in sorted(_HEURISTIC_MATERIALS, key=len, reverse=True):
                     if mat in candidate:
@@ -465,8 +471,8 @@ def parse_remark(
         body_offset = text.find(body) if body != text else 0
         first_size_start = sizes_with_pos[0][2] + body_offset
         before_size = text[:first_size_start].strip()
-        # 去掉"定制"/"现货"前缀
-        before_size = re.sub(r'^(?:定制|现货)', '', before_size).strip()
+        # 去掉"定制"/"现货"/"实际发"前缀
+        before_size = re.sub(r'^(?:定制|现货|实际发)', '', before_size).strip()
         # 从右向左找材质名，材质名之前的内容就是花型
         best_pattern = ""
         for key in sorted(material_map.keys(), key=len, reverse=True):
@@ -474,7 +480,7 @@ def parse_remark(
                 key_pos = before_size.rfind(key)
                 candidate = before_size[:key_pos].strip()
                 candidate = re.sub(r'[，,；;、-]+$', '', candidate).strip()
-                candidate = re.sub(r'(?:定制|现货)\s*$', '', candidate).strip()
+                candidate = re.sub(r'(?:定制|现货|实际发)\s*$', '', candidate).strip()
                 if candidate:
                     best_pattern = candidate
                 break
@@ -484,21 +490,23 @@ def parse_remark(
                     mat_pos = before_size.rfind(mat)
                     candidate = before_size[:mat_pos].strip()
                     candidate = re.sub(r'[，,；;、-]+$', '', candidate).strip()
-                    candidate = re.sub(r'(?:定制|现货)\s*$', '', candidate).strip()
+                    candidate = re.sub(r'(?:定制|现货|实际发)\s*$', '', candidate).strip()
                     if candidate:
                         best_pattern = candidate
                     break
         pattern_name = best_pattern if best_pattern else before_size.strip().strip("-;,，")
 
-    # 去掉可能残留的"定制"或"现货"前缀（循环处理）
-    while pattern_name.startswith("定制") or pattern_name.startswith("现货"):
+    # 去掉可能残留的"定制"、"现货"或"实际发"前缀（循环处理）
+    while pattern_name.startswith("定制") or pattern_name.startswith("现货") or pattern_name.startswith("实际发"):
         if pattern_name.startswith("定制"):
             pattern_name = pattern_name[2:].strip()
         elif pattern_name.startswith("现货"):
             pattern_name = pattern_name[2:].strip()
-    # 清理末尾的分隔符和残留的"定制/现货"
+        elif pattern_name.startswith("实际发"):
+            pattern_name = pattern_name[3:].strip()
+    # 清理末尾的分隔符和残留的"定制/现货/实际发"
     pattern_name = re.sub(r'[，,；;、-]+$', '', pattern_name).strip()
-    pattern_name = re.sub(r'(?:定制|现货)\s*$', '', pattern_name).strip()
+    pattern_name = re.sub(r'(?:定制|现货|实际发)\s*$', '', pattern_name).strip()
 
     # 先检查是否匹配已知花型关键词（更健壮的方式）
     # 按长度从长到短排序，优先匹配更长的关键词（如"真爱花"优先于"爱花"）
@@ -601,26 +609,28 @@ def extract_multiple_remarks(
 
     text = remark_text.strip()
 
-    # 在整个文本中搜索"定制"或"现货"关键字（处理"等通知发 定制..."这种情况）
+    # 在整个文本中搜索"定制"、"现货"或"实际发"关键字（"实际发"与"现货"处理方式一致）
     custom_pos = text.find("定制")
     is_custom = custom_pos != -1
     stock_pos = text.find("现货")
-    is_stock_text = stock_pos != -1
+    actual_pos = text.find("实际发")
+    is_stock_text = (stock_pos != -1) or (actual_pos != -1)
 
-    # 优先级：定制优先于现货（如果同时存在，视为定制）
+    # 优先级：定制优先于现货/实际发（如果同时存在，视为定制）
     if is_custom and is_stock_text:
         is_stock_text = False
 
     if is_custom:
         body = text[custom_pos:]
     elif is_stock_text:
-        body = text[stock_pos:]
+        stock_starts = [p for p in [stock_pos, actual_pos] if p != -1]
+        body = text[min(stock_starts):]
     else:
         body = text
 
     # 优先检测是否为直接编码格式（如现货编码 "双面格-标准-33x120-塞纳时光;33x120"）
-    # 编码格式的特征：含"-"、不以"定制"/"现货"开头、按"-"分割后>=4段且最后一段含分号
-    if "-" in text and not text.startswith("定制") and not text.startswith("现货"):
+    # 编码格式的特征：含"-"、不以"定制"/"现货"/"实际发"开头、按"-"分割后>=4段且最后一段含分号
+    if "-" in text and not text.startswith("定制") and not text.startswith("现货") and not text.startswith("实际发"):
         parts = text.split("-")
         if len(parts) >= 4 and ";" in parts[-1]:
             encoded_parsed = parse_remark(text, material_map, material_matcher)
@@ -660,7 +670,7 @@ def extract_multiple_remarks(
 
     for idx, (segment, qty) in enumerate(segments):
         # 根据原备注的全局类型决定段前缀
-        if "定制" not in segment and "现货" not in segment:
+        if "定制" not in segment and "现货" not in segment and "实际发" not in segment:
             if is_custom:
                 segment_with_prefix = f"定制{segment}"
             elif is_stock_text:
@@ -1921,6 +1931,9 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
                 elif pattern_candidate.startswith("现货"):
                     pattern_candidate = pattern_candidate[2:].strip()
                     current_is_stock = True
+                elif pattern_candidate.startswith("实际发"):
+                    pattern_candidate = pattern_candidate[3:].strip()
+                    current_is_stock = True
                 for key in ["双面革", "吸水皮革", "双面格", "镜面皮革", "丝圈", "软玻璃"]:
                     if key in pattern_candidate:
                         pattern_candidate = pattern_candidate.replace(key, "").strip()
@@ -2059,21 +2072,23 @@ def _split_into_segments(text: str) -> tuple[list[tuple[str, int]], str]:
                 first_semi = semi_positions[0]
                 # 从开始到第一个分号，作为完整前缀
                 full_prefix = text[:first_semi].strip()
-                # 提取花型名（去掉定制/现货和材质）
+                # 提取花型名（去掉定制/现货/实际发和材质）
                 pattern_text = full_prefix
                 custom_pos = pattern_text.find("定制")
                 stock_pos = pattern_text.find("现货")
+                actual_pos = pattern_text.find("实际发")
                 if custom_pos != -1:
                     pattern_text = pattern_text[custom_pos:]
-                elif stock_pos != -1:
-                    pattern_text = pattern_text[stock_pos:]
-                if pattern_text.startswith("定制") or pattern_text.startswith("现货"):
+                elif stock_pos != -1 or actual_pos != -1:
+                    stock_starts = [p for p in [stock_pos, actual_pos] if p != -1]
+                    pattern_text = pattern_text[min(stock_starts):]
+                if pattern_text.startswith("定制") or pattern_text.startswith("现货") or pattern_text.startswith("实际发"):
                     for key in ["双面革", "吸水皮革", "双面格", "镜面皮革", "丝圈", "软玻璃"]:
                         if key in pattern_text:
-                            common_pattern = pattern_text.replace("定制", "").replace("现货", "").replace(key, "").strip()
+                            common_pattern = pattern_text.replace("定制", "").replace("现货", "").replace("实际发", "").replace(key, "").strip()
                             break
                     else:
-                        common_pattern = pattern_text.replace("定制", "").replace("现货", "").strip()
+                        common_pattern = pattern_text.replace("定制", "").replace("现货", "").replace("实际发", "").strip()
             
             for i, (size_start, size_end) in enumerate(all_sizes_pos):
                 # 找到该尺寸前面的分号
