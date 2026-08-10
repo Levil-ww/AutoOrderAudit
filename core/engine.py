@@ -353,6 +353,84 @@ class AutoAuditEngine:
             return True
         return False
 
+    def _detect_implied_price_diff_scenario(self, order: Order):
+        """
+        检测隐含补差价场景（正常订单中，两个标题相同的商品行，
+        一个有备注含"共X张"，另一个无备注）。
+        无备注的一行实际只是补差价凑面积的作用，需要标记为不打印。
+
+        触发条件（全部满足）：
+        1. 订单非合并（已在调用方保证）
+        2. 订单非显式补差价订单（已在调用方保证，即没有标题带补差价关键词的行）
+        3. 订单有且仅有2个有效商品行（非作废、非赠品）
+        4. 两个商品行的标题完全相同
+        5. 恰好一个商品行有 shop_remark（非空），另一个 shop_remark 完全为空
+        6. 有备注行的 shop_remark 或订单级 shop_remark 中包含"共X张"模式
+
+        返回：price_diff_updates 列表（无备注行标记为 ship=False→编码改为不打印）
+              不匹配时返回 None
+        """
+        # 获取有效商品行：非作废、非赠品
+        valid_items = [
+            item for item in order.items
+            if not item.is_void and not self.adapter._is_gift_item(item)
+        ]
+
+        # 条件3：恰好2个有效商品行
+        if len(valid_items) != 2:
+            return None
+
+        item_a, item_b = valid_items
+
+        # 条件4：标题完全相同
+        if not item_a.title or item_a.title.strip() != item_b.title.strip():
+            return None
+
+        # 条件5：恰好一个有 shop_remark，另一个为空
+        remark_a = (item_a.shop_remark or "").strip()
+        remark_b = (item_b.shop_remark or "").strip()
+        a_has = bool(remark_a)
+        b_has = bool(remark_b)
+        if a_has == b_has:
+            # 两个都有或两个都没有，不匹配
+            return None
+
+        if a_has:
+            remarked_item = item_a
+            no_remark_item = item_b
+        else:
+            remarked_item = item_b
+            no_remark_item = item_a
+
+        # 条件6：检查"共X张"模式（在商品行备注或订单级备注中）
+        # 根据 lessons learned: 处理 "总?共" 前缀，避免 "总共X张" 只匹配 "共" 残留"总"
+        total_count_pattern = re.compile(r'总?共\s*(\d+)\s*张')
+
+        has_total_pattern = False
+        if remarked_item.shop_remark and total_count_pattern.search(remarked_item.shop_remark):
+            has_total_pattern = True
+        if not has_total_pattern:
+            order_remark = order.shop_remark or ""
+            if order_remark and total_count_pattern.search(order_remark):
+                has_total_pattern = True
+
+        if not has_total_pattern:
+            return None
+
+        # 所有条件满足，返回 price_diff_updates（无备注行→补差价不打印）
+        print(f"  💡 检测到隐含补差价场景：同标题两商品行，无备注行凑面积")
+        print(f"     标题: {no_remark_item.title[:30]}...")
+        remarked_remark_preview = (remarked_item.shop_remark or order.shop_remark or "")[:40]
+        print(f"     有备注行: ID={remarked_item.id or remarked_item.oid[:8]}..., remark='{remarked_remark_preview}...'")
+        print(f"     无备注行: ID={no_remark_item.id or no_remark_item.oid[:8]}... → 编码改为'定制-定制-补差价-不打印'")
+
+        return [{
+            'tid': order.tid,
+            'items': [no_remark_item],
+            'remark': "隐含补差价场景(凑面积)",
+            'ship': False,  # ship=False → 编码改为不打印
+        }]
+
     def _process_normal_order_logic(self, order: Order, price_diff_updates: list = None, parsed_list_override: list = None):
         """
         普通订单处理逻辑（从 _process_order 提取的公共逻辑）
@@ -674,19 +752,62 @@ class AutoAuditEngine:
             self._process_price_difference_order(order)
             return
 
+        # ===== 检测隐含补差价场景（标题相同+单行备注共X张+另一行无备注） =====
+        # 注意：必须在 补差价订单检测之后、普通订单处理之前执行
+        implied_price_diff_updates = self._detect_implied_price_diff_scenario(order)
+
         # ===== 普通订单处理 =====
         # 混合订单（有普通商品行 + 补差价行）：即使备注为空，也要处理补差价行
         price_diff_items = [item for item in order.items if self._is_price_difference_item(item)]
-        if not remark.strip():
+
+        # 预构建完整的 price_diff_updates（显式 + 隐含），避免传参后内部逻辑遗漏显式行
+        # 说明：_process_normal_order_logic 仅在 price_diff_updates is None 时自行构建显式行
+        #       如果我们只传隐含行，会导致显式补差价行被遗漏，所以这里统一构建。
+        prebuilt_price_diff_updates = None
+        if price_diff_items or implied_price_diff_updates:
+            prebuilt_price_diff_updates = []
+            # 显式补差价行（与 _process_normal_order_logic 内部构建逻辑对齐）
             if price_diff_items:
-                # 备注为空但有补差价行 → 编码改为不打印
-                self._process_normal_order_logic(order)
+                no_print_reason = self._get_no_print_reason(remark)
+                if no_print_reason:
+                    prebuilt_price_diff_updates.append({
+                        'tid': order.tid,
+                        'items': price_diff_items,
+                        'remark': remark,
+                        'ship': False,
+                    })
+                else:
+                    # 备注有定制信息，后续流程会计算 extra_parsed 分配；这里先标记 ship=True
+                    # 真正的分配在 update_merchant_code 第五步通过 parsed_list 字段处理
+                    regular_item_count = sum(
+                        1 for item in order.items
+                        if not self._is_price_difference_item(item)
+                        and not self.adapter._is_gift_item(item)
+                        and not item.is_void
+                    )
+                    # 先临时构建 ship=False，让后续逻辑接管（如果传了 price_diff_updates 就跳过了内部构建）
+                    # 实际上：为避免复杂分支，直接传 None 让内部处理显式行，然后在 adapter 层合并隐含行
+                    # → 更简单方案：把隐含场景追加到后面，且只对隐含行 ship=False
+                    prebuilt_price_diff_updates.append({
+                        'tid': order.tid,
+                        'items': price_diff_items,
+                        'remark': remark,
+                        'ship': False if not remark.strip() else True,
+                    })
+            # 隐含场景补差价行（ship=False → 编码改为不打印）
+            if implied_price_diff_updates:
+                prebuilt_price_diff_updates.extend(implied_price_diff_updates)
+
+        if not remark.strip():
+            if price_diff_items or implied_price_diff_updates:
+                # 备注为空但有补差价行（显式或隐含） → 继续处理
+                self._process_normal_order_logic(order, price_diff_updates=prebuilt_price_diff_updates)
             else:
                 print("  ⏭️  跳过：卖家备注为空")
                 self.stats["skipped"] += 1
                 return
         else:
-            self._process_normal_order_logic(order)
+            self._process_normal_order_logic(order, price_diff_updates=prebuilt_price_diff_updates)
 
     def _process_merged_order(self, order, material_map, material_matcher):
         """
@@ -768,9 +889,19 @@ class AutoAuditEngine:
             # 若以此作为解析来源，会导致反复创建手工单（反复增值）。
             # 赠品行同样会被ERP复制订单级备注，若以其备注作为解析来源，
             # 会导致解析出其他分组的商品信息并创建重复行。
+            # 
+            # 关键规则：ERP 在合并订单中会自动将订单级备注关联到新建的商品行/赠品行，
+            # 这些行的特征是 original_tid 或 oid 包含 "&"（合并订单号）。
+            # 这些行的 shop_remark 是订单级备注而非子订单专属备注，不应作为解析来源。
             is_manual_item = item.raw and item.raw.get('type') == 1
             is_gift_item = self.adapter._is_gift_item(item)
-            if item.shop_remark and not is_manual_item and not is_gift_item:
+            # 检查是否为 ERP 合并订单自动创建的商品行（其备注是订单级备注，不可信）
+            erp_tid = item._erp_original_tid
+            is_erp_created = (
+                (erp_tid and "&" in erp_tid) or
+                (item.oid and "&" in item.oid)
+            )
+            if item.shop_remark and not is_manual_item and not is_gift_item and not is_erp_created:
                 if self._is_price_difference_item(item):
                     groups[tid]['price_diff_remark'] = item.shop_remark
                 else:
@@ -985,7 +1116,9 @@ class AutoAuditEngine:
             return sku
 
         # 构建现有商品行的 (normalized_sku, num) -> set of original_tid 映射
-        existing_sku_tids = {}
+        # 同时构建 original_tid -> set of (normalized_sku, num) 反向映射
+        existing_sku_tids = {}  # {(norm_sku, num): set of tid}
+        tid_to_skus = {}       # {tid: set of (norm_sku, num)}
         for item in order.items:
             if item.is_void or self.adapter._is_gift_item(item) or self._is_price_difference_item(item):
                 continue
@@ -994,28 +1127,30 @@ class AutoAuditEngine:
                 key = (norm_sku, item.num)
                 if key not in existing_sku_tids:
                     existing_sku_tids[key] = set()
-                existing_sku_tids[key].add(item.original_tid or '')
+                item_tid = item.original_tid or ''
+                existing_sku_tids[key].add(item_tid)
+                # 反向映射：tid -> set of sku keys
+                if item_tid:
+                    if item_tid not in tid_to_skus:
+                        tid_to_skus[item_tid] = set()
+                    tid_to_skus[item_tid].add(key)
 
         # --- a. 跨分组污染过滤 ---
         # 对每个解析结果，检查其 SKU 是否已经存在于「其他 original_tid 的商品行」。
         # 若存在则说明是订单级备注带进来的外组商品，剔除。
-        # 关键修复：当解析结果的 original_tid 不在现有商品行的 tid 集合中时，
-        # 不能直接判定为污染——因为不同子订单可能合法拥有相同SKU。
-        # 只有当该子订单没有任何有效商品行时，才能确定是污染。
+        # 修复：当解析结果的 original_tid 不在现有商品行的 tid 集合中时，
+        # 检查当前子订单是否有「这个特定 SKU」的现有商品行（而不是检查是否有任何有效商品行）。
+        # 如果当前子订单也有该 SKU → 合法商品（不同子订单相同SKU），保留。
+        # 如果当前子订单没有该 SKU → 订单级备注污染，剔除。
         filtered_parsed = []
         contamination_count = 0
         
-        # 预计算每个 original_tid 是否有有效商品行（非作废、非赠品、非补差价）
-        has_valid_items_by_tid = {}
+        # 预计算每个 original_tid 是否有有效商品行（用于订单级别的辅助判断）
         all_tids_in_order = set()  # 所有出现在订单中的 tid（包括全作废的子订单）
         for item in order.items:
             tid = item.original_tid or ''
             if tid:
                 all_tids_in_order.add(tid)
-            if item.is_void or self.adapter._is_gift_item(item) or self._is_price_difference_item(item):
-                continue
-            if tid:
-                has_valid_items_by_tid[tid] = True
         
         for p in all_parsed_list:
             if not p or not p.success:
@@ -1030,15 +1165,19 @@ class AutoAuditEngine:
                     # 本组已有该 SKU 的商品行 → 这是本组自己的商品，保留
                     filtered_parsed.append(p)
                 else:
-                    # 该 SKU 的商品行在其他组 → 检查当前子订单是否有有效商品行
-                    # 如果有，说明是合法商品（不同子订单相同SKU），保留
-                    # 如果没有，说明是订单级备注污染，剔除
+                    # 该 SKU 的商品行在其他组 → 检查当前子订单是否有「这个特定 SKU」的现有商品行
                     p_tid = p.original_tid or ''
-                    if p_tid and (has_valid_items_by_tid.get(p_tid, False) or p_tid in all_tids_in_order):
-                        # 该子订单有有效商品行，或存在但全作废 → 是合法商品，保留
+                    # 检查当前子订单是否有该 SKU 的现有商品行（合法跨子订单相同SKU）
+                    current_tid_skus = tid_to_skus.get(p_tid, set())
+                    if key in current_tid_skus:
+                        # 当前子订单也有该 SKU → 是合法商品（不同子订单相同SKU），保留
+                        filtered_parsed.append(p)
+                    elif p_tid and p_tid in all_tids_in_order and not tid_to_skus.get(p_tid, set()):
+                        # 子订单存在但没有任何有效商品行（全作废/全赠品/全补差价）→ 保留
+                        # 这种情况可能是赠品对应的子订单，需要保留解析结果
                         filtered_parsed.append(p)
                     else:
-                        # 该子订单没有有效商品行 → 确定是污染，剔除
+                        # 当前子订单没有该 SKU 的现有商品行 → 订单级备注污染，剔除
                         contamination_count += 1
             else:
                 # 该 SKU 没有现有商品行 → 可能是新尺寸/新商品，保留
