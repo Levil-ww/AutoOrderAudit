@@ -938,6 +938,29 @@ class AutoAuditEngine:
         gift_no_ship_tids = []
         
         for tid, group in groups.items():
+            # ===== 全作废子订单跳过检测 =====
+            # 如果该分组（子订单）内所有非赠品、非补差价的普通商品行全部已作废/已退款，
+            # 则直接跳过该分组，不再解析备注、不再处理商品和赠品，
+            # 避免因备注能解析成功而为已退款的子订单错误地新建商品行和赠品行。
+            non_gift_regular_items = [
+                item for item in group['items']
+                if not self.adapter._is_gift_item(item)
+                and not self._is_price_difference_item(item)
+            ]
+            if non_gift_regular_items and all(item.is_void for item in non_gift_regular_items):
+                # 补差价分组单独判断：补差价行本身也可能是唯一非赠品行
+                # （补差价分组的补差价行也是要处理的"有效行"，全作废才跳过）
+                if not group['is_price_diff']:
+                    print(f"    ⏭️  原始订单 {tid[:16]}...: 子订单所有商品行已作废/已退款，跳过解析")
+                    continue
+            # 补差价分组：若补差价行和普通行都已作废，也跳过
+            if group['is_price_diff']:
+                all_void = all(item.is_void for item in group['items']
+                               if not self.adapter._is_gift_item(item))
+                if all_void:
+                    print(f"    ⏭️  原始订单 {tid[:16]}...: 子订单（补差价）所有行已作废/已退款，跳过解析")
+                    continue
+
             # 补差价分组必须优先使用补差价商品行的备注，避免被普通商品行上的
             # 订单级备注覆盖后错误解析；普通分组则优先使用普通商品行备注。
             if group['is_price_diff']:
