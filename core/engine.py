@@ -597,7 +597,7 @@ class AutoAuditEngine:
                 return
 
         try:
-            ok = self.adapter.update_merchant_code(order, parsed_list[0] if parsed_list else None, parsed_list, price_diff_updates, gift_no_ship=gift_no_ship)
+            ok = self.adapter.update_merchant_code(order, parsed_list[0] if parsed_list else None, parsed_list, price_diff_updates, gift_no_ship=gift_no_ship, engine_gifts=[(g[0], g[1], '') for g in all_gifts])
             if ok is None:
                 print(f"  ⏭️  跳过：订单所有商品行已作废")
                 self.stats["skipped"] += 1
@@ -843,15 +843,55 @@ class AutoAuditEngine:
         has_prefix_collision = any(v > 1 for v in amp_tid_prefixes.values())
         
         # 按 original_tid 分组商品行
+        # 预收集所有非赠品行的有效子订单tid，供赠品行匹配使用
+        valid_suborder_tids = set()
+        for item in order.items:
+            if not self.adapter._is_gift_item(item) and item.original_tid and "&" not in item.original_tid:
+                valid_suborder_tids.add(item.original_tid)
+        
         groups = {}
         for idx, item in enumerate(order.items):
             # 保存 ERP 原始 original_tid，避免后续处理丢失
             if not hasattr(item, '_erp_original_tid'):
                 item._erp_original_tid = item.original_tid
             
+            is_gift_item = self.adapter._is_gift_item(item)
+            
             # 优先使用不包含&的子订单号
             if item.original_tid and "&" not in item.original_tid:
                 tid = item.original_tid
+            elif is_gift_item and item.original_tid and "&" in item.original_tid:
+                # 赠品行特殊处理：如果 original_tid 包含 &，尝试从子订单中找到正确的 tid
+                # ERP 在合并订单中会自动创建赠品行，其 original_tid 是合并订单号
+                # 需要将赠品行分配到正确的子订单分组
+                # 策略：通过 shop_remark 匹配关联的商品行，确定正确的子订单
+                candidate_tids = item.original_tid.split("&")
+                matched_tid = None
+                
+                # 优先策略：通过 shop_remark 匹配（赠品行的 shop_remark 通常与关联的商品行相同）
+                if item.shop_remark:
+                    for ctid in candidate_tids:
+                        if ctid in valid_suborder_tids and ctid in groups:
+                            # 检查该分组是否有商品行与赠品行的 shop_remark 匹配
+                            for gitem in groups[ctid]['items']:
+                                if not self.adapter._is_gift_item(gitem) and gitem.shop_remark == item.shop_remark:
+                                    matched_tid = ctid
+                                    break
+                            if matched_tid:
+                                break
+                
+                # 备用策略：如果 shop_remark 匹配失败，从后向前遍历（赠品行通常关联到最后一个子订单）
+                if not matched_tid:
+                    for ctid in reversed(candidate_tids):
+                        if ctid in valid_suborder_tids:
+                            matched_tid = ctid
+                            break
+                
+                # 最后兜底：使用最后一个候选
+                if not matched_tid and candidate_tids:
+                    matched_tid = candidate_tids[-1]
+                
+                tid = matched_tid if matched_tid else (str(item.id) if item.id else f"item_{idx}")
             elif item.oid and "&" not in item.oid:
                 tid = item.oid
             elif item.original_tid and "&" in item.original_tid:
@@ -981,6 +1021,21 @@ class AutoAuditEngine:
                 diff_items = [item for item in group['items'] if self._is_price_difference_item(item)]
                 regular_items_in_group = [item for item in group['items'] if not self._is_price_difference_item(item)]
 
+                # 先统一解析备注（用于赠品收集，补差价无论何种分支都可能有赠品）
+                parsed_list_for_gifts = extract_multiple_remarks(
+                    group_remark,
+                    material_map=material_map,
+                    material_matcher=material_matcher,
+                )
+                # 收集纯赠品信息：即使商品解析 success=False，
+                # 补差价订单也可能只携带赠品描述（如"赠送圆垫-1张，方垫-1张"）
+                for p in parsed_list_for_gifts:
+                    if p.gifts:
+                        for gname, gnum in p.gifts:
+                            all_gifts.append((gname, gnum, tid))
+                    elif p.gift_name and p.gift_num > 0:
+                        all_gifts.append((p.gift_name, p.gift_num, tid))
+
                 # 检测备注是否为空、"补差价"、"差价不发货"或"不打印"
                 # → 编码改为"定制-定制-补差价-不打印"，数量改为1
                 no_print_reason = self._get_no_print_reason(group_remark)
@@ -992,6 +1047,7 @@ class AutoAuditEngine:
                         'remark': group_remark,
                         'ship': False,
                     })
+                    # 赠品已在上方统一收集，这里不 return/continue
                 else:
                     print(f"      📝 补差价订单备注含信息，按正常解析逻辑处理")
                     skip_reason = None
@@ -1002,16 +1058,14 @@ class AutoAuditEngine:
                     
                     if skip_reason:
                         print(f"        ⏭️  跳过：{skip_reason}")
+                        # 赠品已收集，continue 到下一分组
                         continue
                     
-                    parsed_list = extract_multiple_remarks(
-                        group_remark,
-                        material_map=material_map,
-                        material_matcher=material_matcher,
-                    )
+                    parsed_list = parsed_list_for_gifts
                     
                     if not parsed_list or not any(p.success for p in parsed_list):
-                        print(f"        ⏭️  跳过：无法解析备注")
+                        print(f"        ⏭️  跳过：无法解析备注（赠品仍已收集）")
+                        # success=False 但有赠品时，不处理商品行修改，但赠品已收集
                         continue
                     
                     for p in parsed_list:
@@ -1066,13 +1120,6 @@ class AutoAuditEngine:
                             })
 
                     all_parsed_list.extend(parsed_list)
-                    
-                    for p in parsed_list:
-                        if p.gifts:
-                            for gname, gnum in p.gifts:
-                                all_gifts.append((gname, gnum, tid))
-                        elif p.gift_name and p.gift_num > 0:
-                            all_gifts.append((p.gift_name, p.gift_num, tid))
             else:
                 skip_reason = None
                 for keyword in _SKIP_KEYWORDS:
@@ -1093,8 +1140,18 @@ class AutoAuditEngine:
                     material_matcher=material_matcher,
                 )
                 
+                # 先收集赠品：普通分组也可能出现"无商品信息但有赠品"的备注，
+                # 即使 success=False 也要把赠品收集到 all_gifts 中
+                for p in parsed_list:
+                    if p.gifts:
+                        for gname, gnum in p.gifts:
+                            all_gifts.append((gname, gnum, tid))
+                    elif p.gift_name and p.gift_num > 0:
+                        all_gifts.append((p.gift_name, p.gift_num, tid))
+                
                 if not parsed_list or not any(p.success for p in parsed_list):
-                    print(f"      ⏭️  跳过：无法解析备注")
+                    print(f"      ⏭️  跳过：无法解析备注（赠品仍已收集）")
+                    # success=False 不处理商品行修改，但赠品已收集
                     continue
                 
                 for p in parsed_list:
@@ -1102,13 +1159,6 @@ class AutoAuditEngine:
                     p.shop_remark = group['remark']
 
                 all_parsed_list.extend(parsed_list)
-
-                for p in parsed_list:
-                    if p.gifts:
-                        for gname, gnum in p.gifts:
-                            all_gifts.append((gname, gnum, tid))
-                    elif p.gift_name and p.gift_num > 0:
-                        all_gifts.append((p.gift_name, p.gift_num, tid))
 
         # 赠品去重：按 (赠品名, tid) 合并数量，不同子订单的赠品不合并
         gift_merged = {}
@@ -1323,6 +1373,7 @@ class AutoAuditEngine:
                     all_parsed_list,
                     price_diff_updates,
                     gift_no_ship_tids=gift_no_ship_tids,
+                    engine_gifts=all_gifts,
                 )
                 if ok is None:
                     print(f"  ⏭️  跳过：订单所有商品行已作废")

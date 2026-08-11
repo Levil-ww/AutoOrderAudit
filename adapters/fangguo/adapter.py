@@ -383,7 +383,7 @@ class FangguoAdapter(ErpAdapter):
     # -------------------------------------------------------------------
     # 3. 修改商家编码（带详细错误日志）
     # -------------------------------------------------------------------
-    def update_merchant_code(self, order: Order, parsed: ParsedRemark, parsed_list: list = None, price_diff_updates: list = None, gift_no_ship_tids: list = None, gift_no_ship: bool = False) -> bool:
+    def update_merchant_code(self, order: Order, parsed: ParsedRemark, parsed_list: list = None, price_diff_updates: list = None, gift_no_ship_tids: list = None, gift_no_ship: bool = False, engine_gifts: list = None) -> bool:
         """
         调用 saveProduct 接口更新商家编码
         支持多尺寸：如果备注中有多个尺寸，会拆分成多个商品行
@@ -407,6 +407,9 @@ class FangguoAdapter(ErpAdapter):
                                - ship=False: 修改编码为"定制-定制-补差价-不打印"，数量改为1
             gift_no_ship_tids: 合并订单中需要"赠品不送"处理的子订单tid列表
             gift_no_ship: 普通订单是否需要"赠品不送"处理
+            engine_gifts: engine 层完整收集的赠品 [(name, num, tid), ...]，
+                          用于传递 success=False 分组（纯赠品备注）中的赠品。
+                          若提供则与 parsed_list 中的赠品合并后按 tid 分组去重。
         """
         # 检测是否为合并订单（解析结果带有 original_tid，或 gift_no_ship_tids 不为空）
         is_merged_order = any(p.original_tid for p in (parsed_list or [])) or (gift_no_ship_tids and len(gift_no_ship_tids) > 0)
@@ -912,6 +915,25 @@ class FangguoAdapter(ErpAdapter):
                 if p.shop_remark:
                     gifts_by_tid[tid]['shop_remark'] = p.shop_remark
 
+        # 合并 engine 层传入的完整赠品（包含纯赠品备注的 success=False 分组的赠品）
+        if engine_gifts:
+            # 记录已从 parsed_list 中收集到 (name, tid) 的集合，避免与 engine_gifts 重复累加
+            existing_pairs = set()
+            for tid, info in gifts_by_tid.items():
+                for gname, _ in info['gifts']:
+                    existing_pairs.add((gname, tid))
+
+            for gift_tuple in engine_gifts:
+                # engine_gifts 格式: [(name, num, tid), ...]
+                if len(gift_tuple) >= 3:
+                    gname, gnum, gtid = gift_tuple[0], gift_tuple[1], gift_tuple[2]
+                    # 若 (name, tid) 已存在于 parsed_list 赠品中，跳过避免重复
+                    if (gname, gtid) in existing_pairs:
+                        continue
+                    if gtid not in gifts_by_tid:
+                        gifts_by_tid[gtid] = {'gifts': [], 'material_code': '', 'shop_remark': ''}
+                    gifts_by_tid[gtid]['gifts'].append((gname, gnum))
+
         # 收集所有赠品（按子订单分组去重后）
         all_gifts = []
         for tid, gift_info in gifts_by_tid.items():
@@ -925,13 +947,80 @@ class FangguoAdapter(ErpAdapter):
             for name, num in unique_gifts.items():
                 all_gifts.append((name, num, tid, gift_info['material_code'], gift_info['shop_remark']))
 
+        # ===== 赠品行去重（在赠品处理前执行）=====
+        # 合并订单中 ERP 可能为同一子订单创建多个赠品行（因订单级备注被自动关联），
+        # 导致出现多个相同 SKU+数量+子订单号的赠品行。
+        # 在赠品处理前去重，避免重复赠品行被收集用于匹配。
+        gift_dup_groups = defaultdict(list)
+        for idx, item in enumerate(order.items):
+            if item.is_void:
+                continue
+            if not self._is_gift_item(item):
+                continue
+            item_sku = _clean_sku(item.shop_mapping_sku)
+            if not item_sku:
+                continue
+            norm_sku = _normalize_sku_for_duplicate(item_sku)
+            if not norm_sku:
+                continue
+            orig_tid = getattr(item, '_erp_original_tid', None) or item.original_tid or ''
+            gift_dup_key = (norm_sku, item.num, orig_tid)
+            gift_dup_groups[gift_dup_key].append(idx)
+
+        gift_removed_dup_count = 0
+        for key, indices in gift_dup_groups.items():
+            if len(indices) <= 1:
+                continue
+            # 按优先级排序：优先保留 type=0 原始行、有 sys_oid 的行
+            sorted_indices = sorted(indices, key=lambda i: (
+                0 if (order.items[i].raw and order.items[i].raw.get('type') == 0) else 1,
+                0 if (order.items[i].sys_oid and not order.items[i].sys_oid.startswith('new_')) else 1,
+                i
+            ))
+            for dup_idx in sorted_indices[1:]:
+                dup_item = order.items[dup_idx]
+                gift_removed_dup_count += 1
+                # 标记为 void，这样后续的赠品收集/匹配/提交都会跳过
+                dup_item.is_void = True
+                dup_item.cancel_status = True
+                dup_item.discard_status = 2
+                if dup_item.raw:
+                    dup_item.raw['cancelStatus'] = True
+                    dup_item.raw['discardStatus'] = 2
+                # 同时添加 void 项到 order_items，确保提交时 ERP 会删除这些行
+                if dup_item.raw:
+                    void_item = dict(dup_item.raw)
+                else:
+                    void_item = {
+                        "id": dup_item.id,
+                        "orderId": dup_item.order_id,
+                        "sysOid": dup_item.sys_oid,
+                        "oid": dup_item.oid,
+                        "title": dup_item.title,
+                        "skuPropertiesName": dup_item.sku_properties_name,
+                        "shopMappingSku": dup_item.shop_mapping_sku,
+                        "originalSkuId": dup_item.original_sku_id,
+                        "originalGoodsId": dup_item.original_goods_id,
+                        "merchandisePicPath": dup_item.merchandise_pic_path,
+                        "num": dup_item.num,
+                        "price": dup_item.price,
+                        "shopRemark": dup_item.shop_remark or "",
+                    }
+                void_item['cancelStatus'] = True
+                void_item['discardStatus'] = 2
+                order_items.append(void_item)
+                used_item_indices.add(dup_idx)
+
+        if gift_removed_dup_count > 0:
+            print(f"  🧹 赠品行去重：移除 {gift_removed_dup_count} 个重复赠品行")
+
         if all_gifts:
             # 收集现有赠品行，并按 original_tid 分组以便精确匹配
             # 关键修复：不再按顺序匹配，而是按子订单号精确匹配，
             # 避免子订单A的赠品行被子订单B的赠品覆盖修改
             existing_gifts_by_tid = {}  # {original_tid: [idx, idx...]}
             for idx, item in enumerate(order.items):
-                if idx not in used_item_indices and self._is_gift_item(item):
+                if idx not in used_item_indices and not item.is_void and self._is_gift_item(item):
                     item_tid = item.original_tid or ""
                     if item_tid not in existing_gifts_by_tid:
                         existing_gifts_by_tid[item_tid] = []
@@ -1724,7 +1813,11 @@ class FangguoAdapter(ErpAdapter):
 
         tid = original_tid or item.oid or order.tid
         trade_id = original_tid or item.order_id or order.trade_id
-        remark = shop_remark or item.shop_remark or order.shop_remark or ""
+        # 赠品行不应携带订单级备注，否则 ERP 保存后会把订单级备注关联到赠品行，
+        # 导致下次运行时被误解析（形成反馈循环）。
+        # 只使用显式传入的 shop_remark 或原商品行自身的 shop_remark，
+        # 不回退到 order.shop_remark。
+        remark = shop_remark or item.shop_remark or ""
 
         result = {
             "materialId": None,

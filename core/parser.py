@@ -1250,12 +1250,14 @@ def _extract_multiple_gifts(text: str) -> list[tuple[str, int]]:
     自动去重：相同赠品名称合并数量
     """
     gifts = []
+    last_accepted_match_end = 0  # 记录最后一次成功提取赠品的匹配结束位置
     
     gift_pattern = re.compile(r"(送|赠品|附赠|加送)\s*([^，,；;\n]*?)[张个件套米]")
     
     for match in gift_pattern.finditer(text):
         keyword = match.group(1)
         content = match.group(2).strip()
+        accepted_this = False
         
         if keyword == "送":
             prev_pos = match.start() - 1
@@ -1337,13 +1339,67 @@ def _extract_multiple_gifts(text: str) -> list[tuple[str, int]]:
 
             if gift_text and gift_text not in ["一", "二", "两", "三", "四", "五", "六", "七", "八", "九", "十", "赠品"]:
                 gifts.append((gift_text, gift_num))
+                accepted_this = True
         elif gift_num > 0 and keyword in ("赠品", "附赠", "加送"):
             # 处理"赠品2张"这种只有数量没有名称的简洁格式
             # 使用默认赠品名"赠品"
             gifts.append(("赠品", gift_num))
+            accepted_this = True
+        
+        if accepted_this:
+            last_accepted_match_end = max(last_accepted_match_end, match.end())
     
     if not gifts:
         gifts = _extract_gifts_fallback(text)
+    
+    # ===== 补充提取：赠品上下文继承 =====
+    # 当前面已经出现"送/赠品/附赠/加送"前缀匹配到赠品后，
+    # 后续出现的白名单赠品名称即使没有前缀（如"方垫-1张"）也应被识别。
+    # 例如："赠送赠品圆垫-1张，方垫-1张" → 应提取出 [圆垫x1, 方垫x1]
+    has_whitelisted_gift_already = any(_is_whitelisted_gift(g) for g, _ in gifts)
+    if has_whitelisted_gift_already and last_accepted_match_end < len(text):
+        # 从最后一次成功提取赠品的结束位置之后开始搜索，
+        # 避免重复匹配原 gift_pattern 已经处理过的内容
+        context_text = text[last_accepted_match_end:]
+        
+        if context_text:
+            # 匹配白名单赠品名称 + 数量模式：
+            # 数量优先匹配 "-数字" 或 "-中文数" 格式（-1张、-两张），
+            # 避免把 "30x50" 中的 "30" 误识别为数量。
+            # 例："方垫-1张"、"方垫30x50cm-1张"、"沥水垫25cm-2张"、"30x50一张"
+            ctx_pattern = re.compile(
+                r"(圆垫|方垫(?:30\s*[xX×*]\s*50(?:cm)?)?|沥水垫25cm|沥水垫 25cm|30\s*[xX×*]\s*50(?:cm)?)\s*"
+                r"(?:[-××]\s*(\d+)|[-××]\s*([一二两三四五六七八九十]+)|(?<![xX×*\d])\s*(\d+)\s*(?=[张个件套米]|$)|([一二两三四五六七八九十]+)\s*(?=[张个件套米]|$))?\s*"
+                r"(?:张|个|件|套|米)?",
+                flags=re.IGNORECASE,
+            )
+            for m in ctx_pattern.finditer(context_text):
+                raw_gift_name = m.group(1).strip()
+                # 解析数量：优先 "-数字"（group2）> "-中文数"（group3）> 其他
+                if m.group(2):
+                    gnum = int(m.group(2))
+                elif m.group(3):
+                    gnum = _CHINESE_NUM_MAP.get(m.group(3), 1)
+                elif m.group(4):
+                    gnum = int(m.group(4))
+                elif m.group(5):
+                    gnum = _CHINESE_NUM_MAP.get(m.group(5), 1)
+                else:
+                    gnum = 1
+                
+                # 标准化赠品名称，后续交给白名单过滤
+                gift_name = re.sub(r"\s+", "", raw_gift_name)
+                # 统一 30x50 变体写法：用户指定方垫和30x50使用相同编码
+                # "吸水皮革-标准-随机发；30x50"，所以：
+                # - "方垫30x50cm" → "30x50"
+                # - "30x50cm" → "30x50"
+                # - "30×50" → "30x50"
+                if re.search(r"30\s*[xX×*]\s*50", gift_name, flags=re.IGNORECASE):
+                    gift_name = "30x50"
+                if "沥水垫25cm" in gift_name or "沥水垫 25cm" in gift_name:
+                    gift_name = "沥水垫25cm"
+                
+                gifts.append((gift_name, gnum))
     
     # 赠品行去重：相同赠品名称合并数量
     unique_gifts = {}
