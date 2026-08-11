@@ -440,7 +440,7 @@ class AutoAuditEngine:
             parsed_list_override: 外部传入的预解析结果，避免重复解析。混合订单场景使用。
         """
         remark = order.shop_remark or ""
-        gift_no_ship = "赠品不送" in remark
+        gift_no_ship = "赠品不送" in remark or "不要赠品" in remark
 
         for keyword in _SKIP_KEYWORDS:
             if keyword in remark:
@@ -1013,7 +1013,7 @@ class AutoAuditEngine:
             is_price_diff = group['is_price_diff']
             print(f"    原始订单 {tid[:16]}...: 备注='{group_remark[:40]}...' {'(补差价)' if is_price_diff else ''}")
             
-            if "赠品不送" in group_remark:
+            if "赠品不送" in group_remark or "不要赠品" in group_remark:
                 gift_no_ship_tids.append(tid)
             
             if is_price_diff:
