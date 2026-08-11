@@ -1,0 +1,289 @@
+================================================================================
+2026-08-11 合并订单赠品无限增长问题修复 工作总结
+================================================================================
+
+一、问题背景
+================================================================================
+
+合并订单 6928601810063031567&6928604049951915279 出现赠品行"无限增长"现象：
+每次程序运行都会新增一行相同的赠品行，导致订单中出现 4~6 行重复的赠品。
+
+子订单备注：
+- 子订单1 (6928601810063031567): "定制双面革安妮森林;35x320cm-1张，赠品圆垫-1张"
+- 子订单2 (6928604049951915279): "赠送赠品圆垫-1张，方垫-1张"（纯赠品备注）
+
+伴随问题：
+1. 子订单2（纯赠品备注，解析结果 success=False）的赠品被整体跳过
+2. 备注中的"方垫"未被识别为 30x50 赠品（应映射到
+   `吸水皮革-标准-30x50-随机发；30x50`）
+
+二、根因分析
+================================================================================
+
+1. 反馈循环：ERP 保存赠品行时自动把订单级备注关联到新建的赠品行 shop_remark
+   字段。下次运行时，adapter 的 _build_gift_item 在缺少显式 shop_remark 时
+   会回退到 order.shop_remark（订单级备注），导致订单级备注中的
+   "赠品圆垫-1张" 被反复解析、反复创建赠品行。
+
+2. 纯赠品备注跳过：engine._process_merged_order 在分组解析失败（success=False）
+   时直接 continue，未收集该分组的赠品信息，导致子订单2 的圆垫/方垫丢失。
+
+3. 上下文继承缺失：parser._extract_multiple_gifts 只识别带"送/赠品/附赠/加送"
+   前缀的赠品。当备注形如 "赠送赠品圆垫-1张，方垫-1张" 时，第二个"方垫"
+   没有前缀，导致漏识别。
+
+4. 缺少赠品行去重：adapter 在处理赠品前未对 ERP 已存在的重复赠品行去重，
+   导致 ERP 创建的重复赠品行被反复收集、反复匹配。
+
+三、修复方案与代码改动
+================================================================================
+
+【改动1】adapters/fangguo/adapter.py —— 赠品行预处理去重
+--------------------------------------------------------------------------------
+位置：update_merchant_code 方法内，赠品处理之前（约 950~1015 行）
+
+新增逻辑：
+- 扫描所有非作废赠品行，按 (标准化SKU, 数量, original_tid) 三元组分组
+- 同一组内只保留优先级最高的一行：
+    优先级：type=0 原始行 > 有 sys_oid 的行 > 其他
+- 其余重复行标记 cancelStatus=True / discardStatus=2，并加入 order_items
+  提交给 ERP 进行删除
+- 日志输出："🧹 赠品行去重：移除 N 个重复赠品行"
+
+关键代码片段：
+    gift_dup_groups = defaultdict(list)
+    for idx, item in enumerate(order.items):
+        if item.is_void or not self._is_gift_item(item):
+            continue
+        item_sku = _clean_sku(item.shop_mapping_sku)
+        norm_sku = _normalize_sku_for_duplicate(item_sku)
+        orig_tid = getattr(item, '_erp_original_tid', None) or item.original_tid or ''
+        gift_dup_key = (norm_sku, item.num, orig_tid)
+        gift_dup_groups[gift_dup_key].append(idx)
+
+    for key, indices in gift_dup_groups.items():
+        if len(indices) <= 1:
+            continue
+        sorted_indices = sorted(indices, key=lambda i: (
+            0 if (order.items[i].raw and order.items[i].raw.get('type') == 0) else 1,
+            0 if (order.items[i].sys_oid and not order.items[i].sys_oid.startswith('new_')) else 1,
+            i
+        ))
+        for dup_idx in sorted_indices[1:]:
+            dup_item = order.items[dup_idx]
+            dup_item.is_void = True
+            dup_item.cancel_status = True
+            dup_item.discard_status = 2
+            # 同步 raw 字段并加入 order_items 让 ERP 删除
+            ...
+
+
+【改动2】adapters/fangguo/adapter.py —— 阻止赠品行 fallback 到订单级备注
+--------------------------------------------------------------------------------
+位置：_build_gift_item 方法（约 1816~1820 行）
+
+修改前：
+    remark = shop_remark or item.shop_remark or order.shop_remark or ""
+
+修改后：
+    # 赠品行不应携带订单级备注，否则 ERP 保存后会把订单级备注关联到赠品行，
+    # 导致下次运行时被误解析（形成反馈循环）。
+    # 只使用显式传入的 shop_remark 或原商品行自身的 shop_remark，
+    # 不回退到 order.shop_remark。
+    remark = shop_remark or item.shop_remark or ""
+
+效果：切断"订单级备注 → 赠品行 shop_remark → 再次解析"的反馈循环。
+
+
+【改动3】adapters/fangguo/adapter.py —— 新增 engine_gifts 参数
+--------------------------------------------------------------------------------
+位置：update_merchant_code 方法签名与赠品合并逻辑（约 386 行、918~936 行）
+
+方法签名新增参数：
+    engine_gifts: list = None
+    # engine 层完整收集的赠品 [(name, num, tid), ...]，
+    # 用于传递 success=False 分组（纯赠品备注）中的赠品。
+    # 若提供则与 parsed_list 中的赠品合并后按 tid 分组去重。
+
+合并逻辑：
+- 记录 parsed_list 中已收集的 (name, tid) 集合 existing_pairs
+- 遍历 engine_gifts，若 (gname, gtid) 已在 existing_pairs 中则跳过，避免重复累加
+- 否则加入 gifts_by_tid[gtid]['gifts']
+
+关键代码片段：
+    if engine_gifts:
+        existing_pairs = set()
+        for tid, info in gifts_by_tid.items():
+            for gname, _ in info['gifts']:
+                existing_pairs.add((gname, tid))
+
+        for gift_tuple in engine_gifts:
+            if len(gift_tuple) >= 3:
+                gname, gnum, gtid = gift_tuple[0], gift_tuple[1], gift_tuple[2]
+                if (gname, gtid) in existing_pairs:
+                    continue
+                if gtid not in gifts_by_tid:
+                    gifts_by_tid[gtid] = {'gifts': [], 'material_code': '', 'shop_remark': ''}
+                gifts_by_tid[gtid]['gifts'].append((gname, gnum))
+
+
+【改动4】core/engine.py —— 收集 success=False 分组的赠品并传递 engine_gifts
+--------------------------------------------------------------------------------
+位置：_process_merged_order 方法（约 1143~1155 行）与普通订单流程（约 600 行）
+
+合并订单流程修改：
+- 在判断 "无法解析备注" 之前，先遍历 parsed_list 收集赠品到 all_gifts
+- 即使后续 continue 跳过商品行修改，赠品也已保留
+- 日志输出："⏭️  跳过：无法解析备注（赠品仍已收集）"
+
+关键代码片段：
+    # 先收集赠品：普通分组也可能出现"无商品信息但有赠品"的备注，
+    # 即使 success=False 也要把赠品收集到 all_gifts 中
+    for p in parsed_list:
+        if p.gifts:
+            for gname, gnum in p.gifts:
+                all_gifts.append((gname, gnum, tid))
+        elif p.gift_name and p.gift_num > 0:
+            all_gifts.append((p.gift_name, p.gift_num, tid))
+
+    if not parsed_list or not any(p.success for p in parsed_list):
+        print(f"      ⏭️  跳过：无法解析备注（赠品仍已收集）")
+        continue
+
+调用 adapter 时传递 engine_gifts：
+    ok = self.adapter.update_merchant_code(
+        order,
+        all_parsed_list[0] if all_parsed_list else None,
+        all_parsed_list,
+        price_diff_updates,
+        gift_no_ship_tids=gift_no_ship_tids,
+        engine_gifts=all_gifts,   # ← 新增
+    )
+
+普通订单流程同步传递 engine_gifts：
+    ok = self.adapter.update_merchant_code(
+        order, parsed_list[0] if parsed_list else None, parsed_list,
+        price_diff_updates, gift_no_ship=gift_no_ship,
+        engine_gifts=[(g[0], g[1], '') for g in all_gifts]   # ← 新增
+    )
+
+
+【改动5】core/parser.py —— 赠品上下文继承（识别无前缀的白名单赠品）
+--------------------------------------------------------------------------------
+位置：_extract_multiple_gifts 函数（约 1355~1402 行）
+
+新增"补充提取"逻辑：
+- 引入 last_accepted_match_end 记录最后一次成功提取赠品的匹配结束位置
+- 当已识别到白名单赠品后，从 last_accepted_match_end 之后开始搜索
+- 匹配无前缀的白名单赠品名称 + 数量模式：
+    圆垫、方垫（可选带 30x50cm 后缀）、沥水垫25cm、30x50
+- 数量优先匹配 "-数字" / "-中文数" 格式，避免把 30x50 中的 30 误识别为数量
+- 30x50 变体统一标准化：30×50、30X50、30*50 → 30x50
+- 沥水垫 25cm 变体统一：沥水垫 25cm → 沥水垫25cm
+
+关键代码片段：
+    has_whitelisted_gift_already = any(_is_whitelisted_gift(g) for g, _ in gifts)
+    if has_whitelisted_gift_already and last_accepted_match_end < len(text):
+        context_text = text[last_accepted_match_end:]
+        if context_text:
+            ctx_pattern = re.compile(
+                r"(圆垫|方垫(?:30\s*[xX×*]\s*50(?:cm)?)?|沥水垫25cm|沥水垫 25cm|30\s*[xX×*]\s*50(?:cm)?)\s*"
+                r"(?:[-××]\s*(\d+)|[-××]\s*([一二两三四五六七八九十]+)|...)\s*"
+                r"(?:张|个|件|套|米)?",
+                flags=re.IGNORECASE,
+            )
+            for m in ctx_pattern.finditer(context_text):
+                raw_gift_name = m.group(1).strip()
+                # 解析数量并标准化赠品名称
+                ...
+                gifts.append((gift_name, gnum))
+
+
+四、修复效果
+================================================================================
+
+以合并订单 6928601810063031567&6928604049951915279 为例：
+
+修复前：
+- 子订单1：1 商品行 + N 个重复圆垫赠品行（N 随运行次数增长）
+- 子订单2：1 补差价行（赠品被跳过）
+
+修复后：
+- 子订单1：1 商品行 + 1 圆垫赠品行（重复行被去重清理）
+- 子订单2：1 补差价行 + 1 圆垫赠品行 + 1 方垫(30x50)赠品行
+- 合计：3 个赠品行，分别属于不同子订单，互不合并去重
+- 赠品行 shop_remark 干净，不再携带订单级备注，反馈循环被切断
+
+五、测试验证
+================================================================================
+
+新增/更新的测试用例：
+
+1. Test/test_gift_dup_erp.py
+   - 验证 ERP 创建的重复赠品行（带订单级备注）被自动去重
+   - 验证保留的赠品行 shop_remark 干净（不含订单级备注）
+   - 场景：3 个相同赠品行 → 去重为 1 个
+
+2. Test/test_merged_order_dup_fix.py
+   - 验证合并订单订单级备注污染的过滤
+   - 场景1：单分组污染（B 组备注包含 A 组商品）→ 只保留 B 自己的商品
+   - 场景2：双分组污染 → 每组只保留自己的商品
+   - 场景3：正常多尺寸订单 → 不被误过滤
+   - 场景4：不同商品跨分组污染 → 正确按 original_tid 保留
+   - 场景5：ERP 自动创建的商品行（original_tid 含 &）备注不被收集
+
+3. Test/test_two_suborder_gifts.py
+   - 验证两个子订单各自赠品不互相去重
+   - 验证纯赠品备注（success=False）的子订单赠品被收集
+   - 验证无前缀的"方垫"通过上下文继承被识别
+   - 期望结果：3 个赠品行（子订单1 圆垫x1，子订单2 圆垫x1 + 方垫/30x50x1）
+
+六、涉及的文件清单
+================================================================================
+
+1. adapters/fangguo/adapter.py
+   - update_merchant_code：新增 engine_gifts 参数、赠品预处理去重逻辑
+   - _build_gift_item：shop_remark 不再回退到 order.shop_remark
+
+2. core/engine.py
+   - _process_merged_order：success=False 分组赠品收集、传递 engine_gifts
+   - 普通订单流程：同步传递 engine_gifts
+
+3. core/parser.py
+   - _extract_multiple_gifts：新增赠品上下文继承（无前缀白名单赠品识别）
+
+4. Test/test_gift_dup_erp.py（新增）
+5. Test/test_merged_order_dup_fix.py（新增）
+6. Test/test_two_suborder_gifts.py（新增）
+
+七、注意事项与后续维护建议
+================================================================================
+
+1. 赠品行 shop_remark 来源约束
+   - 赠品行的 shop_remark 只能来自显式传入参数或原商品行自身
+   - 严禁回退到 order.shop_remark，否则会再次触发反馈循环
+   - 后续如需修改 _build_gift_item，务必保留此约束
+
+2. engine_gifts 与 parsed_list 赠品去重
+   - adapter 合并时以 (name, tid) 为去重键
+   - 若同一 (name, tid) 在两处都出现，以 parsed_list 为准，engine_gifts 跳过
+   - 避免同一赠品被重复累加数量
+
+3. 赠品上下文继承的边界
+   - 仅当前面已识别到白名单赠品时才触发补充提取
+   - 从 last_accepted_match_end 之后开始搜索，避免重复匹配
+   - 30x50 数量解析特殊处理：优先匹配 "-数字"，避免把 30 误识别为数量
+
+4. 赠品行去重优先级
+   - type=0 原始行 > type=1 手工单行
+   - 有 sys_oid 且不以 'new_' 开头 > 其他
+   - 同优先级按 idx 升序保留第一个
+
+5. 跨子订单不去重
+   - 赠品去重分组键包含 original_tid
+   - 不同子订单的相同赠品行不会被互相去重
+   - 这是"两个子订单各有圆垫"场景能正确保留的关键
+
+================================================================================
+                              总结结束
+================================================================================

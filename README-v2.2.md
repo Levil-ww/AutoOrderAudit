@@ -59,6 +59,9 @@ AutoOrderAudit 连接方果 ERP 系统，自动拉取待整理订单，解析卖
 - **登录有效期与 API 同步** — 优先使用登录接口返回的 `expiresTime`（毫秒时间戳）作为 Token 过期时间，兼容 `expiresIn`/`ttl` 秒级间隔格式，无返回时回退默认 7 天
 - **期望签名维度扩展** — 二次运行幂等校验签名新增「订单备注 hash」和「现有商品行作废状态摘要」两个维度，防止备注措辞变化或外部作废后缓存命中跳过
 - **GUI 并发与超时保护** — `_running` 状态加线程锁防止重复触发审单；确认弹窗增加 5 分钟超时兜底；登录回调后自动清空密码输入框
+- **合并订单赠品无限增长修复** — 切断"订单级备注 → 赠品行 shop_remark → 再次解析"的反馈循环：`_build_gift_item` 不再回退到 `order.shop_remark`；同时新增赠品行预处理去重，按 `(标准化SKU, 数量, original_tid)` 三元组分组，同子订单内相同赠品行只保留一行
+- **纯赠品备注子订单赠品收集** — 子订单备注为纯赠品（解析结果 `success=False`）时，engine 仍将其赠品收集到 `all_gifts` 并通过 `engine_gifts` 参数传递给 adapter，避免赠品丢失
+- **赠品上下文继承识别** — 当备注前面已识别到白名单赠品后，后续出现的白名单赠品名称（如"方垫-1张"）即使没有"送/赠品"前缀也会被识别。例如"赠送赠品圆垫-1张，方垫-1张" → `[圆垫x1, 方垫x1]`
 
 ### V2.1 功能（已包含）
 - **自动监控模式** — 自适应间隔轮询待处理订单，有订单时快查（10秒），无订单时逐步拉长至3分钟
@@ -92,12 +95,14 @@ AutoOrderAudit/
 │   ├── test_deduplication.py          # 商品行去重测试
 │   ├── test_duplicate_order_fix.py    # 重复订单修复测试
 │   ├── test_gift_dedup_bug.py         # 合并订单赠品去重测试
+│   ├── test_gift_dup_erp.py            # ERP 创建重复赠品行去重测试
 │   ├── test_gift_extract.py           # 赠品提取测试
 │   ├── test_gift_fix.py               # 赠品修复测试
 │   ├── test_gift_format.py            # 赠品格式化测试
 │   ├── test_gift_pad_format.py        # 赠品沥水垫格式测试
 │   ├── test_manual_item_red_tag.py    # 手工单红标测试
 │   ├── test_manual_type.py            # 手工单类型测试
+│   ├── test_merged_order_dup_fix.py   # 合并订单订单级备注污染过滤测试
 │   ├── test_multi_gift.py             # 多赠品测试
 │   ├── test_only_gift.py              # 仅赠品订单测试
 │   ├── test_order_scenario.py         # 订单场景测试
@@ -105,6 +110,7 @@ AutoOrderAudit/
 │   ├── test_red_color.py              # 红色标识测试
 │   ├── test_skip_if_correct.py        # 编码已正确跳过测试
 │   ├── test_stock_goods.py            # 现货商品测试
+│   ├── test_two_suborder_gifts.py     # 两个子订单赠品不互相去重测试
 │   └── revert_order.py                # 订单回滚工具
 │
 ├── auth_client.py                     # 方果登录客户端（封装登录API、二次租户登录）
@@ -237,12 +243,18 @@ pu皮革/PU皮革       → pu防水
    - 找到匹配 tid 的赠品行 → 在原赠品行上修改编码和数量
    - 找不到匹配 tid → **新建**赠品行（挂对应子订单号），绝不覆盖其他子订单的赠品行
 3. **合并赠品行时同步调整数量** — 删除赠品行时必须修改剩余赠品行的数量，不能只删不改
+4. **赠品行预处理去重** — ERP 可能因订单级备注自动关联而为同一子订单创建多个相同赠品行。adapter 在赠品处理前按 `(标准化SKU, 数量, original_tid)` 三元组分组去重，同子订单内相同赠品行只保留一行（优先 `type=0` 原始行），其余标记 `cancelStatus=True` 提交 ERP 删除
+5. **赠品行 shop_remark 来源约束** — 赠品行的 `shop_remark` 只使用显式传入参数或原商品行自身备注，**严禁回退到 `order.shop_remark`**（订单级备注），否则 ERP 保存后会把订单级备注关联到赠品行，下次运行时被反复解析形成"赠品无限增长"反馈循环
+6. **纯赠品备注子订单赠品收集** — 子订单备注为纯赠品（如"赠送赠品圆垫-1张，方垫-1张"，解析结果 `success=False`）时，engine 仍将其赠品收集并通过 `engine_gifts` 参数传递给 adapter，避免赠品丢失
+7. **赠品上下文继承识别** — 当备注前面已识别到白名单赠品后，后续出现的白名单赠品名称（如"方垫-1张"）即使没有"送/赠品"前缀也会被识别。例如"赠送赠品圆垫-1张，方垫-1张" → `[圆垫x1, 方垫x1]`
 
 | 子订单A | 子订单B | 正确行为 |
 |---------|---------|---------|
 | 原有圆垫，备注无赠品说明 | 无原赠品，备注要方垫 | A的圆垫保留不变；B新建方垫赠品行 |
 | 原有圆垫，备注无赠品说明 | 原有圆垫，备注无赠品说明 | 两个圆垫都保留，不合并 |
 | 无原赠品，备注要方垫 | 无原赠品，备注要方垫 | 两个子订单各新建方垫赠品行 |
+| 原有圆垫x3（ERP重复创建） | 无 | 去重为1个圆垫，其余标记作废 |
+| 备注"赠送赠品圆垫-1张，方垫-1张" | 无 | 识别出圆垫x1 + 方垫x1（方垫无前缀也识别） |
 
 ### 安全跳过关键字
 
@@ -451,7 +463,7 @@ pytest Test/
 pytest Test/test_stock_goods.py -v
 ```
 
-测试覆盖：赠品提取、赠品格式化、现货商品、补差价订单、多尺寸拆分、合并订单、到货返过滤、编码去重、重复订单修复、手工单类型等场景。
+测试覆盖：赠品提取、赠品格式化、现货商品、补差价订单、多尺寸拆分、合并订单、到货返过滤、编码去重、重复订单修复、手工单类型、ERP 重复赠品行去重、合并订单订单级备注污染过滤、纯赠品备注子订单赠品收集等场景。
 
 ## 技术栈
 
@@ -465,6 +477,14 @@ pytest Test/test_stock_goods.py -v
 ## 版本历史
 
 ### V2.2
+
+#### 2026-08-11 增量更新（合并订单赠品无限增长修复）
+- **修复合并订单赠品无限增长问题** — ERP 保存赠品行时会自动把订单级备注关联到新建赠品行的 `shop_remark`，导致下次运行时被反复解析、反复创建赠品行。`adapter.py` 的 `_build_gift_item` 不再回退到 `order.shop_remark`，切断"订单级备注 → 赠品行 shop_remark → 再次解析"的反馈循环（`adapters/fangguo/adapter.py`）
+- **新增赠品行预处理去重** — `update_merchant_code` 在赠品处理前按 `(标准化SKU, 数量, original_tid)` 三元组分组去重，同一子订单内相同赠品行只保留一行（优先 `type=0` 原始行），其余标记 `cancelStatus=True` 提交 ERP 删除（`adapters/fangguo/adapter.py`）
+- **修复合并订单纯赠品备注子订单赠品丢失** — 子订单备注为纯赠品（如"赠送赠品圆垫-1张，方垫-1张"）时解析结果 `success=False`，旧逻辑直接 `continue` 导致赠品被跳过。`engine.py` 改为先收集赠品到 `all_gifts` 再判断 success，即使分组解析失败也保留赠品信息（`core/engine.py`）
+- **新增 engine_gifts 参数传递机制** — `update_merchant_code` 新增 `engine_gifts` 参数接收 engine 层完整收集的赠品 `[(name, num, tid), ...]`，包含 `success=False` 分组中的赠品；与 `parsed_list` 赠品按 `(name, tid)` 去重合并后处理（`adapters/fangguo/adapter.py`、`core/engine.py`）
+- **新增赠品上下文继承识别** — `_extract_multiple_gifts` 引入 `last_accepted_match_end` 跟踪，当前面已识别到白名单赠品后，后续出现的白名单赠品名称（如"方垫-1张"）即使没有"送/赠品"前缀也会被识别。例如"赠送赠品圆垫-1张，方垫-1张" → `[圆垫x1, 方垫x1]`（`core/parser.py`）
+- **新增测试** — `Test/test_gift_dup_erp.py` 覆盖 ERP 创建的重复赠品行去重；`Test/test_merged_order_dup_fix.py` 覆盖合并订单订单级备注污染过滤（5 个场景）；`Test/test_two_suborder_gifts.py` 覆盖两个子订单赠品不互相去重 + 纯赠品备注收集 + 无前缀方垫识别
 
 #### 2026-08-07 增量更新
 - **修复合并订单跨子订单误删商品行** — 不同子订单拥有相同商品编码时，旧逻辑按 `(SKU, 数量)` 去重会误删其中一行。改为按 `(标准化SKU, 数量, original_tid)` 三元组分组，确保跨子订单永不互斥去重，仅同一子订单内重复行合并（`core/engine.py`、`adapters/fangguo/adapter.py`）
