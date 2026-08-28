@@ -1263,6 +1263,55 @@ class AutoAuditEngine:
         success_parsed = [p for p in filtered_parsed if p and p.success]
         non_success_parsed = [p for p in filtered_parsed if p and not p.success]
 
+        # 检测是否为套装订单：
+        # 1. 商品行title包含"件套"、"套装"、"优惠装"等关键词
+        # 2. 或存在多个相同SKU的非赠品、非作废商品行
+        is_set_order_engine = False
+        set_keywords = ['件套', '套装', '优惠装', '组合装']
+        for item in order.items:
+            if item.is_void:
+                continue
+            sku = item.shop_mapping_sku or ''
+            if '赠品' in sku or '补差价' in sku:
+                continue
+            title = item.title or ''
+            for kw in set_keywords:
+                if kw in title:
+                    is_set_order_engine = True
+                    print(f"  📦 引擎检测到套装订单：商品标题包含 '{kw}'")
+                    break
+            if is_set_order_engine:
+                break
+        
+        # 方式2：解析结果中存在重复的 SKU+数量 组合，且原始商品行中也有多个相同SKU
+        if not is_set_order_engine and success_parsed:
+            from collections import Counter
+            sku_num_counter = Counter()
+            for p in success_parsed:
+                sku_num_counter[(_normalize_sku_for_dup(p.shop_mapping_sku), p.num)] += 1
+            for key, count in sku_num_counter.items():
+                if count > 1:
+                    norm_sku, num = key
+                    raw_count = 0
+                    for item in order.items:
+                        if item.is_void:
+                            continue
+                        item_sku = re.sub(r'<[^>]+>', '', item.shop_mapping_sku or '')
+                        if not item_sku:
+                            continue
+                        if '赠品' in item_sku or '补差价' in item_sku:
+                            continue
+                        item_norm = _normalize_sku_for_dup(item_sku)
+                        if item_norm == norm_sku and item.num == num:
+                            raw_count += 1
+                    if raw_count > 1:
+                        is_set_order_engine = True
+                        print(f"  📦 引擎检测到套装订单：存在 {raw_count} 个相同SKU({norm_sku[:40]})的商品行")
+                        break
+
+        if is_set_order_engine:
+            print(f"  📦 套装订单：引擎SKU去重将合并数量而非删除")
+
         # 关键修复：按 (normalized_sku, num, original_tid) 分组，
         # 确保不同子订单的商品永不互斥去重。
         # 同一子订单内的相同SKU才需要去重（数量合并或保留最优）。
@@ -1282,6 +1331,13 @@ class AutoAuditEngine:
             
             if len(candidates) == 1:
                 deduped_parsed.append(candidates[0])
+                continue
+
+            # 套装订单：相同SKU的解析结果全部保留，不做去重删除
+            # 因为套装中的每个商品行都是独立的，不应因SKU相同而去除
+            if is_set_order_engine:
+                for p in candidates:
+                    deduped_parsed.append(p)
                 continue
 
             # 同一子订单内的纯重复解析 → 保留最优的一个

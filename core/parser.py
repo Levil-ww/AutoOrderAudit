@@ -152,13 +152,14 @@ _PATTERN_KEYWORDS = ["花幔", "卢浮梦境", "安妮森林", "暗夜缪斯", "
 # 赠品关键词
 _GIFT_KEYWORDS = ["送", "赠品", "附赠", "加送"]
 
-# 赠品名称白名单：只识别这四类赠品
-# 圆垫、沥水垫25cm -> 编码 round
+# 赠品名称白名单：只识别这几类赠品
+# 圆垫、沥水垫25cm、沥水垫小圆或小方 -> 编码 round
 # 方垫、30x50 -> 编码 square
 # 其他（防滑垫、小垫子等）一律跳过不处理
 _GIFT_NAME_WHITELIST = [
     "圆垫",
     "沥水垫25cm",
+    "沥水垫小圆或小方",
     "方垫",
     "30x50",
 ]
@@ -174,6 +175,7 @@ def _is_whitelisted_gift(gift_text: str) -> bool:
     匹配规则（任一命中即视为白名单）：
     - 包含"圆垫"
     - 包含"沥水垫25cm"
+    - 包含"沥水垫小圆或小方"
     - 包含"方垫"
     - 包含"30x50"（忽略大小写和分隔符）
     """
@@ -182,6 +184,8 @@ def _is_whitelisted_gift(gift_text: str) -> bool:
     if "圆垫" in gift_text:
         return True
     if "沥水垫25cm" in gift_text:
+        return True
+    if "沥水垫小圆或小方" in gift_text:
         return True
     if "方垫" in gift_text:
         return True
@@ -736,9 +740,9 @@ def extract_multiple_remarks(
                 if gift_pos_in_trailing != -1:
                     clean_remark = clean_remark[:gift_pos_in_trailing].strip().strip("-;,、，")
                 # 进一步清理：即使没有"送/赠品"前缀，残留的白名单赠品名
-                # （圆垫/方垫/沥水垫25cm/30x50）也应从尾部备注中剔除，
+                # （圆垫/方垫/沥水垫25cm/沥水垫小圆或小方/30x50）也应从尾部备注中剔除，
                 # 这些是赠品语义内容，不应附加到商品编码后缀
-                for gift_kw in ["圆垫", "方垫", "沥水垫25cm"]:
+                for gift_kw in ["圆垫", "方垫", "沥水垫25cm", "沥水垫小圆或小方"]:
                     pos = clean_remark.find(gift_kw)
                     if pos != -1:
                         # 从该关键字位置向前找到上一个分隔符，从分隔符处截断
@@ -1351,6 +1355,10 @@ def _extract_multiple_gifts(text: str) -> list[tuple[str, int]]:
     
     if not gifts:
         gifts = _extract_gifts_fallback(text)
+        if gifts:
+            # fallback 已处理全文，将 last_accepted_match_end 推到文本末尾，
+            # 避免后续补充提取重复提取同一赠品导致数量翻倍
+            last_accepted_match_end = len(text)
     
     # ===== 补充提取：赠品上下文继承 =====
     # 当前面已经出现"送/赠品/附赠/加送"前缀匹配到赠品后，
@@ -1368,7 +1376,7 @@ def _extract_multiple_gifts(text: str) -> list[tuple[str, int]]:
             # 避免把 "30x50" 中的 "30" 误识别为数量。
             # 例："方垫-1张"、"方垫30x50cm-1张"、"沥水垫25cm-2张"、"30x50一张"
             ctx_pattern = re.compile(
-                r"(圆垫|方垫(?:30\s*[xX×*]\s*50(?:cm)?)?|沥水垫25cm|沥水垫 25cm|30\s*[xX×*]\s*50(?:cm)?)\s*"
+                r"(圆垫|方垫(?:30\s*[xX×*]\s*50(?:cm)?)?|沥水垫25cm|沥水垫 25cm|沥水垫小圆或小方|30\s*[xX×*]\s*50(?:cm)?)\s*"
                 r"(?:[-××]\s*(\d+)|[-××]\s*([一二两三四五六七八九十]+)|(?<![xX×*\d])\s*(\d+)\s*(?=[张个件套米]|$)|([一二两三四五六七八九十]+)\s*(?=[张个件套米]|$))?\s*"
                 r"(?:张|个|件|套|米)?",
                 flags=re.IGNORECASE,

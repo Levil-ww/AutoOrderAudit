@@ -441,6 +441,11 @@ class FangguoAdapter(ErpAdapter):
             sku = re.sub(r'(直径|圆|圆形|圆直径|尺寸)(\d+(?:\.\d+)?)\s*(?:cm|CM|厘米)', r'\1\2', sku, flags=re.IGNORECASE)
             return sku
 
+        # 检测是否为套装订单（套装订单的相同SKU商品行不应被去重删除）
+        is_set_order = self._is_set_order(order, product_parsed_list)
+        if is_set_order:
+            print(f"    📦 套装订单：后续去重逻辑将保留相同SKU商品行，不执行删除")
+
         # 判断是否为"只有补差价但应作为普通订单处理"的情况
         price_diff_items_count = sum(1 for item in order.items if self._is_price_difference_item(item))
         has_only_price_diff = price_diff_items_count > 0 and price_diff_items_count == len(order.items)
@@ -534,19 +539,20 @@ class FangguoAdapter(ErpAdapter):
                         if matched_base_key is not None:
                             base_current_counter[matched_base_key] += 1
                     duplicate_found = False
-                    for sku_num, expected_cnt in expected_counter.items():
-                        if current_counter.get(sku_num, 0) > expected_cnt:
-                            print(f"  ⚠️ 检测到重复商品行: {sku_num[0]} x {sku_num[1]}，当前{current_counter[sku_num]}个，期望{expected_cnt}个，将重建订单")
-                            duplicate_found = True
-                            break
-                    if not duplicate_found:
+                    if not is_set_order:
+                        for sku_num, expected_cnt in expected_counter.items():
+                            if current_counter.get(sku_num, 0) > expected_cnt:
+                                print(f"  ⚠️ 检测到重复商品行: {sku_num[0]} x {sku_num[1]}，当前{current_counter[sku_num]}个，期望{expected_cnt}个，将重建订单")
+                                duplicate_found = True
+                                break
+                    if not duplicate_found and not is_set_order:
                         for sku_num, expected_cnt in base_expected_counter.items():
                             actual = base_current_counter.get(sku_num, 0)
                             if actual > expected_cnt:
                                 print(f"  ⚠️ 检测到重复商品行(基础SKU): {sku_num[0]} x {sku_num[1]}，当前{actual}个，期望{expected_cnt}个，将重建订单")
                                 duplicate_found = True
                                 break
-                    if not duplicate_found:
+                    if not duplicate_found and not is_set_order:
                         for sku_num, expected_cnt in normalized_expected_counter.items():
                             actual = normalized_current_counter.get(sku_num, 0)
                             if actual > expected_cnt:
@@ -624,19 +630,20 @@ class FangguoAdapter(ErpAdapter):
                             base_current_counter[matched_base_key] += 1
 
                     duplicate_found = False
-                    for sku_num, expected_cnt in expected_counter.items():
-                        if current_counter.get(sku_num, 0) > expected_cnt:
-                            print(f"  ⚠️ 检测到重复商品行: {sku_num[0]} x {sku_num[1]}，当前{current_counter[sku_num]}个，期望{expected_cnt}个，将重建订单")
-                            duplicate_found = True
-                            break
-                    if not duplicate_found:
+                    if not is_set_order:
+                        for sku_num, expected_cnt in expected_counter.items():
+                            if current_counter.get(sku_num, 0) > expected_cnt:
+                                print(f"  ⚠️ 检测到重复商品行: {sku_num[0]} x {sku_num[1]}，当前{current_counter[sku_num]}个，期望{expected_cnt}个，将重建订单")
+                                duplicate_found = True
+                                break
+                    if not duplicate_found and not is_set_order:
                         for sku_num, expected_cnt in base_expected_counter.items():
                             actual = base_current_counter.get(sku_num, 0)
                             if actual > expected_cnt:
                                 print(f"  ⚠️ 检测到重复商品行(基础SKU): {sku_num[0]} x {sku_num[1]}，当前{actual}个，期望{expected_cnt}个，将重建订单")
                                 duplicate_found = True
                                 break
-                    if not duplicate_found:
+                    if not duplicate_found and not is_set_order:
                         for sku_num, expected_cnt in normalized_expected_counter.items():
                             actual = normalized_current_counter.get(sku_num, 0)
                             if actual > expected_cnt:
@@ -725,7 +732,7 @@ class FangguoAdapter(ErpAdapter):
                         existing_gift_items = [item for item in order.items if self._is_gift_item(item)]
 
                         def _get_gift_sku(gift_name):
-                            if "圆垫" in gift_name or "沥水垫25cm" in gift_name:
+                            if "圆垫" in gift_name or "沥水垫25cm" in gift_name or "沥水垫小圆或小方" in gift_name:
                                 gift_type = 'round'
                             elif "方垫" in gift_name or re.search(r"30\s*[xX×*]\s*50", gift_name):
                                 gift_type = 'square'
@@ -1166,45 +1173,50 @@ class FangguoAdapter(ErpAdapter):
             duplicate_groups[dup_group_key].append(idx)
 
         removed_dup_count = 0
-        for key, indices in duplicate_groups.items():
-            if len(indices) <= 1:
-                continue
-            # key 格式: (norm_sku, item_num, original_tid)
-            norm_sku, item_num, _ = key
-            sorted_indices = sorted(indices, key=lambda i: (
-                0 if (order.items[i].raw and order.items[i].raw.get('type') == 0) else 1,
-                0 if order.items[i].id and not order.items[i].id.startswith('new_') else 1,
-                i
-            ))
-            keep_idx = sorted_indices[0]
-            for dup_idx in sorted_indices[1:]:
-                if dup_idx in used_item_indices:
+        if is_set_order:
+            # 套装订单：跳过去重删除，所有相同SKU的商品行都保留
+            # 套装中的每个商品都是独立的，不应因SKU相同而删除
+            print(f"    📦 套装订单：跳过第二步五全局去重，保留所有 {len(order.items)} 个商品行")
+        else:
+            for key, indices in duplicate_groups.items():
+                if len(indices) <= 1:
                     continue
-                dup_item = order.items[dup_idx]
-                dup_sku = _clean_sku(dup_item.shop_mapping_sku)
-                removed_dup_count += 1
-                if dup_item.raw:
-                    void_item = dict(dup_item.raw)
-                else:
-                    void_item = {
-                        "id": dup_item.id,
-                        "orderId": dup_item.order_id,
-                        "sysOid": dup_item.sys_oid,
-                        "oid": dup_item.oid,
-                        "title": dup_item.title,
-                        "skuPropertiesName": dup_item.sku_properties_name,
-                        "shopMappingSku": dup_item.shop_mapping_sku,
-                        "originalSkuId": dup_item.original_sku_id,
-                        "originalGoodsId": dup_item.original_goods_id,
-                        "merchandisePicPath": dup_item.merchandise_pic_path,
-                        "num": dup_item.num,
-                        "price": dup_item.price,
-                        "shopRemark": dup_item.shop_remark or "",
-                    }
-                void_item['cancelStatus'] = True
-                void_item['discardStatus'] = 2
-                order_items.append(void_item)
-                used_item_indices.add(dup_idx)
+                # key 格式: (norm_sku, item_num, original_tid)
+                norm_sku, item_num, _ = key
+                sorted_indices = sorted(indices, key=lambda i: (
+                    0 if (order.items[i].raw and order.items[i].raw.get('type') == 0) else 1,
+                    0 if order.items[i].id and not order.items[i].id.startswith('new_') else 1,
+                    i
+                ))
+                keep_idx = sorted_indices[0]
+                for dup_idx in sorted_indices[1:]:
+                    if dup_idx in used_item_indices:
+                        continue
+                    dup_item = order.items[dup_idx]
+                    dup_sku = _clean_sku(dup_item.shop_mapping_sku)
+                    removed_dup_count += 1
+                    if dup_item.raw:
+                        void_item = dict(dup_item.raw)
+                    else:
+                        void_item = {
+                            "id": dup_item.id,
+                            "orderId": dup_item.order_id,
+                            "sysOid": dup_item.sys_oid,
+                            "oid": dup_item.oid,
+                            "title": dup_item.title,
+                            "skuPropertiesName": dup_item.sku_properties_name,
+                            "shopMappingSku": dup_item.shop_mapping_sku,
+                            "originalSkuId": dup_item.original_sku_id,
+                            "originalGoodsId": dup_item.original_goods_id,
+                            "merchandisePicPath": dup_item.merchandise_pic_path,
+                            "num": dup_item.num,
+                            "price": dup_item.price,
+                            "shopRemark": dup_item.shop_remark or "",
+                        }
+                    void_item['cancelStatus'] = True
+                    void_item['discardStatus'] = 2
+                    order_items.append(void_item)
+                    used_item_indices.add(dup_idx)
 
         if removed_dup_count > 0:
             remaining = len(order.items) - removed_dup_count
@@ -1258,6 +1270,7 @@ class FangguoAdapter(ErpAdapter):
                 else:
                     # 检测与已生成行完全重复的商品行（包括 trailing_remark 不同的情况）
                     # 关键修复：只有同一子订单号的相同SKU才视为重复
+                    # 套装订单例外：套装中的相同SKU商品行是独立的，不应标记为重复删除
                     is_duplicate = False
                     item_sku = _clean_sku(item.shop_mapping_sku)
                     item_num = item.num
@@ -1276,8 +1289,12 @@ class FangguoAdapter(ErpAdapter):
                     
                     if item_sku and (item_sku, item_num) in existing_sku_nums:
                         if _is_same_tid_dup(item_sku, item_num, item_tid):
-                            print(f"    ⚠️ 检测到重复商品行(同子订单): {item_sku} x {item_num} tid={item_tid[-6:]}")
-                            is_duplicate = True
+                            # 套装订单中相同SKU不视为重复，保留全部商品行
+                            if is_set_order:
+                                print(f"    📦 套装订单：保留相同SKU商品行(不标记重复): {item_sku} x {item_num}")
+                            else:
+                                print(f"    ⚠️ 检测到重复商品行(同子订单): {item_sku} x {item_num} tid={item_tid[-6:]}")
+                                is_duplicate = True
                     else:
                         # 使用 base_shop_mapping_sku 检测 trailing_remark 不同导致的重复
                         for p in product_parsed_list:
@@ -1285,8 +1302,11 @@ class FangguoAdapter(ErpAdapter):
                                 if (p.base_shop_mapping_sku, item_num) in existing_base_sku_nums:
                                     # base SKU 重复也需验证子订单号
                                     if _is_same_tid_dup(p.base_shop_mapping_sku, item_num, item_tid):
-                                        print(f"    ⚠️ 检测到重复商品行(基础SKU,同子订单): {item_sku} x {item_num}")
-                                        is_duplicate = True
+                                        if is_set_order:
+                                            print(f"    📦 套装订单：保留相同SKU商品行(基础SKU,不标记重复): {item_sku} x {item_num}")
+                                        else:
+                                            print(f"    ⚠️ 检测到重复商品行(基础SKU,同子订单): {item_sku} x {item_num}")
+                                            is_duplicate = True
                                 break
 
                         # 兜底：通过标准化SKU（忽略 cm/CM 单位差异）检测重复
@@ -1294,8 +1314,11 @@ class FangguoAdapter(ErpAdapter):
                             normalized_item_sku = _normalize_sku_for_duplicate(item_sku)
                             if normalized_item_sku and (normalized_item_sku, item_num) in existing_normalized_sku_nums:
                                 if _is_same_tid_dup(normalized_item_sku, item_num, item_tid):
-                                    print(f"    ⚠️ 检测到重复商品行(标准化SKU,同子订单): {item_sku} x {item_num}")
-                                    is_duplicate = True
+                                    if is_set_order:
+                                        print(f"    📦 套装订单：保留相同SKU商品行(标准化SKU,不标记重复): {item_sku} x {item_num}")
+                                    else:
+                                        print(f"    ⚠️ 检测到重复商品行(标准化SKU,同子订单): {item_sku} x {item_num}")
+                                        is_duplicate = True
 
                     if is_duplicate:
                         # 将重复行标记为作废（cancelStatus: true）后提交
@@ -1780,7 +1803,7 @@ class FangguoAdapter(ErpAdapter):
         """
         # 硬约束：赠品材质固定为"吸水皮革"
         gift_material = "吸水皮革"
-        if "圆垫" in gift_name or "沥水垫25cm" in gift_name:
+        if "圆垫" in gift_name or "沥水垫25cm" in gift_name or "沥水垫小圆或小方" in gift_name:
             gift_type = 'round'
         elif "方垫" in gift_name or re.search(r"30\s*[xX×*]\s*50", gift_name):
             gift_type = 'square'
@@ -2079,6 +2102,75 @@ class FangguoAdapter(ErpAdapter):
         if '差价不发货' in remark or '不打印' in remark or '不用发' in remark:
             return True
         return False
+
+    def _is_set_order(self, order: Order, product_parsed_list: list) -> bool:
+        """检测订单是否为套装订单（如2件套、3件套等）
+        
+        套装订单的特征：
+        1. 商品行title包含"件套"、"套装"、"优惠装"等关键词
+        2. 多个非赠品、非作废、非补差价的商品行具有相同的 (标准化SKU, 数量)
+        
+        套装订单的相同SKU商品行不应被去重删除，而应全部保留或合并数量。
+        """
+        # 方式1：通过title关键词检测
+        set_keywords = ['件套', '套装', '优惠装', '组合装', '套装']
+        for item in order.items:
+            if item.is_void:
+                continue
+            if self._is_gift_item(item):
+                continue
+            if self._is_price_difference_item(item):
+                continue
+            title = item.title or ''
+            for kw in set_keywords:
+                if kw in title:
+                    print(f"    📦 检测到套装订单：商品标题包含 '{kw}'")
+                    return True
+
+        # 方式2：检测是否有多个非赠品、非作废的相同SKU商品行
+        # 当解析结果中有多个相同SKU时，很可能是套装
+        if product_parsed_list and len(product_parsed_list) >= 2:
+            from collections import Counter
+            sku_counter = Counter()
+            for p in product_parsed_list:
+                if p and p.success:
+                    sku_counter[(self._normalize_sku_for_set(p.shop_mapping_sku), p.num)] += 1
+            # 如果有某个SKU+数量组合出现超过1次，可能是套装
+            for key, count in sku_counter.items():
+                if count > 1:
+                    # 进一步确认：检查原始商品行中是否也有多个相同SKU
+                    norm_sku = key[0]
+                    num = key[1]
+                    raw_same_sku_count = 0
+                    for item in order.items:
+                        if item.is_void:
+                            continue
+                        if self._is_gift_item(item):
+                            continue
+                        if self._is_price_difference_item(item):
+                            continue
+                        if item.num != num:
+                            continue
+                        item_sku = re.sub(r'<[^>]+>', '', item.shop_mapping_sku or '')
+                        if item_sku and self._normalize_sku_for_set(item_sku) == norm_sku:
+                            raw_same_sku_count += 1
+                    if raw_same_sku_count > 1:
+                        print(f"    📦 检测到套装订单：存在 {raw_same_sku_count} 个相同SKU({norm_sku[:40]})的商品行")
+                        return True
+
+        return False
+
+    @staticmethod
+    def _normalize_sku_for_set(sku: str) -> str:
+        """为套装检测标准化SKU（与 _normalize_sku_for_duplicate 保持一致）"""
+        if not sku:
+            return sku
+        sku = re.sub(r'<[^>]+>', '', sku)
+        sku = re.sub(r'(\d+(?:\.\d+)?)\s*[xX×*]\s*(\d+(?:\.\d+)?)\s*(?:cm|CM|厘米)',
+                     r'\1x\2', sku, flags=re.IGNORECASE)
+        sku = re.sub(r'(直径|圆|圆形|圆直径|尺寸)(\d+(?:\.\d+)?)\s*(?:cm|CM|厘米)',
+                     r'\1\2', sku, flags=re.IGNORECASE)
+        return sku
 
     # -------------------------------------------------------------------
     # 工具方法
