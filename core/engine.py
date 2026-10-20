@@ -3,13 +3,19 @@
 通用的自动审单流程，通过 ErpAdapter 接口与具体 ERP 解耦。
 """
 
+from __future__ import annotations
+
 import re
+from _version import __version__
 import time
 from datetime import datetime
+from collections import Counter
+from html import unescape
+from express_manager import get_manager as get_express_manager
 from typing import Callable, Optional
 
 from .adapter_base import ErpAdapter, Order, OrderItem
-from .parser import parse_remark, extract_multiple_remarks
+from .parser import parse_remark, extract_multiple_remarks, is_simple_price_diff_remark, ParsedRemark, _extract_multiple_gifts
 
 
 _SKIP_KEYWORDS = [
@@ -39,6 +45,49 @@ _PRICE_DIFF_KEYWORDS = [
 ]
 
 
+# 备注指定发货日期时，交由人工处理；不因日期已到就自动放行。
+_PUSH_SHIP_DATE = (
+    r"(?:[0-9零〇一二三四五六七八九十两]{1,3}\s*月\s*"
+    r"[0-9零〇一二三四五六七八九十两]{1,3}\s*[日号]?"
+    r"|(?<![\d.])(?:\d{4}[-/.])?(?:0?[1-9]|1[0-2])\s*[-/.]\s*"
+    r"(?:0?[1-9]|[12]\d|3[01])(?!\d|\s*(?:[xX×*]|[cCmM][mM]|厘米|毫米)))"
+)
+_PUSH_SHIP_ACTION = r"(?:发货|发出|发走|寄出|出货|安排发)"
+_RE_PUSH_SCHEDULED_SHIP = re.compile(
+    rf"{_PUSH_SHIP_DATE}[\s\S]{{0,12}}{_PUSH_SHIP_ACTION}"
+    rf"|{_PUSH_SHIP_ACTION}[\s\S]{{0,12}}{_PUSH_SHIP_DATE}"
+)
+
+
+def _is_genuine_skip_keyword(keyword: str, remark: str) -> bool:
+    """判断跳过关键字是否为真正的跳过指令。
+
+    某些关键字在特定上下文中不是跳过信号，例如：
+    - "补发" 后紧跟订单号（如 "补发:6929536054462610661"）是补发关联标记，
+      表示本单是补发单，仍需正常解析定制信息。
+    """
+    if keyword == "补发":
+        pos = remark.find(keyword)
+        if pos >= 0:
+            tail = remark[pos + len(keyword):].lstrip()
+            if tail and (tail[0] in ":：" or tail[0].isdigit()):
+                return False
+    return True
+
+_RE_RESHIPMENT_REF = re.compile(r"[,，;；\s]*补发\s*[:：]?\s*\d+\s*$")
+
+def _strip_reshipment_ref(remark: str) -> str:
+    """剥离备注末尾的补发关联标记（如 '补发:6929536054462610661'）。
+
+    补发标记是订单关联信息，不属于定制内容，剥离后避免污染解析结果。
+    """
+    return _RE_RESHIPMENT_REF.sub("", remark).strip()
+
+def _has_no_gift_ship(remark: str) -> bool:
+    """与参考项目保持一致的赠品不发货写法。"""
+    return any(keyword in remark for keyword in ("赠品不送", "不要赠品", "赠品不发货", "赠品不发", "赠品不要"))
+
+
 class AutoAuditEngine:
     """自动审单引擎"""
 
@@ -50,6 +99,7 @@ class AutoAuditEngine:
         interval: float = 0.5,
         confirm_callback: Optional[Callable] = None,
         skip_cache: Optional[dict] = None,
+        should_stop: Optional[Callable] = None,
     ):
         """
         :param confirm_callback: 确认回调，签名 (order, parsed_list, changes: list[str]) -> bool
@@ -58,6 +108,8 @@ class AutoAuditEngine:
         :param skip_cache: 已正确订单缓存，格式 {trade_id: expected_key}。
                            传入同一个 dict 可在多次轮询间共享缓存。
         """
+        self.should_stop = should_stop or (lambda: False)
+        self.express_mgr = get_express_manager()
         self.adapter = adapter
         self.dry_run = dry_run
         self.max_orders = max_orders
@@ -431,7 +483,7 @@ class AutoAuditEngine:
             'ship': False,  # ship=False → 编码改为不打印
         }]
 
-    def _process_normal_order_logic(self, order: Order, price_diff_updates: list = None, parsed_list_override: list = None):
+    def _process_normal_order_logic(self, order: Order, price_diff_updates: list = None, parsed_list_override: list = None, keep_main_code: bool = False):
         """
         普通订单处理逻辑（从 _process_order 提取的公共逻辑）
 
@@ -440,10 +492,10 @@ class AutoAuditEngine:
             parsed_list_override: 外部传入的预解析结果，避免重复解析。混合订单场景使用。
         """
         remark = order.shop_remark or ""
-        gift_no_ship = "赠品不送" in remark or "不要赠品" in remark
+        gift_no_ship = _has_no_gift_ship(remark)
 
         for keyword in _SKIP_KEYWORDS:
-            if keyword in remark:
+            if keyword in remark and not (keep_main_code and keyword == "正常发"):
                 print(f"  ⏭️  跳过：备注包含关键字 '{keyword}'")
                 self.stats["skipped"] += 1
                 return
@@ -597,7 +649,8 @@ class AutoAuditEngine:
                 return
 
         try:
-            ok = self.adapter.update_merchant_code(order, parsed_list[0] if parsed_list else None, parsed_list, price_diff_updates, gift_no_ship=gift_no_ship, engine_gifts=[(g[0], g[1], '') for g in all_gifts])
+            update_kwargs = {"keep_main_code": True} if keep_main_code else {}
+            ok = self.adapter.update_merchant_code(order, parsed_list[0] if parsed_list else None, parsed_list, price_diff_updates, gift_no_ship=gift_no_ship, engine_gifts=[(g[0], g[1], '') for g in all_gifts], **update_kwargs)
             if ok is None:
                 print(f"  ⏭️  跳过：订单所有商品行已作废")
                 self.stats["skipped"] += 1
@@ -626,9 +679,11 @@ class AutoAuditEngine:
             self.stats["failed"] += 1
             self.stats["errors"].append(f"订单 {order.trade_id}: {e}\n{tb}")
 
-    def run(self, page_no=1, page_size=500, query_status=1, time_begin="", time_end=""):
+    def run(self, page_no=1, page_size=500, query_status=1, time_begin="", time_end="", allowed_order_ids=None):
+        if self.should_stop():
+            return
         print("=" * 60)
-        print(f"自动审单引擎 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"自动审单引擎 V{__version__} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"适配器: {self.adapter.get_adapter_name()}")
         if self.dry_run:
             print("🔶 DRY RUN 模式：仅模拟，不会真实提交")
@@ -638,13 +693,16 @@ class AutoAuditEngine:
 
         print("\n📦 正在查询待处理订单...")
         try:
-            orders = self.adapter.query_orders(
-                page_no=page_no, page_size=page_size,
+            orders = self.adapter.query_all_orders(
+                page_size=page_size,
                 query_status=query_status, time_begin=time_begin, time_end=time_end,
             )
         except Exception as e:
             print(f"❌ 查询订单失败: {e}")
             return
+
+        if allowed_order_ids is not None:
+            orders = [order for order in orders if (order.tid or order.trade_id) in allowed_order_ids]
 
         if not orders:
             print("✅ 没有待处理的订单")
@@ -654,6 +712,8 @@ class AutoAuditEngine:
         print(f"📋 共获取 {len(orders)} 个待处理订单")
 
         for idx, order in enumerate(orders):
+            if self.should_stop():
+                break
             if self.max_orders > 0 and idx >= self.max_orders:
                 print(f"\n⏸️  已达最大处理数量 ({self.max_orders})")
                 break
@@ -662,9 +722,12 @@ class AutoAuditEngine:
             print(f"[{idx+1}/{len(orders)}] 处理订单 {order.id or order.trade_id}")
 
             try:
+                cancelled_before = self.stats["cancelled"]
+                failed_before = self.stats["failed"]
                 self._process_order(order)
                 # 处理完商品编码后，统一处理快递
-                self._update_express_for_order(order)
+                if not self.should_stop() and self.stats["cancelled"] == cancelled_before and self.stats["failed"] == failed_before:
+                    self._update_express_for_order(order)
             except Exception as e:
                 self.stats["failed"] += 1
                 import traceback
@@ -677,7 +740,7 @@ class AutoAuditEngine:
 
         self._print_summary()
 
-    def run_monitor_cycle(self, page_no=1, page_size=500, query_status=1, time_begin="", time_end="") -> int:
+    def run_monitor_cycle(self, page_no=1, page_size=500, query_status=1, time_begin="", time_end="", allowed_order_ids=None) -> int:
         """
         监控周期：查询订单，有则处理，无则安静返回。
         比 run() 更安静，不打印 banner，无订单时不打印多余信息。
@@ -687,13 +750,16 @@ class AutoAuditEngine:
         self.stats = {"total": 0, "success": 0, "skipped": 0, "failed": 0, "errors": [], "cancelled": 0}
 
         try:
-            orders = self.adapter.query_orders(
-                page_no=page_no, page_size=page_size,
+            orders = self.adapter.query_all_orders(
+                page_size=page_size,
                 query_status=query_status, time_begin=time_begin, time_end=time_end,
             )
         except Exception as e:
             print(f"❌ 查询订单失败: {e}")
             return 0
+
+        if allowed_order_ids is not None:
+            orders = [order for order in orders if (order.tid or order.trade_id) in allowed_order_ids]
 
         if not orders:
             return 0
@@ -703,6 +769,8 @@ class AutoAuditEngine:
         print("=" * 60)
 
         for idx, order in enumerate(orders):
+            if self.should_stop():
+                break
             if self.max_orders > 0 and idx >= self.max_orders:
                 print(f"\n⏸️  已达最大处理数量 ({self.max_orders})")
                 break
@@ -711,8 +779,11 @@ class AutoAuditEngine:
             print(f"[{idx+1}/{len(orders)}] 处理订单 {order.id or order.trade_id}")
 
             try:
+                cancelled_before = self.stats["cancelled"]
+                failed_before = self.stats["failed"]
                 self._process_order(order)
-                self._update_express_for_order(order)
+                if not self.should_stop() and self.stats["cancelled"] == cancelled_before and self.stats["failed"] == failed_before:
+                    self._update_express_for_order(order)
             except Exception as e:
                 self.stats["failed"] += 1
                 self.stats["errors"].append(str(e))
@@ -746,6 +817,16 @@ class AutoAuditEngine:
         if is_merged_order:
             self._process_merged_order(order, material_map, material_matcher)
             return
+
+        # 正常发/特定保持原商品编码，只补齐备注中的赠品。
+        if "正常发" in remark or "特定" in remark:
+            gifts = _extract_multiple_gifts(remark)
+            if gifts or _has_no_gift_ship(remark):
+                parsed = ParsedRemark(raw_text=remark, gifts=gifts,
+                                      gift_name=gifts[0][0] if gifts else "",
+                                      gift_num=gifts[0][1] if gifts else 0)
+                self._process_normal_order_logic(order, parsed_list_override=[parsed], keep_main_code=True)
+                return
 
         # ===== 检测补差价订单 =====
         if self._is_price_difference_order(order):
@@ -1013,9 +1094,17 @@ class AutoAuditEngine:
             is_price_diff = group['is_price_diff']
             print(f"    原始订单 {tid[:16]}...: 备注='{group_remark[:40]}...' {'(补差价)' if is_price_diff else ''}")
             
-            if "赠品不送" in group_remark or "不要赠品" in group_remark:
+            if _has_no_gift_ship(group_remark):
                 gift_no_ship_tids.append(tid)
             
+            if not is_price_diff and ("正常发" in group_remark or "特定" in group_remark):
+                if not any(keyword in group_remark for keyword in _SKIP_KEYWORDS if keyword != "正常发"):
+                    gifts = _extract_multiple_gifts(group_remark)
+                    all_gifts.extend((name, num, tid) for name, num in gifts)
+                    all_parsed_list.append(ParsedRemark(raw_text=group_remark, gifts=gifts,
+                                                        original_tid=tid))
+                continue
+
             if is_price_diff:
                 # 分离补差价商品行和普通商品行
                 diff_items = [item for item in group['items'] if self._is_price_difference_item(item)]
@@ -1452,53 +1541,119 @@ class AutoAuditEngine:
             self.stats["failed"] += 1
             self.stats["errors"].append(f"订单 {order.trade_id}: {e}")
 
-    def _update_express_for_order(self, order):
+    def _update_express_for_order(self, order: Order) -> bool:
+        """保留现有调用入口，支持备注、店铺、平台、省份四级快递规则。"""
+        return self._update_express(order)
+
+    def _update_express(self, order: Order) -> bool:
+        """根据规则自动修改订单快递（在商家编码修改成功后调用）
+
+        逻辑：
+        1. 根据店铺+平台+省份+备注解析目标快递（四级优先级）
+        2. 获取当前快递编码（adapter字段 → order.raw → 备选字段名）
+        3. 如果订单当前快递已与目标一致 → 跳过，打印提示
+        4. 否则调用 API 修改，并更新 order.current_cp_code
+
+        返回值：
+            bool: True 表示快递满足规则可以推送，False 表示不满足规则应阻止推送
         """
-        根据备注关键词或省份规则，自动更新订单快递信息
-        优先级：备注关键词 > 省份规则
-        """
-        from express_config import get_express_by_remark, get_express_for_province, get_express_code
+        express_name, cp_code = self.express_mgr.resolve_express(
+            order.receiver_province, order.shop_remark,
+            store_name=order.store_name,
+            platform_name=order.platform_name,
+        )
+        if not express_name or not cp_code:
+            return True
 
-        remark = order.shop_remark or ""
-        province = order.receiver_province or ""
+        # 判断匹配来源，用于日志输出
+        match_source = self._resolve_match_source(
+            order.shop_remark, order.store_name, order.platform_name
+        )
 
-        # 1. 优先检测备注关键词
-        express_name = get_express_by_remark(remark)
-        match_source = "备注关键词"
+        # 获取当前快递编码
+        current_code = (order.current_cp_code or "").strip().upper()
+        if not current_code and order.raw:
+            current_code = self._find_express_code_from_raw(order.raw)
 
-        # 2. 如果没有匹配到关键词，使用省份规则
-        if not express_name and province:
-            express_name = get_express_for_province(province)
-            match_source = f"省份规则({province})"
+        target_code = cp_code.strip().upper()
 
-        if not express_name:
-            return
-
-        express_code = get_express_code(express_name)
-        if not express_code:
-            print(f"  ⚠️  快递编码未找到: {express_name}")
-            return
-
-        # 检查当前快递是否已经正确，避免重复修改
-        if order.current_cp_code == express_code:
-            print(f"  ⏭️  跳过：快递已正确 [{express_name}({express_code})]")
-            return
+        # 打印快递选择信息
+        source_tag = f"({match_source})" if match_source else ""
+        if current_code:
+            if current_code == target_code:
+                print(f"  🚚 快递{source_tag}：{express_name}({cp_code}) | 当前：{current_code} | ⏭️ 已正确，跳过")
+                return True
+            else:
+                print(f"  🚚 快递{source_tag}：{express_name}({cp_code}) | 当前：{current_code} → 需修改")
+        else:
+            print(f"  🚚 快递{source_tag}：{express_name}({cp_code}) | 当前：未知 → 需修改")
 
         if self.dry_run:
-            print(f"  🔶 DRY RUN: 将更新快递为 {express_name}({express_code})，来源: {match_source}")
-            return
-
-        # 检查适配器是否支持更新快递
-        if not hasattr(self.adapter, 'update_express'):
-            return
+            print(f"  🔶 DRY RUN: 将快递从 [{current_code or '无'}] 改为 [{express_name}({cp_code})]")
+            return True
 
         try:
-            ok = self.adapter.update_express(order, express_code)
+            ok = self.adapter.update_express(order, cp_code)
             if ok:
-                print(f"  ✅ 快递已更新: {express_name}({express_code})，来源: {match_source}")
-            # 失败日志由 adapter.update_express 内部打印
+                print(f"  ✅ 快递已改为 {express_name}({cp_code})")
+                order.current_cp_code = cp_code
+                return True
+            else:
+                print(f"  ⚠️ 修改快递失败：{express_name}({cp_code})")
+                return False
         except Exception as e:
-            print(f"  ❌ 快递更新异常: {e}")
+            print(f"  ⚠️ 修改快递异常: {e}")
+            return False
+
+    def _resolve_match_source(
+        self, remark: str, store_name: str, platform_name: str
+    ) -> str:
+        """判断快递匹配的来源层级，返回中文标签用于日志"""
+        remark = remark or ""
+        for keyword in self.express_mgr.keyword_map:
+            if keyword in remark:
+                return "备注指定"
+        if store_name and store_name in self.express_mgr.store_map:
+            return "店铺专属"
+        if platform_name and platform_name in self.express_mgr.platform_map:
+            return "平台默认"
+        return "省份默认"
+
+    @staticmethod
+    def _find_express_code_from_raw(raw: dict) -> str:
+        """从订单原始数据中深度搜索快递编码"""
+        # 常见的快递编码字段名
+        code_fields = [
+            "cpCode", "logisticsCompanyCode", "currentCpCode",
+            "expressCode", "shippingCode",
+        ]
+        for field in code_fields:
+            val = raw.get(field)
+            if val and isinstance(val, str) and val.strip():
+                return val.strip().upper()
+        # 搜索 orderItems 中的物流信息（部分ERP在商品行中存储）
+        items = raw.get("orderItems") or raw.get("items") or []
+        for item in (items if isinstance(items, list) else []):
+            if isinstance(item, dict):
+                for field in code_fields:
+                    val = item.get(field)
+                    if val and isinstance(val, str) and val.strip():
+                        return val.strip().upper()
+                # 嵌套的 logisticsInfo
+                logistics = item.get("logisticsInfo") or item.get("logistics") or {}
+                if isinstance(logistics, dict):
+                    for field in code_fields:
+                        val = logistics.get(field)
+                        if val and isinstance(val, str) and val.strip():
+                            return val.strip().upper()
+        # 搜索顶层的 logisticsInfo
+        logistics = raw.get("logisticsInfo") or raw.get("logistics") or {}
+        if isinstance(logistics, dict):
+            for field in code_fields:
+                val = logistics.get(field)
+                if val and isinstance(val, str) and val.strip():
+                    return val.strip().upper()
+        return ""
 
     def _print_summary(self):
         print("\n" + "=" * 60)
@@ -1517,3 +1672,389 @@ class AutoAuditEngine:
             if len(self.stats["errors"]) > 10:
                 print(f"    ... 还有 {len(self.stats['errors']) - 10} 个错误")
         print("=" * 60)
+    def _get_material_context(self, order: Order | None = None) -> tuple:
+        """获取材质解析上下文：material_map 和 material_matcher。
+
+        Returns:
+            (material_map, material_matcher): 适配器提供的材质映射和匹配器
+        """
+        material_map = getattr(self.adapter, 'material_map', None)
+        order_matcher = getattr(type(self.adapter), "get_material_matcher_for_order", None)
+        if order is not None and callable(order_matcher):
+            material_matcher = self.adapter.get_material_matcher_for_order(order)
+        else:
+            material_matcher = getattr(self.adapter, 'get_material_matcher', lambda: None)()
+        return material_map, material_matcher
+
+
+    def push_eligible_orders(self, page_no=1, page_size=500, time_begin="", time_end=""):
+        """
+        推送符合条件的订单到工厂待审。
+
+        流程：
+        1. 查询待推送订单 (queryStatus=2)，允许空备注标准单，检查跳过指令与付款时间
+        2. 查询待整理订单 (queryStatus=1)，检查解码状态 + 跳过关键词 + 时间，收集 tradeId
+        3. 合并 tradeId 列表，调用 adapter.push_orders()
+
+        Args:
+            page_no: 页码
+            page_size: 每页数量
+            time_begin: 开始时间
+            time_end: 结束时间
+        """
+        if self.should_stop():
+            print("⏹️  收到停止信号，取消推单")
+            return
+
+        from datetime import timedelta
+        from adapters.fangguo.config import QUERY_STATUS_PENDING_PUSH
+
+        print("\n" + "=" * 60)
+        print(f"自动推单 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        if self.dry_run:
+            print("🔶 DRY RUN 模式：仅模拟，不会真实推送")
+        print("=" * 60)
+
+        cutoff = datetime.now() - timedelta(minutes=30)
+        cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"⏰ 时间 cutoff: {cutoff_str}（只推送此时间之前付款的订单）")
+
+        push_trade_ids = []
+        from_pending_push = 0  # 来自「待推送」状态
+        from_pending_audit = 0  # 来自「待整理」状态
+
+        # ===== 来源1：待推送订单 (queryStatus=2) =====
+        print("\n 查询待推送订单...")
+        try:
+            pending_push_orders = self.adapter.query_all_orders(
+                page_size=page_size,
+                query_status=QUERY_STATUS_PENDING_PUSH,
+                time_begin=time_begin, time_end=time_end,
+            )
+        except Exception as e:
+            print(f"❌ 查询待推送订单失败: {e}")
+            return
+
+        print(f"📋 待推送订单: {len(pending_push_orders)} 个")
+
+        for order in pending_push_orders:
+            if self.should_stop():
+                print("⏹️  收到停止信号，终止推单，本批次未提交")
+                return
+            try:
+                skip_reason = self._get_push_skip_reason(order, allow_blank_remark=True)
+            except Exception as e:
+                skip_reason = f"推送条件检查异常，需人工确认: {e}"
+            if skip_reason:
+                print(f"  ⏭️  跳过（待推送）: {order.tid or order.trade_id} - {skip_reason}")
+                continue
+
+            # 时间过滤
+            pay_time = self._get_pay_time(order)
+            if pay_time is None:
+                print(f"  ⏭️  跳过（待推送）: {order.tid or order.trade_id} - 付款时间缺失或无效，无法确认已满30分钟")
+                continue
+            if pay_time > cutoff:
+                print(f"  ️  跳过（待推送）: {order.tid or order.trade_id} - 付款时间 {pay_time} 晚于 cutoff")
+                continue
+
+            if self.should_stop():
+                print("⏹️  收到停止信号，终止推单，本批次未提交")
+                return
+
+            # 快递合规检查
+            try:
+                express_ok = self._update_express(order)
+            except Exception as e:
+                print(f"  ⚠️ 快递检查异常: {order.tid or order.trade_id}: {e}")
+                express_ok = False
+            if not express_ok:
+                print(f"  ⏭️ 跳过（待推送）: {order.tid or order.trade_id} - 快递修改失败，阻止推送")
+                continue
+
+            push_trade_ids.append(order.trade_id)
+            from_pending_push += 1
+            print(f"  ✅ 待推送订单加入推送列表: {order.tid or order.trade_id}")
+
+        # ===== 来源2：待整理订单 (queryStatus=1) —— 只检查，不审单 =====
+        if self.should_stop():
+            print("⏹️  收到停止信号，终止推单，本批次未提交")
+            return
+        print("\n 查询待整理订单...")
+        try:
+            pending_audit_orders = self.adapter.query_all_orders(
+                page_size=page_size,
+                query_status=1,
+                time_begin=time_begin, time_end=time_end,
+            )
+        except Exception as e:
+            print(f" 查询待整理订单失败: {e}")
+            return
+
+        print(f" 待整理订单: {len(pending_audit_orders)} 个")
+
+        for order in pending_audit_orders:
+            if self.should_stop():
+                print("⏹️  收到停止信号，终止推单，本批次未提交")
+                return
+            try:
+                skip_reason = self._get_push_skip_reason(order)
+            except Exception as e:
+                skip_reason = f"推送条件检查异常，需人工确认: {e}"
+            if skip_reason:
+                print(f"  ⏭️  跳过（待整理）: {order.tid or order.trade_id} - {skip_reason}")
+                continue
+
+            # 时间过滤
+            pay_time = self._get_pay_time(order)
+            if pay_time is None:
+                print(f"  ⏭️  跳过（待整理）: {order.tid or order.trade_id} - 付款时间缺失或无效，无法确认已满30分钟")
+                continue
+            if pay_time > cutoff:
+                print(f"  ⏭️  跳过（待整理）: {order.tid or order.trade_id} - 付款时间 {pay_time} 晚于 cutoff")
+                continue
+
+            if self.should_stop():
+                print("⏹️  收到停止信号，终止推单，本批次未提交")
+                return
+
+            # 快递合规检查
+            try:
+                express_ok = self._update_express(order)
+            except Exception as e:
+                print(f"  ⚠️ 快递检查异常: {order.tid or order.trade_id}: {e}")
+                express_ok = False
+            if not express_ok:
+                print(f"  ⏭️ 跳过（待整理）: {order.tid or order.trade_id} - 快递修改失败，阻止推送")
+                continue
+
+            push_trade_ids.append(order.trade_id)
+            from_pending_audit += 1
+            print(f"  ✅ 待整理订单加入推送列表: {order.tid or order.trade_id}")
+
+        push_trade_ids = list(dict.fromkeys(push_trade_ids))
+
+        # ===== 推送 =====
+        print(f"\n📤 待推送订单总数: {len(push_trade_ids)}（待推送来源: {from_pending_push}，待整理来源: {from_pending_audit}）")
+
+        if not push_trade_ids:
+            print("✅ 没有需要推送的订单")
+            return
+
+        if self.dry_run:
+            print(f" DRY RUN: 将推送 {len(push_trade_ids)} 个订单（待推送: {from_pending_push} + 待整理: {from_pending_audit}）")
+            print(f"   tradeIdList: {push_trade_ids[:10]}{'...' if len(push_trade_ids) > 10 else ''}")
+            return
+
+        print(f" 正在推送 {len(push_trade_ids)} 个订单（待推送: {from_pending_push} + 待整理: {from_pending_audit}）...")
+        try:
+            if self.should_stop():
+                print("⏹️  收到停止信号，终止推单，本批次未提交")
+                return
+            result = self.adapter.push_orders(push_trade_ids)
+            code = result.get("code")
+            if code == 0:
+                print(f"✅ API 响应: code=0, data={result.get('data', True)}")
+                # 验证推送结果
+                self._verify_push_result(push_trade_ids)
+            else:
+                print(f"❌ 推送失败: {result.get('msg', '未知错误')} (code={code})")
+        except Exception as e:
+            print(f"❌ 推送异常: {e}")
+
+
+    def _verify_push_result(self, pushed_trade_ids: list[str]) -> None:
+        """验证推送结果：查询工厂待审状态，确认订单已转移"""
+        import time
+
+        # 推送是异步任务，等待完成
+        wait_seconds = 5
+        print(f"\n⏳ 等待推送任务完成（{wait_seconds}秒）...")
+        time.sleep(wait_seconds)
+
+        print(f"\n 验证推送结果...")
+        try:
+            from adapters.fangguo.config import QUERY_STATUS_FACTORY_REVIEW, get_time_begin, get_time_end
+            factory_orders = self.adapter.query_orders(
+                page_no=1, page_size=500,
+                query_status=QUERY_STATUS_FACTORY_REVIEW,
+                time_begin=get_time_begin(), time_end=get_time_end(),
+            )
+            factory_trade_ids = {o.trade_id for o in factory_orders}
+            verified = [tid for tid in pushed_trade_ids if tid in factory_trade_ids]
+            missing = [tid for tid in pushed_trade_ids if tid not in factory_trade_ids]
+
+            if not missing:
+                print(f"  ✅ {len(verified)}/{len(pushed_trade_ids)} 验证通过，全部已移至工厂待审")
+            else:
+                print(f"  ⚠️ {len(verified)}/{len(pushed_trade_ids)} 验证通过")
+                print(f"   {len(missing)} 个订单未找到（可能推送失败）:")
+                for tid in missing:
+                    print(f"     - {tid}")
+        except Exception as e:
+            print(f"  ️ 验证查询异常: {e}")
+
+
+    def _get_pay_time(self, order: Order) -> datetime | None:
+        """从订单 raw 数据中提取付款时间"""
+        if not order.raw:
+            return None
+
+        pay_time_str = (
+            order.raw.get("payTime")
+            or order.raw.get("paymentTime")
+            or order.raw.get("buyerPayTime")
+        )
+        if not pay_time_str:
+            return None
+
+        try:
+            # 尝试多种时间格式
+            for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S"]:
+                try:
+                    return datetime.strptime(pay_time_str, fmt)
+                except ValueError:
+                    continue
+            return None
+        except Exception:
+            return None
+
+
+    @staticmethod
+    def _normalize_push_sku(sku: str) -> str:
+        """去除 ERP 展示标签、空白及大小写差异，保留编码业务内容。"""
+        plain = re.sub(r"<[^>]*>", "", unescape(sku or ""))
+        return re.sub(r"\s+", "", plain).replace("；", ";").casefold()
+
+
+    def _get_push_skip_reason(self, order: Order, allow_blank_remark: bool = False) -> str:
+        """核对备注要求；待推送标准单可允许空备注，仍执行共同安全检查。"""
+        active_items = [item for item in order.items if not item.is_void]
+        if not active_items:
+            return "没有有效商品行，需人工确认"
+        if any(not item.detail_enriched for item in active_items):
+            return "商品详情不完整，需人工确认"
+
+        # 商品行处于退款中状态时，整单不应推送，避免推送到已发起退款的订单。
+        for item in active_items:
+            refund_desc = ""
+            if item.raw:
+                refund_desc = str(item.raw.get("refundStatusDesc") or "")
+            if "退款中" in refund_desc:
+                return f"商品行 {item.id} 退款中，需人工确认"
+
+        # 所有有效行上的延期/补差价说明都具有约束力，不能只看第一条备注。
+        remarks = {order.shop_remark.strip()} if order.shop_remark else set()
+        remarks.update((item.shop_remark or "").strip() for item in active_items)
+        for remark in remarks:
+            if _RE_PUSH_SCHEDULED_SHIP.search(remark):
+                return "备注指定日期发货，需人工处理"
+            if is_simple_price_diff_remark(remark.strip(" ,，。;；!！")):
+                return "备注仅为补差价，不安排生产"
+            for keyword in _SKIP_KEYWORDS:
+                if keyword != "正常发" and keyword in remark and _is_genuine_skip_keyword(keyword, remark):
+                    return f"备注含'{keyword}'"
+
+        if self._is_decode_failed(order):
+            return "解码失败或商品编码不完整"
+
+        # 所有商品行均为补差价且商家编码含"不打印"时，无需推送生产。
+        if all(
+            self.adapter.is_price_difference_item(item)
+            and "不打印" in self._normalize_push_sku(item.shop_mapping_sku)
+            for item in active_items
+        ):
+            return "全部为补差价不打印商品，无需推送"
+
+        # 不打印的差价行、赠品行不能作为主商品已完成审单的凭据。
+        product_items = [
+            item for item in active_items
+            if not self.adapter.is_gift_item(item)
+            and "不打印" not in self._normalize_push_sku(item.shop_mapping_sku)
+        ]
+        if not product_items:
+            return "只有赠品或不打印商品，没有可生产的主商品"
+
+        # 空备注标准单也必须遵守材质限制，不能依赖备注解析后才检查。
+        blocked_materials = getattr(self.adapter, "push_blocked_materials", set())
+        for item in product_items:
+            material = self._normalize_push_sku(item.shop_mapping_sku).split("-", 1)[0]
+            if material in blocked_materials:
+                return f"材质[{material}]不允许自动推送"
+
+        # 待推送标准单无需定制备注；商品行有备注时仍须继续校验。
+        if allow_blank_remark and not any(remarks):
+            return ""
+
+        # 合并订单按子订单独立校验，避免一单有效就带着未处理的另一单推送。
+        original_tids = {item.original_tid for item in product_items if item.original_tid}
+        is_merged = "&" in order.tid or "&" in order.trade_id or len(original_tids) >= 2
+        child_remarks: dict[str, set[str]] = {}
+        if is_merged:
+            for item in product_items:
+                group_id = item.original_tid
+                if not group_id or "&" in group_id or group_id in {order.tid, order.trade_id}:
+                    return "合并订单子订单归属不明确，需人工确认"
+                remark = (item.shop_remark or "").strip()
+                if remark:
+                    child_remarks.setdefault(group_id, set()).add(remark)
+        groups: dict[tuple[str, str], list[OrderItem]] = {}
+        for item in product_items:
+            remark = (item.shop_remark or order.shop_remark or "").strip()
+            group_id = item.original_tid if is_merged else ""
+            if is_merged:
+                remark = (item.shop_remark or "").strip()
+                if not remark:
+                    own_remarks = child_remarks.get(group_id, set())
+                    if len(own_remarks) != 1:
+                        return "合并订单子订单备注缺失或不明确，需人工确认"
+                    remark = next(iter(own_remarks))
+            groups.setdefault((group_id, remark), []).append(item)
+
+        material_map, material_matcher = self._get_material_context(order)
+        for (_, remark), items in groups.items():
+            if not remark:
+                return "备注为空，无商品定制信息"
+            parsed_list = extract_multiple_remarks(
+                _strip_reshipment_ref(remark), material_map=material_map,
+                material_matcher=material_matcher,
+            )
+            products = [parsed for parsed in parsed_list if parsed.success]
+            if not products:
+                return "备注无有效商品信息，主商品尚未完成审单"
+            blocked_materials = getattr(self.adapter, "push_blocked_materials", set())
+            for parsed in products:
+                if parsed.material_code in blocked_materials:
+                    return f"材质[{parsed.material_code}]不允许自动推送"
+            expected: Counter[str] = Counter()
+            actual: Counter[str] = Counter()
+            for parsed in products:
+                expected[self._normalize_push_sku(parsed.shop_mapping_sku)] += parsed.num
+            for item in items:
+                actual[self._normalize_push_sku(item.shop_mapping_sku)] += item.num
+            if actual != expected:
+                return "主商品编码或数量与备注不一致，尚未完成审单"
+        return ""
+
+
+    def _is_decode_failed(self, order: Order) -> bool:
+        """检查订单是否解码失败"""
+        # 检查 decodeStatus 字段
+        decode_status = (order.raw or {}).get("decodeStatus")
+        if decode_status and "失败" in str(decode_status):
+            return True
+
+        # 检查商品行是否有解码失败的标记
+        for item in order.items:
+            if item.is_void:
+                continue
+            if item.raw:
+                item_decode = item.raw.get("decodeStatus")
+                if item_decode and "失败" in str(item_decode):
+                    return True
+            # 单个字段仍为星号或编码为空时，不能视为已完成解码。
+            sku = self._normalize_push_sku(item.shop_mapping_sku)
+            if not sku or re.search(r"(?:^|[-_/])\*+(?=$|[-_/])", sku):
+                return True
+
+        return False

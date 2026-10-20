@@ -11,6 +11,8 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any, Optional
 
+from gift_manager import get_manager as get_gift_manager, split_shop_sku
+
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -29,6 +31,7 @@ class FangguoAdapter(ErpAdapter):
         self._token_version = fg_config.get_token_version()
         self._material_source = get_material_source()
         self.material_map = fg_config.MATERIAL_MAP
+        self.push_blocked_materials = fg_config.PUSH_BLOCKED_MATERIALS
 
     def _ensure_session(self):
         """检查 token 版本，如有变化则重建 session"""
@@ -165,6 +168,8 @@ class FangguoAdapter(ErpAdapter):
         return orders
 
     def _parse_order_list(self, data: dict) -> list[dict]:
+        if not isinstance(data, dict) or data.get("code") != 0 or isinstance(data.get("code"), bool):
+            raise RuntimeError("订单查询失败，未返回业务成功状态")
         d = data.get("data")
         if d is None:
             return []
@@ -281,6 +286,17 @@ class FangguoAdapter(ErpAdapter):
                 original_tid=original_tid,
             )
             order.items.append(item)
+        order.platform_name = str(raw.get("platformName") or "")
+        if not order.platform_name:
+            from _app_path import get_app_dir
+            cache_file = get_app_dir() / "shop_cache.json"
+            if cache_file.exists():
+                try:
+                    shops = json.loads(cache_file.read_text(encoding="utf-8"))
+                    order.platform_name = next((s.get("platform_name", "") for s in shops
+                                                if s.get("shop_name") == order.store_name), "")
+                except (OSError, ValueError, TypeError):
+                    pass
         return order
 
     # -------------------------------------------------------------------
@@ -316,6 +332,8 @@ class FangguoAdapter(ErpAdapter):
             sys_tid=order.sys_tid,
         )
         if not detail:
+            for item in order.items:
+                item.detail_enriched = False
             return order
 
         # 补充卖家备注（如果缺失）
@@ -383,7 +401,7 @@ class FangguoAdapter(ErpAdapter):
     # -------------------------------------------------------------------
     # 3. 修改商家编码（带详细错误日志）
     # -------------------------------------------------------------------
-    def update_merchant_code(self, order: Order, parsed: ParsedRemark, parsed_list: list = None, price_diff_updates: list = None, gift_no_ship_tids: list = None, gift_no_ship: bool = False, engine_gifts: list = None) -> bool:
+    def update_merchant_code(self, order: Order, parsed: ParsedRemark, parsed_list: list = None, price_diff_updates: list = None, gift_no_ship_tids: list = None, gift_no_ship: bool = False, engine_gifts: list = None, keep_main_code: bool = False) -> bool:
         """
         调用 saveProduct 接口更新商家编码
         支持多尺寸：如果备注中有多个尺寸，会拆分成多个商品行
@@ -415,7 +433,9 @@ class FangguoAdapter(ErpAdapter):
         is_merged_order = any(p.original_tid for p in (parsed_list or [])) or (gift_no_ship_tids and len(gift_no_ship_tids) > 0)
         
         # 合并订单跳过 _split_parsed_by_sizes，因为解析结果已经按分组处理过了
-        if parsed_list and len(parsed_list) > 1:
+        if keep_main_code:
+            effective_list = parsed_list or [parsed]
+        elif parsed_list and len(parsed_list) > 1:
             effective_list = parsed_list
         elif not is_merged_order:
             effective_list = self._split_parsed_by_sizes(order, parsed)
@@ -424,7 +444,7 @@ class FangguoAdapter(ErpAdapter):
 
         # 只保留解析成功的商品行（success=True）
         # 对于只有赠品信息、没有有效商品解析的情况，不修改商品编码
-        product_parsed_list = [p for p in effective_list if p and p.success]
+        product_parsed_list = [] if keep_main_code else [p for p in effective_list if p and p.success]
 
         # 辅助：清理 HTML 高亮标签（手工单行的 shopMappingSku 会被 ERP 带上 <font color="red">）
         def _clean_sku(sku: str) -> str:
@@ -732,6 +752,9 @@ class FangguoAdapter(ErpAdapter):
                         existing_gift_items = [item for item in order.items if self._is_gift_item(item)]
 
                         def _get_gift_sku(gift_name):
+                            cfg = get_gift_manager().get_config(gift_name)
+                            if cfg:
+                                return cfg["shop_sku"]
                             if "圆垫" in gift_name or "沥水垫25cm" in gift_name or "沥水垫小圆或小方" in gift_name:
                                 gift_type = 'round'
                             elif "方垫" in gift_name or re.search(r"30\s*[xX×*]\s*50", gift_name):
@@ -1811,7 +1834,16 @@ class FangguoAdapter(ErpAdapter):
             # 白名单后理论上不会出现未知类型，兜底使用 round
             gift_type = 'round'
 
-        gift_info = self._GIFT_TYPE_MAP[gift_type]
+        gift_info = dict(self._GIFT_TYPE_MAP[gift_type])
+        cfg = get_gift_manager().get_config(gift_name)
+        if cfg:
+            gift_material, gift_color, model, picture = split_shop_sku(cfg["shop_sku"])
+            if not all((gift_material, gift_color, model, picture)):
+                raise ValueError("赠品商家编码必须包含材质、颜色、规格和花型")
+            gift_info.update(model_code=model, picture_code=picture, title=cfg["title"],
+                             original_sku_id=cfg["sku_id"], original_goods_id=cfg["goods_id"])
+        else:
+            gift_color = "标准"
         model_code = gift_info['model_code']
         picture_code = gift_info['picture_code']
 
@@ -1861,7 +1893,7 @@ class FangguoAdapter(ErpAdapter):
             "compactFactoryModelName": None,
             "compactFactoryModelId": None,
             "colorId": None,
-            "colorCode": "标准",
+            "colorCode": gift_color,
             "colorCodeName": None,
             "customPicture": False,
             "pictureId": None,
@@ -1917,9 +1949,9 @@ class FangguoAdapter(ErpAdapter):
             "skuPropertiesName": sku_properties_name_field,
             "outerIid": "",
             "shopMappingSku": (
-                f'<font color="red">{gift_material}-标准-{model_code}-{picture_code}</font>'
+                f'<font color="red">{gift_material}-{gift_color}-{model_code}-{picture_code}</font>'
                 if is_new else
-                f"{gift_material}-标准-{model_code}-{picture_code}"
+                f"{gift_material}-{gift_color}-{model_code}-{picture_code}"
             ),
             "diyList": [{
                 "bg": "", "mask": "", "picName": "",
@@ -1987,6 +2019,10 @@ class FangguoAdapter(ErpAdapter):
         3. shop_mapping_sku 包含"赠品"
         4. price为0且标题包含"垫"（常见赠品如沥水垫、防滑垫等，且非桌垫/餐垫/地垫等普通商品）
         """
+        for cfg in get_gift_manager().gifts.values():
+            if ((item.original_goods_id and item.original_goods_id == cfg["goods_id"])
+                    or (item.shop_mapping_sku and re.sub(r"<[^>]*>", "", item.shop_mapping_sku).strip() == cfg["shop_sku"])):
+                return True
         # 方式1：检查 filmGiftCode 字段
         gift_code = item.raw.get('filmGiftCode', '') if item.raw else ''
         if gift_code:
@@ -2602,3 +2638,342 @@ class FangguoAdapter(ErpAdapter):
         except Exception as e:
             print(f"  ❌ 快递更新请求异常: {e}")
             return False
+
+    def push_orders(self, trade_id_list: list[str]) -> dict:
+        """
+        批量推送订单到工厂待审。
+
+        Args:
+            trade_id_list: 待推送的订单 tradeId 列表
+
+        Returns:
+            dict: API 响应结果 {"code": 0, "data": True/...}
+        """
+        if not trade_id_list:
+            return {"code": -1, "msg": "trade_id_list 为空"}
+
+        self._ensure_session()
+        payload = {
+            "tradeIdList": trade_id_list,
+            "pushCheckDecodeBool": True,
+            "forcePushLabel": 0,
+            "onlyNoRefundOrderPushFlag": False,
+            "repeatedPrint": False,
+            "superCpCode": "",
+            "newFactoryId": None,
+            "modifyCpCode": "",
+            "smartDecodeStrategyId": "",
+            "smartDecodeType": 1,
+            "executeCombination": 0,
+            "failSetNull": 0,
+            "lockRemark": "",
+            "identifyContentType": [],
+            "identifyFlag": 0,
+            "maxLengthOrAccurate": 0,
+            "matchRuleType": None,
+            "updateSellerFlag": None,
+            "updateFlag": 1,
+            "updateSellerRemark": "",
+            "syncBool": 0,
+            "specificationNo": 1,
+            "learnTypeList": [],
+            "supplementaryScope": 0,
+            "picTechnologyFactoryId": "",
+            "picTechnologyCode": "",
+            "isCopyRemake": True,
+            "copyReasonCode": 0,
+            "copyReasonCustomized": "",
+            "isLockOrder": False,
+            "copyDiyPicType": 0,
+            "copyReceivedAmount": 0,
+            "copyPaidAmount": 0,
+            "modelData": None,
+            "onlyNotGiftOrderBool": True,
+            "giftTargetType": 1,
+            "giftVOS": {"top": [], "bottom": []},
+            "copyNum": 1,
+            "namingOptions": [],
+            "subFolder": False,
+            "subFolderOptions": [],
+            "downType": 0,
+            "shopId": "",
+        }
+
+        try:
+            resp = self._session.post(
+                fg_config.API_PUSH_ORDERS,
+                json=payload,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except requests.Timeout:
+            return {"code": -1, "msg": "推送超时"}
+        except requests.ConnectionError:
+            return {"code": -1, "msg": "网络连接错误"}
+        except Exception as e:
+            return {"code": -1, "msg": str(e)}
+
+
+    def get_store_list(self) -> list[dict]:
+        """
+        从 ERP 拉取已授权店铺列表，缓存到 shop_cache.json。
+
+        Returns:
+            [{"shop_name": "怡达怡盛家居专卖店", "platform_name": "抖音"}, ...]
+        """
+        from _app_path import get_app_dir
+
+        self._ensure_session()
+        all_shops: list[dict] = []
+        page_no = 1
+        fetched_count = 0
+
+        try:
+            while page_no <= 100:
+                resp = self._session.get(
+                    fg_config.API_SHOP_LIST,
+                    params={"pageSize": 1000, "pageNo": page_no},
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if data.get("code") != 0 or isinstance(data.get("code"), bool):
+                    raise RuntimeError("店铺查询未返回业务成功状态")
+                items = (data.get("data") or {}).get("list") or []
+                if not items:
+                    break
+                for item in items:
+                    if item.get("type") == 1 and item.get("shopName"):
+                        all_shops.append({
+                            "shop_name": item["shopName"],
+                            "platform_name": item.get("platformName") or "",
+                        })
+                fetched_count += len(items)
+                total = (data.get("data") or {}).get("total") or 0
+                if (total and fetched_count >= total) or len(items) < 1000:
+                    break
+                page_no += 1
+            else:
+                raise RuntimeError("店铺分页达到上限")
+        except Exception as e:
+            print(f"  ⚠️ 拉取店铺列表失败: {e}")
+            cache_file = get_app_dir() / "shop_cache.json"
+            if cache_file.exists():
+                try:
+                    with open(cache_file, "r", encoding="utf-8") as f:
+                        return json.load(f)
+                except Exception:
+                    pass
+            return []
+
+        cache_file = get_app_dir() / "shop_cache.json"
+        try:
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(all_shops, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+        return all_shops
+
+
+    def is_manual_item(self, item: OrderItem) -> bool:
+        """判断商品行是否为手工单（通过API创建的新商品行）
+
+        手工单特征：
+        1. type==1 或 shop_mapping_sku 含红色标记（强判定，优先于平台ID）
+        2. 没有原始SKU ID和原始商品ID（兜底判定）
+        3. 不是赠品行
+        4. 不是补差价行
+
+        注意：此方法实现的是 ErpAdapter 基类的公共接口。
+        """
+        if self.is_gift_item(item) or self.is_price_difference_item(item):
+            return False
+
+        # 强判定1：ERP中 type==1 明确标记为手工单
+        if item.raw and isinstance(item.raw, dict):
+            raw_type = item.raw.get('type')
+            if raw_type == 1 or raw_type == '1':
+                return True
+
+        # 强判定2：程序创建的手工单带有红色编码标记
+        if item.shop_mapping_sku and '<font color="red">' in item.shop_mapping_sku:
+            return True
+
+        # 兜底判定：没有任何平台原始标识，视为手工单
+        # 但如果详情未成功补全（detail_enriched=False），字段可能因列表接口
+        # 未返回而缺失，保守起见不判定为手工单，避免误删商品行
+        if not item.detail_enriched:
+            return False
+        has_platform_id = bool(item.original_sku_id) or bool(item.original_goods_id)
+        return not has_platform_id
+
+
+    def delete_manual_items(self, order: Order) -> bool:
+        """删除订单中的所有手工单
+
+        通过 saveProduct 接口提交订单，保留非手工单商品行原样，
+        并通过 deleteTradeOrder 接口真正删除手工单商品行，确保 ERP 正确移除。
+
+        Args:
+            order: 订单对象（需包含 items）
+
+        Returns:
+            True: 删除成功或订单中无手工单
+            False: 删除失败
+        """
+        self._ensure_session()
+        manual_items = [item for item in order.items if self.is_manual_item(item)]
+        non_manual_items = [item for item in order.items if not self.is_manual_item(item)]
+
+        if not manual_items:
+            print(f"  ⏭️  订单 {order.tid or order.trade_id} 中没有手工单，无需清理")
+            return True
+
+        print(f"  🧹 发现 {len(manual_items)} 个手工单，准备删除:")
+        for idx, item in enumerate(manual_items, 1):
+            sku = item.shop_mapping_sku or ""
+            # 去除HTML标签用于日志显示
+            clean_sku = re.sub(r'<[^>]+>', '', sku)
+            print(f"     [{idx}] {clean_sku[:50]}... (数量: {item.num})")
+
+        # 构建保留的商品行列表
+        order_items = []
+        for item in non_manual_items:
+            if item.raw:
+                raw_copy = dict(item.raw)
+                if not raw_copy.get("merchandisePicPath"):
+                    raw_copy.pop("merchandisePicPath", None)
+                order_items.append(raw_copy)
+            else:
+                _pic_path = item.merchandise_pic_path
+                _item_dict = {
+                    "id": item.id,
+                    "orderId": item.order_id,
+                    "sysOid": item.sys_oid,
+                    "oid": item.oid,
+                    "title": item.title,
+                    "skuPropertiesName": item.sku_properties_name,
+                    "shopMappingSku": item.shop_mapping_sku,
+                    "originalSkuId": item.original_sku_id,
+                    "originalGoodsId": item.original_goods_id,
+                    "num": item.num,
+                    "price": item.price,
+                    "shopRemark": item.shop_remark or "",
+                }
+                if _pic_path:
+                    _item_dict["merchandisePicPath"] = _pic_path
+                order_items.append(_item_dict)
+
+        # 调用 deleteTradeOrder 真正删除手工单
+        manual_ids_to_delete = [item.id for item in manual_items if item.id]
+        if manual_ids_to_delete:
+            if not self.delete_trade_order(manual_ids_to_delete):
+                print("  ❌ 删除手工单失败或结果不确定，已中止保存，请人工核对订单")
+                return False
+
+        payload = {
+            "orderType": 0,
+            "id": order.trade_id,
+            "shopRemark": order.shop_remark or "",
+            "buyerRemark": order.buyer_remark or "",
+            "factoryId": order.factory_id,
+            "platform": 0,
+            "platformDesc": "",
+            "allManualOrder": False,
+            "sysTid": order.sys_tid,
+            "tid": order.tid,
+            "dfStatus": 0,
+            "tradeInitNum": 1,
+            "orderItems": order_items,
+            "totalCount": len(order_items),
+            "outerOrderStatusDesc": "",
+            "storeName": order.store_name,
+            "goodsIndex": 0,
+            "shopId": "",
+        }
+
+        print(f"  📤 清理手工单: 保留 {len(order_items)} 个商品行")
+
+        resp = self._session.post(fg_config.API_SAVE_PRODUCT, json=payload, timeout=30)
+        resp.raise_for_status()
+        result = resp.json()
+
+        if result.get("code") == 0 and result.get("data") is True:
+            print(f"  ✅ 手工单删除成功！已清理 {len(manual_items)} 个手工单")
+            return True
+        else:
+            error_msg = result.get("msg", "未知错误")
+            print(f"  ❌ 删除失败: code={result.get('code')}, msg={error_msg}")
+            return False
+
+
+    def delete_trade_order(self, item_ids: list[str]) -> bool:
+        """调用 deleteTradeOrder 接口删除指定商品行
+
+        方果 Web 端点击"删除商品"按钮时实际调用的 API，
+        传入商品行 id 列表，实现从订单中彻底移除商品行。
+
+        Args:
+            item_ids: 要删除的商品行 id 列表
+
+        Returns:
+            True: 删除成功或无可删除项
+            False: 删除失败
+        """
+        if not item_ids:
+            return True
+
+        self._ensure_session()
+        payload = {
+            "orderIdList": item_ids,
+            "shopId": "",
+        }
+
+        print(f"  📤 调用 deleteTradeOrder 删除 {len(item_ids)} 个商品行: {item_ids}")
+
+        try:
+            resp = self._session.post(fg_config.API_DELETE_ORDER, json=payload, timeout=30)
+            resp.raise_for_status()
+            result = resp.json()
+
+            if result.get("code") == 0 and result.get("data") is True:
+                print(f"  ✅ deleteTradeOrder 删除成功")
+                return True
+            else:
+                error_msg = result.get("msg", "未知错误")
+                print(f"  ❌ deleteTradeOrder 删除失败: code={result.get('code')}, msg={error_msg}")
+                return False
+        except requests.RequestException as e:
+            print(f"  ❌ deleteTradeOrder 请求异常: {e}")
+            return False
+
+
+    def is_gift_item(self, item: OrderItem) -> bool:
+        return self._is_gift_item(item)
+
+    def is_price_difference_item(self, item: OrderItem) -> bool:
+        return self._is_price_difference_item(item)
+
+    def query_all_orders(self, page_size: int = 500, query_status: int = 1,
+                         time_begin: str = "", time_end: str = "", max_pages: int = 100,
+                         **kwargs) -> list[Order]:
+        """完整分页查询，重复页或达到上限时中止，避免部分订单被当作完整结果。"""
+        orders = []
+        seen = set()
+        for page_no in range(1, max_pages + 1):
+            page = self.query_orders(page_no=page_no, page_size=page_size,
+                                     query_status=query_status, time_begin=time_begin,
+                                     time_end=time_end, **kwargs)
+            if not page:
+                return orders
+            for order in page:
+                key = order.trade_id or order.id
+                if key in seen:
+                    raise RuntimeError("订单分页出现重复记录，请稍后重试")
+                seen.add(key)
+                orders.append(order)
+            if len(page) < page_size:
+                return orders
+        raise RuntimeError("订单分页达到上限，未执行后续处理")

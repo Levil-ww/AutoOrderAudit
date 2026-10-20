@@ -10,6 +10,7 @@
 
 import re
 import json
+from gift_manager import get_manager as get_gift_manager
 from typing import Callable, Optional
 
 
@@ -115,10 +116,12 @@ _RE_ROUND_SIZE = re.compile(
 _RE_QTY = re.compile(r"[-*×](\d+)\s*(?:张|个|件|套|米)(?!\s*x|X|×|\*)")
 
 # 中文数字匹配（支持一到十及常用数量词）
-_CHINESE_NUMBERS = r"(?:[一二两三四五六七八九十]|\d+)"
+_CHINESE_NUMBERS = r"(?:[二三四五六七八九]十[一二两三四五六七八九]?|十[一二两三四五六七八九]?|[一二两三四五六七八九]|\d+)"
 
 # 数量汇总信息匹配（如"共计两张"、"共三张"、"共计5张"）
-_RE_QTY_SUMMARY = re.compile(rf"共(?:计)?{_CHINESE_NUMBERS}[张个件套米]")
+_RE_QTY_SUMMARY = re.compile(rf"共(?:计)?\s*{_CHINESE_NUMBERS}\s*[张个件套米]")
+_RE_QTY_SUMMARY_VALUE = re.compile(rf"共(?:计)?\s*({_CHINESE_NUMBERS})\s*[张个件套米]")
+_RE_CHINESE_QTY = re.compile(rf"(?<![xX×*\d])({_CHINESE_NUMBERS})\s*(?:[张件套米长]|个(?!角))(?=$|[，,；;\s\-])")
 
 # 到货返信息匹配（如"到货返22"、"到货返50元"、"确认收货返差价0.3元"、“返现10 /0.2元”）
 _RE_ARRIVAL_REFUND = re.compile(r"(到货返|到货返差价|到货退差价|确认收货返差价|返差价|返现)\d+(?:\.\d+)?[元]?")
@@ -181,6 +184,8 @@ def _is_whitelisted_gift(gift_text: str) -> bool:
     """
     if not gift_text:
         return False
+    if get_gift_manager().match_gift(gift_text):
+        return True
     if "圆垫" in gift_text:
         return True
     if "沥水垫25cm" in gift_text:
@@ -217,7 +222,8 @@ def parse_remark(
     if not remark_text or not remark_text.strip():
         return result
 
-    text = remark_text.strip()
+    text = _normalize_qty_position(remark_text.strip())
+    text = text.replace("成品", "现货")
 
     # 情况1：已经是编码格式 "材质-标准/定制-尺寸-花型;尺寸" 或 现货编码 "材质-标准-尺寸-花型;尺寸"
     if "-" in text and not text.startswith("定制") and not text.startswith("现货") and not text.startswith("实际发"):
@@ -611,7 +617,8 @@ def extract_multiple_remarks(
     if not remark_text or not remark_text.strip():
         return results
 
-    text = remark_text.strip()
+    text = _normalize_qty_position(remark_text.strip())
+    text = text.replace("成品", "现货")
 
     # 在整个文本中搜索"定制"、"现货"或"实际发"关键字（"实际发"与"现货"处理方式一致）
     custom_pos = text.find("定制")
@@ -687,6 +694,10 @@ def extract_multiple_remarks(
         parsed = parse_remark(segment_with_prefix, material_map, material_matcher)
 
         # 材质继承逻辑：如果当前段有明确材质，更新current_material；否则继承
+        if (current_material and parsed.material_source == "heuristic"
+                and current_pattern and parsed.material_code == current_pattern):
+            parsed.material_code = current_material
+            parsed.material_source = current_material_source
         if parsed.material_code:
             current_material = parsed.material_code
             current_material_source = parsed.material_source
@@ -1209,9 +1220,20 @@ def _map_material(raw: str, material_map: dict) -> str:
 
 
 def _extract_qty(text: str) -> int:
+    # 优先匹配逐商品数量（如"-2张"），再回退到汇总数量（如"共计5张"）
+    # 汇总数量是所有商品的总数，不应覆盖单个商品的明确数量标记
     matches = _RE_QTY.findall(text)
     if matches:
         return max(int(m) for m in matches)
+
+    chinese_matches = _RE_CHINESE_QTY.findall(text)
+    if chinese_matches:
+        return max(_num_to_int(m) for m in chinese_matches)
+
+    summary_matches = _RE_QTY_SUMMARY_VALUE.findall(text)
+    if summary_matches:
+        return max(_num_to_int(m) for m in summary_matches)
+
     return 1
 
 
@@ -1292,7 +1314,7 @@ def _extract_multiple_gifts(text: str) -> list[tuple[str, int]]:
                 qty_match3 = re.search(r"([一二两三四五六七八九十]+)$", content)
                 if qty_match3:
                     chinese_num = qty_match3.group(1)
-                    gift_num = _CHINESE_NUM_MAP.get(chinese_num, 1)
+                    gift_num = _num_to_int(chinese_num)
                     gift_text = content[:qty_match3.start()].strip()
                 else:
                     gift_num = 1
@@ -1412,6 +1434,9 @@ def _extract_multiple_gifts(text: str) -> list[tuple[str, int]]:
     # 赠品行去重：相同赠品名称合并数量
     unique_gifts = {}
     for gift_name, gift_num in gifts:
+        canonical = get_gift_manager().match_gift(gift_name)
+        if canonical and canonical not in {"圆垫", "方垫"}:
+            gift_name = canonical
         if gift_name in unique_gifts:
             unique_gifts[gift_name] += gift_num
         else:
@@ -1505,7 +1530,7 @@ def _extract_gifts_fallback(text: str) -> list[tuple[str, int]]:
                 qty_match3 = re.search(r"([一二两三四五六七八九十]+)[张个件套米]", part)
                 if qty_match3:
                     chinese_num = qty_match3.group(1)
-                    gift_num = _CHINESE_NUM_MAP.get(chinese_num, 1)
+                    gift_num = _num_to_int(chinese_num)
                     gift_name = part[:qty_match3.start()].strip()
                 else:
                     gift_num = 1
@@ -2434,3 +2459,95 @@ def _clean_segment(segment: str) -> str:
     segment = segment.strip().strip("-;,、，；")
     
     return segment
+
+def is_simple_price_diff_remark(remark: str) -> bool:
+    """
+    判断备注是否为简单的补差价备注（无商品/尺寸信息）
+    匹配："补差价"、"补差价的"、"补的差价"、"差价" 等
+    """
+    remark = remark.strip()
+    if not remark:
+        return False
+    if re.match(r'^补.*差价(的)?$', remark):
+        return True
+    if re.match(r'^差价(的)?$', remark):
+        return True
+    return False
+
+
+
+def _num_to_int(value: str) -> int:
+    value = (value or "").strip()
+    if value.isdigit():
+        return int(value)
+    if value == "十":
+        return 10
+    if value.startswith("十"):
+        return 10 + _CHINESE_NUM_MAP.get(value[1:], 0)
+    if "十" in value:
+        left, right = value.split("十", 1)
+        return _CHINESE_NUM_MAP.get(left, 1) * 10 + (_CHINESE_NUM_MAP.get(right, 0) if right else 0)
+    return _CHINESE_NUM_MAP.get(value, 1)
+
+
+def _normalize_qty_position(text: str) -> str:
+    """
+    规范化数量标记的位置。
+
+    将紧跟在尺寸后面的数量标记（如 -1张）移动到属性后面。
+    例如：
+        "43x47cm-1张左下角右下角圆角半径0.8cm"
+        -> "43x47cm左下角右下角圆角半径0.8cm-1张"
+
+    这样可以确保分割逻辑正确识别产品边界。
+    """
+    text = re.sub(rf"(?<![一二两三四五六七八九十])({_CHINESE_NUMBERS})(?=[张个件套米])",
+                  lambda match: str(_num_to_int(match.group(1))), text)
+    # 查找所有尺寸后面紧跟 -N张 的模式
+    # 尺寸格式：数字x数字cm（可选）
+    pattern = re.compile(
+        r'(\d+(?:\.\d+)?\s*[xX×*]\s*\d+(?:\.\d+)?\s*(?:cm|CM|厘米)?)\s*-\s*(\d+[张个件套米])'
+    )
+
+    # 查找所有匹配项及其位置
+    matches = list(pattern.finditer(text))
+
+    if not matches:
+        return text
+
+    # 从后向前处理，避免位置偏移
+    result = text
+    for match in reversed(matches):
+        dimension = match.group(1)
+        qty_marker = match.group(2)
+        match_start = match.start()
+        match_end = match.end()
+
+        # 查找属性的结束位置（下一个分隔符、下一个尺寸或文本末尾）
+        remaining_text = result[match_end:]
+
+        # 查找下一个分隔符
+        next_sep_pos = len(remaining_text)
+        for sep in ['，', ',', '；', ';']:
+            pos = remaining_text.find(sep)
+            if pos != -1 and pos < next_sep_pos:
+                next_sep_pos = pos
+
+        # 查找下一个尺寸（避免将属性中的尺寸误判为下一个产品）
+        # 只在分隔符之后查找下一个尺寸
+        after_sep = remaining_text[next_sep_pos:]
+        next_size_match = re.search(
+            r'\d+(?:\.\d+)?\s*[xX×*]\s*\d+(?:\.\d+)?',
+            after_sep
+        )
+
+        # 如果分隔符后没有内容，或者分隔符就是末尾，则属性到分隔符结束
+        # 否则，属性包括分隔符前的所有内容
+        attributes = remaining_text[:next_sep_pos]
+        rest = remaining_text[next_sep_pos:]
+
+        # 重建文本：尺寸 + 属性 + -数量标记 + 剩余文本
+        new_text = result[:match_start] + dimension + attributes + '-' + qty_marker + rest
+        result = new_text
+
+    return result

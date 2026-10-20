@@ -27,6 +27,7 @@ class OrderItem:
     raw: dict = field(default_factory=dict)
     shop_remark: str = ""
     original_tid: str = ""
+    detail_enriched: bool = True
 
 
 @dataclass
@@ -45,6 +46,7 @@ class Order:
     receiver_province: str = ""       # 收件人省份
     receiver_address: str = ""        # 收件人完整地址
     current_cp_code: str = ""         # 当前快递编码
+    platform_name: str = ""           # 店铺所属平台
 
 
 class ErpAdapter(ABC):
@@ -76,3 +78,38 @@ class ErpAdapter(ABC):
 
     def get_adapter_name(self) -> str:
         return self.__class__.__name__
+
+    def query_all_orders(
+        self,
+        page_size: int = 500,
+        query_status: int = 1,
+        time_begin: str = "",
+        time_end: str = "",
+        max_pages: int = 10,
+        **kwargs,
+    ) -> list[Order]:
+        """自动分页查询所有订单（可选实现，默认只查询第一页）
+
+        子类可以覆盖此方法以实现真正的分页查询。
+        """
+        return self.query_orders(
+            page_no=1, page_size=page_size,
+            query_status=query_status,
+            time_begin=time_begin, time_end=time_end,
+        )
+
+
+    def is_gift_item(self, item: OrderItem) -> bool:
+        """可选赠品识别接口。"""
+        return False
+
+    def _is_gift_item(self, item: OrderItem) -> bool:
+        """兼容原审单引擎的赠品识别入口。"""
+        return self.is_gift_item(item)
+
+    def is_price_difference_item(self, item: OrderItem) -> bool:
+        return False
+
+    def push_orders(self, trade_id_list: list[str]) -> dict:
+        """可选推单接口；未支持的适配器明确返回失败。"""
+        return {"code": -1, "msg": "当前适配器不支持推单"}

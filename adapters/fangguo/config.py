@@ -89,7 +89,7 @@ MAX_ORDERS = 0       # 0=不限制
 
 def get_time_range_display() -> str:
     """返回当前时间范围的人类可读文本，供GUI显示"""
-    return f"{TIME_BEGIN[:10]} ~ {TIME_END[:10]} (最近7天)"
+    return f"{get_time_begin()[:10]} ~ {get_time_end()[:10]} (最近7天)"
 
 
 def reload_auth():
@@ -104,3 +104,19 @@ def reload_auth():
     COOKIE_STR = get_cookie_str()
     TENANT_ID = get_tenant_id()
     _TOKEN_VERSION += 1
+
+# V2.3.0：店铺快递配置与订单推送。
+API_SHOP_LIST = f"{BASE_URL}/fgapp/basic/shop-author/page"
+API_PUSH_ORDERS = f"{BASE_URL}/fgapp/order/shop/trade/batch/push"
+QUERY_STATUS_PENDING_PUSH = 2
+QUERY_STATUS_FACTORY_REVIEW = 5
+
+def get_time_begin() -> str:
+    """每轮查询动态计算最近七天，避免跨天后遗漏订单。"""
+    return (datetime.now() - timedelta(days=6)).strftime("%Y-%m-%d 00:00:00")
+
+def get_time_end() -> str:
+    return datetime.now().strftime("%Y-%m-%d 23:59:59")
+
+# 参考项目的自动推单材质限制，不影响原有审单。
+PUSH_BLOCKED_MATERIALS = {"防辣椒油", "丝圈", "泡泡绒兔毛"}
