@@ -3,28 +3,39 @@
 ==================================
 为客服人员设计，无需任何技术操作。
 特点：简洁卡片布局、日志自动着色、结构化展示。
+
+V2.3.0：沿用原审单业务，补齐赠品配置、店铺快递规则、自适应监控和订单推送。
 """
 
+from __future__ import annotations
+
 import io
+import json
 import os
+import queue
 import re
 import sys
+import time
 import threading
 import tkinter as tk
+from _version import __version__
 from tkinter import ttk, messagebox, scrolledtext
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from auth_manager import (
-    load_auth, AuthInfo,
-    auto_login, register_auth_callback,
-    unregister_auth_callback,
+    get_auth_status, load_auth, save_auth, AuthInfo,
+    TOKEN_FILE, auto_login, register_auth_callback,
+    unregister_auth_callback, is_logged_in,
 )
 from adapters.fangguo.config import (
     DRY_RUN, MAX_ORDERS, PAGE_SIZE, QUERY_STATUS,
-    get_time_range_display, reload_auth,
+    get_time_range_display,
 )
+from express_manager import get_manager as get_express_manager
+from gift_manager import get_manager as get_gift_manager
+from core.adaptive_poller import AdaptivePoller
 
 
 # ================================================================
@@ -47,167 +58,65 @@ COLORS = {
     "danger_bg":   "#fee2e2",     # 浅红背景
     "info":        "#2563eb",     # 蓝色
     "info_bg":     "#dbeafe",     # 浅蓝背景
+    "header_bg":   "#1e293b",     # 深色标题栏
+    "header_bg2":  "#334155",     # 标题栏渐变
+    "log_bg":      "#1e1e2e",     # 深色日志背景
+    "purple":      "#7c3aed",     # 紫色
 }
 
 FONT = "Microsoft YaHei"
 FONT_MONO = "Consolas"
 
-# ================================================================
-#  自适应监控间隔配置（智能版）
-# ================================================================
-MONITOR_MIN_INTERVAL = 15     # 有订单时：15秒后再次检查（避免过于频繁）
-MONITOR_MAX_INTERVAL = 180    # 无订单时：最长180秒（3分钟）
-MONITOR_INIT_INTERVAL = 30    # 初始间隔：30秒
-MONITOR_STEP_FACTOR = 1.5     # 无订单时间隔放大倍数
 
-MONITOR_DETECT_DELAY_MIN = 10  # 检测到订单后最短延迟时间（秒）- 给客服完善备注
-MONITOR_DETECT_DELAY_MAX = 60  # 检测到订单后最长延迟时间（秒）
-MONITOR_DETECT_DELAY_BASE = 30 # 基础延迟时间（秒）- 默认等待30秒让客服完善备注
-
-MONITOR_API_COOLDOWN = 5      # API调用冷却时间（秒）- 防止过于频繁调用方果API
+def _get_condensed_time_range() -> str:
+    """返回精简时间范围，如 '10-06 ~ 10-13'"""
+    full = get_time_range_display()
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})\s*~\s*(\d{4})-(\d{2})-(\d{2})", full)
+    if m:
+        return f"{m.group(2)}-{m.group(3)} ~ {m.group(5)}-{m.group(6)}"
+    return full
 
 
-class LoginDialog:
-    """登录对话框"""
+def _get_condensed_auth_status(auth) -> tuple[str, str]:
+    """返回精简登录状态 (文本, 颜色key)"""
+    if not auth.authorization:
+        return "未登录", "danger"
+    if not auth.is_valid:
+        return "已过期", "danger"
+    days = auth.remaining_days
+    if days <= 1:
+        return f"即将过期", "warning"
+    return "已连接", "success"
 
-    def __init__(self, parent, on_success=None):
-        """
-        Args:
-            parent: 父窗口
-            on_success: 登录成功回调，签名 on_success(auth: AuthInfo)
-        """
-        self.parent = parent
-        self.on_success = on_success
-        self.result = None
 
-        self.dialog = tk.Toplevel(parent)
-        self.dialog.title("登录方果ERP")
-        self.dialog.geometry("400x320")
-        self.dialog.resizable(False, False)
-        self.dialog.configure(bg=COLORS["card_bg"])
-        self.dialog.transient(parent)
-        self.dialog.grab_set()
-
-        self._center()
-        self._build_ui()
-
-    def _center(self):
-        self.dialog.update_idletasks()
-        pw = self.parent.winfo_width()
-        ph = self.parent.winfo_height()
-        px = self.parent.winfo_x()
-        py = self.parent.winfo_y()
-        w, h = 400, 320
+def _center_toplevel(widget: tk.Toplevel | tk.Tk, parent: tk.Misc | None,
+                     w: int, h: int, on_screen: bool = False):
+    """居中显示顶层窗口。on_screen=True 时相对屏幕居中，否则相对 parent 居中。"""
+    widget.update_idletasks()
+    if on_screen or parent is None:
+        sw = widget.winfo_screenwidth()
+        sh = widget.winfo_screenheight()
+        x, y = (sw - w) // 2, (sh - h) // 2
+    else:
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        px, py = parent.winfo_x(), parent.winfo_y()
         x = px + (pw - w) // 2
         y = py + (ph - h) // 2
-        self.dialog.geometry(f"{w}x{h}+{x}+{y}")
+    widget.geometry(f"{w}x{h}+{x}+{y}")
 
-    def _build_ui(self):
-        container = tk.Frame(self.dialog, bg=COLORS["card_bg"], padx=30, pady=20)
-        container.pack(fill=tk.BOTH, expand=True)
 
-        tk.Label(
-            container, text="🔐 登录方果ERP",
-            font=(FONT, 16, "bold"),
-            bg=COLORS["card_bg"], fg=COLORS["header_fg"],
-        ).pack(anchor="w", pady=(0, 20))
-
-        tk.Label(
-            container, text="手机号",
-            font=(FONT, 10), bg=COLORS["card_bg"], fg=COLORS["label_fg"],
-        ).pack(anchor="w")
-        self.username_var = tk.StringVar()
-        tk.Entry(
-            container, textvariable=self.username_var,
-            font=(FONT, 12), bg="#f9fafb",
-            relief=tk.SOLID, bd=1,
-        ).pack(fill=tk.X, pady=(4, 14), ipady=4)
-
-        tk.Label(
-            container, text="密码",
-            font=(FONT, 10), bg=COLORS["card_bg"], fg=COLORS["label_fg"],
-        ).pack(anchor="w")
-        self.password_var = tk.StringVar()
-        password_entry = tk.Entry(
-            container, textvariable=self.password_var,
-            font=(FONT, 12), bg="#f9fafb",
-            show="*", relief=tk.SOLID, bd=1,
-        )
-        password_entry.pack(fill=tk.X, pady=(4, 20), ipady=4)
-        password_entry.bind("<Return>", lambda e: self._do_login())
-
-        self.status_label = tk.Label(
-            container, text="",
-            font=(FONT, 10), bg=COLORS["card_bg"], fg=COLORS["danger"],
-        )
-        self.status_label.pack(anchor="w")
-
-        btn_frame = tk.Frame(container, bg=COLORS["card_bg"])
-        btn_frame.pack(fill=tk.X)
-
-        self.login_btn = tk.Button(
-            btn_frame, text="登 录", font=(FONT, 12, "bold"),
-            bg=COLORS["accent"], fg="#ffffff",
-            padx=24, pady=8, relief=tk.FLAT, bd=0,
-            cursor="hand2", command=self._do_login,
-        )
-        self.login_btn.pack(side=tk.RIGHT)
-
-        tk.Button(
-            btn_frame, text="取消", font=(FONT, 12),
-            bg=COLORS["card_bg"], fg=COLORS["label_fg"],
-            padx=16, pady=8, relief=tk.FLAT, bd=0,
-            cursor="hand2", command=self.dialog.destroy,
-        ).pack(side=tk.RIGHT, padx=(0, 10))
-
-    def _do_login(self):
-        username = self.username_var.get().strip()
-        password = self.password_var.get()
-
-        if not username:
-            self.status_label.config(text="请输入手机号")
-            return
-        if not password:
-            self.status_label.config(text="请输入密码")
-            return
-
-        self.login_btn.config(state=tk.DISABLED, text="登录中...", bg="#9ca3af")
-        self.status_label.config(text="正在登录...", fg=COLORS["info"])
-        self.dialog.update()
-
-        def _do():
-            try:
-                result = auto_login(username, password)
-                self.dialog.after(0, self._login_callback, result)
-            except Exception as e:
-                self.dialog.after(0, self._error_callback, str(e))
-
-        threading.Thread(target=_do, daemon=True).start()
-
-    def _login_callback(self, result):
-        self.login_btn.config(state=tk.NORMAL, text="登 录", bg=COLORS["accent"])
-        self.password_var.set("")
-
-        if result.success:
-            self.status_label.config(
-                text=f"✅ {result.msg}（{result.main_username}）",
-                fg=COLORS["success"],
-            )
-            self.dialog.update()
-            self.dialog.after(800, self._close_success)
-        else:
-            self.status_label.config(text=f"❌ {result.msg}", fg=COLORS["danger"])
-
-    def _error_callback(self, error_msg):
-        self.login_btn.config(state=tk.NORMAL, text="登 录", bg=COLORS["accent"])
-        self.password_var.set("")
-        self.status_label.config(text=f"❌ 登录异常: {error_msg}", fg=COLORS["danger"])
-
-    def _close_success(self):
-        auth = load_auth()
-        self.dialog.destroy()
-        if self.on_success:
-            self.on_success(auth)
+def _build_treeview(parent: tk.Widget, columns: tuple[str, ...],
+                    headings: dict[str, str], widths: dict[str, int],
+                    height: int = 10, pack_side: str = tk.LEFT,
+                    pack_fill: str = tk.BOTH, pack_expand: bool = True
+                    ) -> ttk.Treeview:
+    """创建并配置 Treeview，返回实例。headings 和 widths 按列名映射。"""
+    tree = ttk.Treeview(parent, columns=columns, show="headings", height=height)
+    for col in columns:
+        tree.heading(col, text=headings.get(col, col))
+        tree.column(col, width=widths.get(col, 100), anchor="w")
+    tree.pack(side=pack_side, fill=pack_fill, expand=pack_expand)
+    return tree
 
 
 class TextRedirector(io.StringIO):
@@ -228,15 +137,23 @@ class TextRedirector(io.StringIO):
         (re.compile(r"^.*🔐.*$"),   "tag_info"),
         (re.compile(r"^.*📅.*$"),   "tag_info"),
         (re.compile(r"^.*⚙️.*$"),  "tag_info"),
+        (re.compile(r"^.*👁.*$"),   "tag_info"),
+        (re.compile(r"^.*🔄.*$"),   "tag_info"),
+        (re.compile(r"^.*💤.*$"),   "tag_info"),
+        (re.compile(r"^.*🔍.*$"),   "tag_info"),
+        (re.compile(r"^.*⏹.*$"),   "tag_warning"),
+        (re.compile(r"^.*💬.*$"),   "tag_info"),
         (re.compile(r"^=+$"),       "tag_separator"),
         (re.compile(r"^─+$"),       "tag_separator"),
         (re.compile(r"^\[.*\].*$"), "tag_order"),
         (re.compile(r"^\s+│.*$"),   "tag_detail"),
     ]
 
-    def __init__(self, text_widget):
+    def __init__(self, text_widget, log_queue=None):
         super().__init__()
         self.text_widget = text_widget
+        # 线程安全的日志队列：若提供则优先投递到队列，由主线程消费
+        self._log_queue = log_queue
 
     def write(self, string):
         if not string:
@@ -248,72 +165,142 @@ class TextRedirector(io.StringIO):
                 tag = t
                 break
 
+        # 如果提供了线程安全队列（子线程场景），投递后由主线程消费
+        if self._log_queue is not None:
+            self._log_queue.put((string, tag))
+            return
+
+        # 主线程场景：直接操作 widget
         self.text_widget.insert(tk.END, string, tag)
         self.text_widget.see(tk.END)
-        self.text_widget.update_idletasks()
 
     def flush(self):
         pass
 
 
+# ── 从 gui_dialogs 导入提取的对话框和组件 ─────────────────────
+from gui_dialogs import LoginDialog, ExpressConfigDialog, GiftConfigDialog, _RoundedButton
+
+
 class AutoAuditGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("方果ERP · 自动审单工具V2.2")
-        self.root.geometry("950x720")
+        self.root.title(f"方果ERP · 自动审单工具 V{__version__}")
+        self.root.geometry("1050x720")
         self.root.resizable(True, True)
         self.root.configure(bg=COLORS["bg"])
         self._running = False
-        self._running_lock = threading.Lock()
+        # 批量确认决策缓存：None=未决定，True=全部确定，False=全部取消
         self._batch_confirm_decision = None
 
-        # 自动监控相关状态
-        self._auto_monitor = False              # 监控开关
-        self._monitor_thread = None             # 监控线程
-        self._monitor_stop_event = threading.Event()  # 停止信号
+        # 自动监控模式
+        self._monitor_skip_cache = {}
+        self._monitoring = False          # 是否正在监控
+        self._monitor_paused = False      # 监控是否暂停
+        self._monitor_thread = None       # 监控线程引用
+        self._monitor_poll_interval = 60  # 基础轮询间隔（秒）
+        self._monitor_audit_count = 0     # 监控期间累计审单轮次
+        self._monitor_push_count = 0      # 监控期间累计推单轮次（仅推单，无审单）
 
-        # Token自动检查相关状态
-        self._token_check_running = False       # Token检查是否在运行
-        self._token_check_stop_event = threading.Event()  # Token检查停止信号
-        self._login_dialog_showing = False      # 登录对话框是否正在显示（防止重复弹出）
+        # 运行时间计时器
+        self._running_start_time = None   # 当前计时段的单调时钟起点
+        self._running_timer_job = None    # after 定时器 job ID
+        self._running_elapsed = 0.0       # 累计已运行秒数（暂停时保留小数）
+        self._adaptive_poller = AdaptivePoller(
+            base_interval=60.0,
+            min_interval=15.0,
+            max_interval=180.0,
+            new_order_wait=30.0,
+            stable_extend_factor=1.5,
+            max_stable_wait=300.0,
+        )
+
+
+        # 线程安全的日志队列：子线程的 print 通过 TextRedirector 投递到此处，
+        # 主线程通过 after 定时消费，避免跨线程操作 Tkinter widget。
+        self._log_queue = queue.Queue()
+        # 鉴权通知独立排队，避免清空日志时丢失状态刷新。
+        self._auth_queue = queue.Queue()
+        self._log_drain_job = None
 
         self._center_window()
-        self._configure_tags()
         self._build_layout()
         self._refresh_status()
 
+        # 启动日志队列消费定时器
+        self._start_log_drain()
+
+        # 注册鉴权变化回调
         register_auth_callback(self._on_auth_changed)
+
+        # Token 过期自动检测
+        self._token_check_job = None  # 定时检查的 after job ID
+        self._token_check_interval = 60 * 1000  # 检查间隔（毫秒），默认1分钟
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # 启动时检查是否有Token，没有则提示登录
         self.root.after(500, self._check_login_on_startup)
+        # 启动Token过期自动检测
         self.root.after(1000, self._start_token_check)
 
     # ------------------------------------------------------------
     #  窗口
     # ------------------------------------------------------------
     def _center_window(self):
-        self.root.update_idletasks()
-        w, h = 950, 720
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        self.root.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+        _center_toplevel(self.root, None, 1050, 720, on_screen=True)
 
     # ------------------------------------------------------------
     #  日志文本颜色配置
     # ------------------------------------------------------------
     def _configure_tags(self):
-        # 这些标签在文本控件创建前就需要？不，在Text创建后配置
-        pass
+        self._setup_text_tags(self.log_text)
+
+    # ------------------------------------------------------------
+    #  日志队列消费（主线程定时刷新）
+    # ------------------------------------------------------------
+    def _start_log_drain(self):
+        """启动主线程定时消费日志队列。"""
+        self._drain_log_queue()
+
+    def _drain_log_queue(self):
+        """主线程消费鉴权通知并把日志写入文本框，共用原有定时器。"""
+        try:
+            while True:
+                self._auth_queue.get_nowait()
+                try:
+                    self._refresh_status()
+                except tk.TclError:
+                    return
+                except Exception as e:
+                    print(f"⚠️ 登录状态刷新异常: {e}")
+        except queue.Empty:
+            pass
+        try:
+            while True:
+                string, tag = self._log_queue.get_nowait()
+                try:
+                    self.log_text.insert(tk.END, string, tag)
+                    self.log_text.see(tk.END)
+                except tk.TclError:
+                    # widget 已销毁
+                    return
+        except queue.Empty:
+            pass
+        # 100ms 后再次刷新
+        try:
+            self._log_drain_job = self.root.after(100, self._drain_log_queue)
+        except tk.TclError:
+            pass
 
     def _setup_text_tags(self, text):
-        text.tag_config("tag_success", foreground=COLORS["success"])
-        text.tag_config("tag_danger",  foreground=COLORS["danger"])
-        text.tag_config("tag_warning", foreground=COLORS["warning"])
-        text.tag_config("tag_info",    foreground=COLORS["info"])
-        text.tag_config("tag_separator", foreground="#9ca3af", font=(FONT_MONO, 8))
-        text.tag_config("tag_order",   foreground=COLORS["header_fg"], font=(FONT, 10, "bold"))
-        text.tag_config("tag_detail",  foreground="#6b7280")
+        text.tag_config("tag_success", foreground="#34d399")
+        text.tag_config("tag_danger",  foreground="#f87171")
+        text.tag_config("tag_warning", foreground="#fbbf24")
+        text.tag_config("tag_info",    foreground="#60a5fa")
+        text.tag_config("tag_separator", foreground="#6b7280", font=(FONT_MONO, 8))
+        text.tag_config("tag_order",   foreground="#f1f5f9", font=(FONT, 10, "bold"))
+        text.tag_config("tag_detail",  foreground="#94a3b8")
 
     # ------------------------------------------------------------
     #  布局
@@ -333,26 +320,26 @@ class AutoAuditGUI:
     #  顶部标题
     # ------------------------------------------------------------
     def _build_header(self, parent):
-        header = tk.Frame(parent, bg=COLORS["bg"])
+        header = tk.Frame(parent, bg=COLORS["header_bg"], height=52)
         header.pack(fill=tk.X, pady=(0, 16))
+        header.pack_propagate(False)
 
         title = tk.Label(
-            header, text="📋 方果ERP · 自动审单工具",
-            font=(FONT, 20, "bold"), bg=COLORS["bg"],
-            fg=COLORS["header_fg"],
+            header, text="方果ERP · 自动审单工具",
+            font=(FONT, 18, "bold"), bg=COLORS["header_bg"],
+            fg="#ffffff",
         )
-        title.pack(side=tk.LEFT)
+        title.pack(side=tk.LEFT, padx=18)
 
-        badge_frame = tk.Frame(header, bg=COLORS["bg"])
-        badge_frame.pack(side=tk.RIGHT)
+        badge_frame = tk.Frame(header, bg=COLORS["header_bg"])
+        badge_frame.pack(side=tk.RIGHT, padx=14)
 
-        # 模式标签
-        mode_text = "🔶 模拟模式" if DRY_RUN else "✅ 正式模式"
-        mode_bg = COLORS["warning_bg"] if DRY_RUN else COLORS["success_bg"]
-        mode_fg = COLORS["warning"] if DRY_RUN else COLORS["success"]
-        self._make_badge(badge_frame, mode_text, mode_bg, mode_fg).pack(side=tk.RIGHT, padx=(6, 0))
+        self.auth_btn = _RoundedButton(
+            badge_frame, "登 录", COLORS["header_bg2"], "#ffffff",
+            self._on_auth_button_click, 10, radius=6, padx=14, pady=4,
+        )
 
-        self._make_badge(badge_frame, "V2.2", COLORS["info_bg"], COLORS["info"]).pack(side=tk.RIGHT)
+        self._make_badge(badge_frame, f"V{__version__}", COLORS["accent"], "#ffffff").pack(side=tk.RIGHT)
 
     def _make_badge(self, parent, text, bg, fg):
         return tk.Label(
@@ -369,13 +356,13 @@ class AutoAuditGUI:
 
         # 三张卡片并排
         self._card_token = self._make_status_card(
-            frame, "🔐 登录状态", "检查中...", 0
+            frame, "登录状态", "未登录", 0
         )
         self._card_time = self._make_status_card(
-            frame, "📅 审单范围", get_time_range_display(), 1
+            frame, "审单范围", _get_condensed_time_range(), 1
         )
         self._card_mode = self._make_status_card(
-            frame, "⚙️ 运行模式",
+            frame, "运行模式",
             "仅模拟（不真实提交）" if DRY_RUN else "正式模式（会实际修改）",
             2
         )
@@ -384,22 +371,40 @@ class AutoAuditGUI:
         card = tk.Frame(
             parent, bg=COLORS["card_bg"],
             highlightbackground=COLORS["card_border"],
-            highlightthickness=1, padx=16, pady=12,
+            highlightthickness=1, padx=16, pady=14,
         )
         card.grid(row=0, column=col, sticky="ew", padx=(0, 10))
         parent.grid_columnconfigure(col, weight=1)
 
+        inner = tk.Frame(card, bg=COLORS["card_bg"])
+        inner.pack(fill=tk.X)
+
+        icon_colors = {0: COLORS["accent"], 1: COLORS["purple"], 2: "#0d9488"}
+        icon_bg = {0: COLORS["accent_light"], 1: "#ede9fe", 2: "#ccfbf1"}
+        icons = {0: "\u2714", 1: "\U0001f4c5", 2: "\u2699"}
+        ic = icon_colors[col]
+        ib = icon_bg[col]
+
+        icon_label = tk.Label(
+            inner, text=icons[col], font=(FONT, 14),
+            bg=ib, fg=ic, padx=8, pady=6,
+        )
+        icon_label.pack(side=tk.LEFT, padx=(0, 12))
+
+        text_frame = tk.Frame(inner, bg=COLORS["card_bg"])
+        text_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
         tk.Label(
-            card, text=title, font=(FONT, 9),
+            text_frame, text=title, font=(FONT, 9),
             bg=COLORS["card_bg"], fg=COLORS["label_fg"],
         ).pack(anchor="w")
 
         value_label = tk.Label(
-            card, text=value, font=(FONT, 11, "bold"),
+            text_frame, text=value, font=(FONT, 12, "bold"),
             bg=COLORS["card_bg"], fg=COLORS["header_fg"],
             anchor="w", wraplength=220,
         )
-        value_label.pack(anchor="w", pady=(4, 0))
+        value_label.pack(anchor="w", pady=(2, 0))
 
         return value_label
 
@@ -415,9 +420,16 @@ class AutoAuditGUI:
         title_row.pack(fill=tk.X, pady=(0, 6))
 
         tk.Label(
-            title_row, text="📝 运行日志", font=(FONT, 12, "bold"),
+            title_row, text="运行日志", font=(FONT, 12, "bold"),
             bg=COLORS["bg"], fg=COLORS["header_fg"],
         ).pack(side=tk.LEFT)
+
+        # 运行时间标签（右侧）
+        self.running_time_label = tk.Label(
+            title_row, text="",
+            font=(FONT, 10), bg=COLORS["bg"], fg=COLORS["label_fg"],
+        )
+        self.running_time_label.pack(side=tk.RIGHT, padx=(0, 4))
 
         # 统计信息
         self.stat_label = tk.Label(
@@ -426,10 +438,10 @@ class AutoAuditGUI:
         )
         self.stat_label.pack(side=tk.RIGHT)
 
-        # 日志卡片
+        # 日志卡片（深色背景）
         log_card = tk.Frame(
-            log_outer, bg=COLORS["card_bg"],
-            highlightbackground=COLORS["card_border"],
+            log_outer, bg=COLORS["log_bg"],
+            highlightbackground="#374151",
             highlightthickness=1,
         )
         log_card.pack(fill=tk.BOTH, expand=True)
@@ -438,9 +450,9 @@ class AutoAuditGUI:
             log_card,
             wrap=tk.WORD,
             font=(FONT_MONO, 10),
-            bg="#fafafa",
-            fg=COLORS["text_fg"],
-            insertbackground=COLORS["text_fg"],
+            bg=COLORS["log_bg"],
+            fg="#e2e8f0",
+            insertbackground="#e2e8f0",
             relief=tk.FLAT,
             borderwidth=0,
             padx=14, pady=10,
@@ -450,14 +462,15 @@ class AutoAuditGUI:
         self.log_text.pack(fill=tk.BOTH, expand=True)
         self._setup_text_tags(self.log_text)
 
-        # 重定向 print
-        self.text_redirector = TextRedirector(self.log_text)
+        # 重定向 print：传入日志队列，子线程的 print 通过队列由主线程消费
+        self.text_redirector = TextRedirector(self.log_text, self._log_queue)
         sys.stdout = self.text_redirector
 
         # 初始信息
         print(f"🟢 自动审单工具已启动 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("📌 点击下方「登录」按钮，输入手机号密码即可开始使用")
-        print("📌 点击「开始审单」自动处理待整理订单\n")
+        print("📌 点击「开始审单」手动处理一批待整理订单")
+        print("📌 点击「自动监控」开启全自动模式，无需手动操作\n")
 
     # ------------------------------------------------------------
     #  底部按钮
@@ -470,44 +483,39 @@ class AutoAuditGUI:
         btn_group = tk.Frame(footer, bg=COLORS["bg"])
         btn_group.pack(side=tk.LEFT)
 
+        # 主要操作：实心按钮
         self.start_btn = self._make_button(
-            btn_group, "▶ 开始审单", COLORS["success"], "#ffffff",
-            self._start_audit, 12,
+            btn_group, "开始审单", COLORS["success"], "#ffffff",
+            self._start_audit, 11,
         )
-        self.start_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.push_btn = self._make_button(
+            btn_group, "开始推单", COLORS["info"], "#ffffff",
+            self._start_push, 11,
+        )
 
         self.monitor_btn = self._make_button(
-            btn_group, "🔄 自动监控", COLORS["warning"], "#ffffff",
+            btn_group, "自动监控", COLORS["purple"], "#ffffff",
             self._toggle_monitor, 11,
         )
-        self.monitor_btn.pack(side=tk.LEFT, padx=(0, 8))
 
-        self._make_button(
-            btn_group, "🔄 刷新", COLORS["info"], "#ffffff",
+        # 次要操作：描边按钮
+        self._make_outlined_button(
+            btn_group, "刷新", COLORS["accent"], COLORS["accent_light"],
             self._refresh_status, 10,
-        ).pack(side=tk.LEFT, padx=(0, 8))
-
-        self.login_btn_footer = self._make_button(
-            btn_group, "🔐 登录", COLORS["accent"], "#ffffff",
-            self._open_login, 10,
         )
-        self.login_btn_footer.pack(side=tk.LEFT, padx=(0, 8))
-
-        self.logout_btn_footer = self._make_button(
-            btn_group, "🚪 退出登录", COLORS["danger"], "#ffffff",
-            self._logout, 10,
-        )
-        self.logout_btn_footer.pack(side=tk.LEFT, padx=(0, 8))
-
-        self._make_button(
-            btn_group, "🗑 清空日志", "#6b7280", "#ffffff",
+        self._make_outlined_button(
+            btn_group, "清空日志", "#6b7280", "#f3f4f6",
             self._clear_log, 10,
-        ).pack(side=tk.LEFT, padx=(0, 8))
-
-        self._make_button(
-            btn_group, "🚚 快递配置", COLORS["warning"], "#ffffff",
+        )
+        self._make_outlined_button(
+            btn_group, "快递配置", COLORS["warning"], COLORS["warning_bg"],
             self._open_express_config, 10,
-        ).pack(side=tk.LEFT)
+        )
+        self._make_outlined_button(
+            btn_group, "赠品配置", COLORS["success"], COLORS["success_bg"],
+            self._open_gift_config, 10,
+        )
 
         # 右侧进度条
         right = tk.Frame(footer, bg=COLORS["bg"])
@@ -517,13 +525,13 @@ class AutoAuditGUI:
         self.progress.pack(side=tk.RIGHT)
 
     def _make_button(self, parent, text, bg, fg, cmd, font_size):
-        return tk.Button(
-            parent, text=text, font=(FONT, font_size, "bold"),
-            bg=bg, fg=fg, padx=18, pady=7,
-            relief=tk.FLAT, bd=0, cursor="hand2",
-            activebackground=bg, activeforeground=fg,
-            command=cmd,
-        )
+        """实心圆角按钮"""
+        return _RoundedButton(parent, text, bg, fg, cmd, font_size, radius=8)
+
+    def _make_outlined_button(self, parent, text, color, bg_color, cmd, font_size):
+        """描边圆角按钮"""
+        return _RoundedButton(parent, text, color, bg_color, cmd, font_size,
+                              radius=6, outline=color, outline_width=1)
 
     # ------------------------------------------------------------
     #  登录相关
@@ -532,191 +540,169 @@ class AutoAuditGUI:
         """启动时检查登录状态"""
         auth = load_auth()
         if not auth.authorization:
-            print("🔐 检测到未登录，请点击「登录」按钮输入账号密码")
+            print("检测到未登录，请点击右上角「登录」按钮输入账号密码")
         elif not auth.is_valid:
-            print(f"⚠️ Token已过期（{auth.expires_at}），请重新登录")
+            print(f"Token已过期（{auth.expires_at}），请重新登录")
         else:
-            print(f"✅ Token有效（{auth.username or ''}，剩余{auth.remaining_days}天）")
-            # 登录状态正常，弹窗询问是否开启自动监控
-            self.root.after(800, self._ask_start_monitor)
-
-    def _ask_start_monitor(self):
-        """启动时弹窗询问是否开启自动监控"""
-        if self._auto_monitor:
-            return  # 已经在监控中
-        ret = messagebox.askyesno(
-            "自动审单",
-            "✅ 登录状态正常！\n\n"
-            "是否立即开启自动审单监控？\n\n"
-            "📌 开启后程序将自动检测待处理订单并执行审单\n"
-            "📌 自适应间隔：有订单时快查，无订单时自动拉长间隔\n"
-            "📌 可随时点击「停止监控」按钮关闭"
-        )
-        if ret:
-            self._start_monitor()
+            print(f"Token有效（{auth.username or ''}，剩余{auth.remaining_days}天）")
 
     def _open_login(self):
         """打开登录对话框"""
-        if self._login_dialog_showing:
-            return
         LoginDialog(self.root, on_success=self._on_login_success)
-
-    def _show_auto_relogin_dialog(self, reason: str = "Token已过期"):
-        """Token过期时自动弹出登录对话框
-
-        Args:
-            reason: 弹出登录框的原因描述
-        """
-        if self._login_dialog_showing:
-            return
-
-        self._login_dialog_showing = True
-        print(f"\n⚠️ {reason}，请重新登录")
-
-        def _on_success(auth: AuthInfo):
-            self._login_dialog_showing = False
-            self._on_login_success(auth)
-
-        def _on_close():
-            self._login_dialog_showing = False
-
-        dialog = LoginDialog(self.root, on_success=_on_success)
-
-        # 监听对话框关闭事件
-        original_destroy = dialog.dialog.destroy
-
-        def _wrapped_destroy():
-            self._login_dialog_showing = False
-            original_destroy()
-
-        dialog.dialog.destroy = _wrapped_destroy
 
     def _on_login_success(self, auth: AuthInfo):
         """登录成功后回调"""
-        try:
-            reload_auth()
-        except Exception:
-            pass
-
+        # 刷新状态卡片
         self._refresh_status()
+        # 日志
         print(f"✅ 登录成功！欢迎 {auth.username or ''}")
         print(f"🔐 Token有效期至 {auth.expires_at}（剩余{auth.remaining_days}天）")
         print("💡 现在可以开始审单了")
+        # 启用开始按钮
         if not self._running:
             self.start_btn.config(state=tk.NORMAL, bg=COLORS["success"])
 
-        # 登录成功后询问是否开启自动监控
-        if not self._auto_monitor:
-            self.root.after(500, self._ask_start_monitor)
-
     def _on_auth_changed(self, auth: AuthInfo):
-        """鉴权信息变化回调（来自auth_manager的通知）"""
-        self._refresh_status()
+        """接收鉴权变化通知；后台线程只入队，不调用任何 Tk 方法。"""
+        self._auth_queue.put(auth)
 
     # ------------------------------------------------------------
-    #  🔐 Token自动检查（后台周期性检测）
+    #  Token 过期自动检测
     # ------------------------------------------------------------
     def _start_token_check(self):
-        """启动Token定时检查线程"""
-        if self._token_check_running:
-            return
-        self._token_check_running = True
-        self._token_check_stop_event.clear()
-        threading.Thread(target=self._token_check_loop, daemon=True).start()
+        """启动Token过期定时检测"""
+        self._check_token_expiry()
+
+    def _check_token_expiry(self):
+        """
+        检查Token是否过期。
+        如果已过期且当前处于登录状态，则自动退出登录并提示重新登录。
+        """
+        try:
+            auth = load_auth()
+            # 如果有Token但已过期，执行自动退出
+            if auth.authorization and not auth.is_valid:
+                was_monitoring = self._monitoring
+                was_running = self._running
+
+                # 自动退出登录
+                self._logout(auto=True)
+
+                # 如果正在监控，停止监控
+                if was_monitoring:
+                    self._stop_monitor()
+
+                # 审单线程是同步阻塞的（engine.run 内部循环），无法直接中断。
+                # 若正在审单，提示用户等待当前轮次结束后再操作。
+                if was_running:
+                    print("⚠️ 检测到审单线程仍在运行，当前轮次完成后将自动停止")
+                    print("⚠️ 由于 Token 已失效，后续 API 调用可能失败，请稍后重新登录")
+                    # 禁用开始按钮，避免用户在 Token 失效期间再次发起审单
+                    try:
+                        self.start_btn.config(state=tk.DISABLED, text="Token已过期", bg="#9ca3af")
+                    except tk.TclError:
+                        pass
+
+                # 弹出提示并自动打开登录对话框
+                print("\n⚠️ " + "=" * 50)
+                print("⚠️ Token已过期，已自动退出登录")
+                print("⚠️ 请重新登录以继续使用")
+                print("⚠️ " + "=" * 50 + "\n")
+
+                # 弹出确认框，询问是否立即重新登录
+                ret = messagebox.askyesno(
+                    "Token已过期",
+                    f"⚠️ Token已过期（{auth.expires_at}），\n是否立即重新登录？"
+                )
+                if ret:
+                    self._open_login()
+        except Exception as e:
+            print(f"⚠️ Token检查异常: {e}")
+        finally:
+            # 安排下一次检查
+            self._token_check_job = self.root.after(
+                self._token_check_interval, self._check_token_expiry
+            )
 
     def _stop_token_check(self):
-        """停止Token定时检查"""
-        self._token_check_running = False
-        self._token_check_stop_event.set()
-
-    def _token_check_loop(self):
-        """Token检查线程主循环"""
-        # 首次等待2秒后开始检查
-        self._token_check_stop_event.wait(timeout=2)
-
-        while self._token_check_running:
-            if self._token_check_stop_event.is_set():
-                break
-
+        """停止Token过期检测"""
+        if self._token_check_job is not None:
             try:
-                auth = load_auth()
-
-                # 只有在有Token的情况下才检查是否过期
-                if auth.authorization:
-                    if not auth.is_valid:
-                        # Token已过期，自动弹出登录框
-                        if not self._login_dialog_showing:
-                            print(f"\n⚠️ 检测到Token已过期（{auth.expires_at}）")
-                            self.root.after(0, lambda: self._show_auto_relogin_dialog("Token已过期"))
-                    else:
-                        # Token即将过期（剩余1天），提前提醒
-                        if auth.remaining_days <= 1:
-                            print(f"⚠️ Token即将过期，剩余{auth.remaining_days}天，请及时重新登录")
-
-            except Exception as e:
-                # 检查出错不影响主流程
+                self.root.after_cancel(self._token_check_job)
+            except Exception:
                 pass
+            self._token_check_job = None
 
-            # 每60秒检查一次
-            self._token_check_stop_event.wait(timeout=60)
+    def _on_auth_button_click(self):
+        """登录/退出登录按钮点击处理（根据当前状态动态切换）"""
+        auth = load_auth()
+        if auth.authorization and auth.is_valid:
+            # 已登录且有效 → 执行退出登录
+            self._logout()
+        else:
+            # 未登录或已过期 → 打开登录对话框
+            self._open_login()
 
-        print("🔐 Token检查线程已退出")
+    def _update_auth_button(self):
+        """根据登录状态更新按钮文本和颜色"""
+        auth = load_auth()
+        if auth.authorization and auth.is_valid:
+            self.auth_btn.config(text="退出登录", bg=COLORS["danger"])
+        else:
+            self.auth_btn.config(text="登 录", bg=COLORS["header_bg2"])
 
-    def _logout(self):
-        """退出登录，清除Token"""
+    def _logout(self, auto=False):
+        """
+        退出登录，清除Token
+        Args:
+            auto: 是否为自动退出（Token过期触发），自动退出不弹确认框
+        """
         if not load_auth().authorization:
             return
-        if not messagebox.askyesno("确认退出", "确定要退出登录吗？退出后需重新登录才能使用。"):
-            return
+
+        if not auto:
+            if not messagebox.askyesno("确认退出", "确定要退出登录吗？退出后需重新登录才能使用。"):
+                return
 
         from auth_manager import reset_auth
         reset_auth()
-        try:
-            reload_auth()
-        except Exception:
-            pass
+        from adapters.fangguo.config import reload_auth
+        reload_auth()
         self._refresh_status()
-        print("🔐 已退出登录")
-        print("📌 下次使用时点击「登录」按钮重新登录")
+
+        if auto:
+            print("⚠️ Token已过期，已自动退出登录")
+            print("🔐 请重新登录以继续使用")
+        else:
+            print("🔐 已退出登录")
+            print("📌 下次使用时点击「登录」按钮重新登录")
 
     # ------------------------------------------------------------
     #  操作
     # ------------------------------------------------------------
     def _refresh_status(self):
         auth = load_auth()
-        status = auth.status_text
-        self._card_token.config(text=status)
+        status_text, color_key = _get_condensed_auth_status(auth)
+        self._card_token.config(text=status_text, fg=COLORS[color_key])
 
-        if "✅" in status:
-            self._card_token.config(fg=COLORS["success"])
-        elif "⚠️" in status:
-            self._card_token.config(fg=COLORS["warning"])
-        else:
-            self._card_token.config(fg=COLORS["danger"])
+        # 更新登录/退出登录按钮状态
+        self._update_auth_button()
 
-        self._card_time.config(text=get_time_range_display())
+        self._card_time.config(text=_get_condensed_time_range())
 
-        # 动态更新登录/退出按钮显示状态
-        self._update_login_buttons(auth)
-
-    def _update_login_buttons(self, auth: AuthInfo = None):
-        """根据登录状态动态更新登录/退出按钮的显示"""
-        if auth is None:
-            auth = load_auth()
-
-        is_logged_in = bool(auth.authorization) and auth.is_valid
-
-        if is_logged_in:
-            # 已登录：显示退出按钮，隐藏登录按钮
-            self.logout_btn_footer.pack(side=tk.LEFT, padx=(0, 8))
-            self.login_btn_footer.pack_forget()
-        else:
-            # 未登录或Token过期：显示登录按钮，隐藏退出按钮
-            self.login_btn_footer.pack(side=tk.LEFT, padx=(0, 8))
-            self.logout_btn_footer.pack_forget()
+        # 刷新运行模式卡片（DRY_RUN 为常量，但保持刷新一致性）
+        try:
+            self._card_mode.config(
+                text="仅模拟（不真实提交）" if DRY_RUN else "正式模式（会实际修改）"
+            )
+        except tk.TclError:
+            pass
 
     def _open_token_file(self):
-        path = os.path.join(os.path.dirname(__file__), "token.json")
+        # 复用 auth_manager.TOKEN_FILE：打包后 __file__ 指向 _MEIxxxxx 临时目录，
+        # 而 token.json 实际写在 exe 同级目录（_get_app_dir）。
+        from auth_manager import TOKEN_FILE
+        path = TOKEN_FILE
         if os.path.exists(path):
             try:
                 if sys.platform == "win32":
@@ -730,10 +716,73 @@ class AutoAuditGUI:
             messagebox.showerror("文件不存在", "token.json 不存在，请联系技术人员。")
 
     def _clear_log(self):
+        # 先清空队列中尚未消费的日志，避免清屏后旧日志又被刷新出来
+        try:
+            while True:
+                self._log_queue.get_nowait()
+        except queue.Empty:
+            pass
         self.log_text.delete(1.0, tk.END)
+
+    def _open_express_config(self):
+        """打开快递配置对话框"""
+        ExpressConfigDialog(self.root)
+
+    def _open_gift_config(self):
+        """打开赠品配置对话框"""
+        GiftConfigDialog(self.root)
 
     def _update_stat(self, text):
         self.stat_label.config(text=text)
+
+    # ------------------------------------------------------------
+    #  运行时间计时器
+    # ------------------------------------------------------------
+    @staticmethod
+    def _format_elapsed(seconds: int) -> str:
+        """将秒数格式化为 MM:SS"""
+        m, s = divmod(seconds, 60)
+        return f"{m:02d}:{s:02d}"
+
+    def _start_running_timer(self, reset: bool = True) -> None:
+        """新任务从零计时；监控会话内继续累计，避免重复注册刷新。"""
+        if reset:
+            self._stop_running_timer()
+            self._running_elapsed = 0.0
+        elif self._running_start_time is not None:
+            return
+        self._running_start_time = time.monotonic()
+        self._update_running_time()
+
+    def _stop_running_timer(self) -> None:
+        """冻结计时并保留最终显示，重复调用不重复累计。"""
+        if self._running_timer_job is not None:
+            try:
+                self.root.after_cancel(self._running_timer_job)
+            except tk.TclError:
+                pass
+            self._running_timer_job = None
+        if self._running_start_time is not None:
+            self._running_elapsed += time.monotonic() - self._running_start_time
+        self._running_start_time = None
+        self.running_time_label.config(
+            text=f"已运行 {self._format_elapsed(int(self._running_elapsed))}"
+        )
+
+    def _sync_running_timer(self) -> None:
+        """只同步计时显示，不改变任务或监控状态。"""
+        if self._running or (self._monitoring and not self._monitor_paused):
+            self._start_running_timer(reset=False)
+        else:
+            self._stop_running_timer()
+
+    def _update_running_time(self) -> None:
+        """刷新运行时间显示，并安排下一次更新"""
+        if self._running_start_time is None:
+            return
+        elapsed = int(time.monotonic() - self._running_start_time + self._running_elapsed)
+        self.running_time_label.config(text=f"已运行 {self._format_elapsed(elapsed)}")
+        self._running_timer_job = self.root.after(1000, self._update_running_time)
 
     # ------------------------------------------------------------
     #  🔥 确认弹窗（线程安全）
@@ -763,17 +812,16 @@ class AutoAuditGUI:
         event = threading.Event()
 
         def _show():
-            try:
-                result[0] = messagebox.askyesno("是否一键自动审单", msg)
-            except Exception:
-                result[0] = False
+            result[0] = messagebox.askyesno("是否一键自动审单", msg)
             event.set()
 
         # 调度到主线程显示
         self.root.after(0, _show)
-        if not event.wait(timeout=300):
-            print("⚠️ 确认弹窗超时（5分钟），默认跳过")
+        # 设置超时避免审计线程永久阻塞（5分钟）
+        event.wait(timeout=300)
+        if result[0] is None:
             result[0] = False
+            print("⚠️ 确认弹窗超时，默认取消修改")
 
         # 缓存本次批量决策，后续订单自动沿用
         self._batch_confirm_decision = result[0]
@@ -783,10 +831,9 @@ class AutoAuditGUI:
     #  开始审单
     # ------------------------------------------------------------
     def _start_audit(self):
-        with self._running_lock:
-            if self._running:
-                messagebox.showinfo("提示", "正在审单中，请等待完成...")
-                return
+        if self._running:
+            messagebox.showinfo("提示", "正在审单中，请等待完成...")
+            return
 
         auth = load_auth()
         if not auth.authorization:
@@ -801,11 +848,11 @@ class AutoAuditGUI:
                 self._open_login()
             return
 
-        with self._running_lock:
-            self._running = True
+        self._running = True
         self._batch_confirm_decision = None  # 重置批量确认决策
-        self.start_btn.config(state=tk.DISABLED, text="⏳ 审单中...", bg="#9ca3af")
+        self.start_btn.config(state=tk.DISABLED, text="审单中...", bg="#9ca3af")
         self.progress.start()
+        self._start_running_timer(reset=not self._monitoring)
 
         print("\n" + "━" * 60)
         print(f"🚀 开始自动审单 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -815,526 +862,490 @@ class AutoAuditGUI:
 
         threading.Thread(target=self._run_audit, daemon=True).start()
 
-    def _run_audit(self):
-        try:
-            from core import AutoAuditEngine
-            from adapters.fangguo import FangguoAdapter
-            from adapters.fangguo.config import (
-                QUERY_STATUS, PAGE_SIZE, TIME_BEGIN, TIME_END,
-                DRY_RUN, MAX_ORDERS,
-            )
-
-            adapter = FangguoAdapter()
-
-            # 只在非 DRY_RUN 模式下才传入确认回调
-            confirm_cb = self._confirm_update if not DRY_RUN else None
-
-            engine = AutoAuditEngine(
-                adapter=adapter, dry_run=DRY_RUN,
-                max_orders=MAX_ORDERS, interval=0.5,
-                confirm_callback=confirm_cb,
-            )
-            engine.run(
-                page_no=1, page_size=PAGE_SIZE,
-                query_status=QUERY_STATUS,
-                time_begin=TIME_BEGIN, time_end=TIME_END,
-            )
-        except Exception as e:
-            print(f"\n❌ 审单异常: {e}")
-            import traceback
-            print(traceback.format_exc())
-        finally:
-            self.root.after(0, self._finish_audit)
-
     def _finish_audit(self):
-        with self._running_lock:
-            self._running = False
+        self._running = False
         self._batch_confirm_decision = None  # 清理批量决策缓存
-        self.start_btn.config(state=tk.NORMAL, text="▶ 开始审单", bg=COLORS["success"])
+        self._sync_running_timer()
+        # 根据监控状态恢复按钮
+        if self._monitoring:
+            self.start_btn.config(state=tk.DISABLED, text="监控中...", bg="#9ca3af")
+        else:
+            self.start_btn.config(state=tk.NORMAL, text="开始审单", bg=COLORS["success"])
         self.progress.stop()
         print("\n" + "━" * 60)
         print("✅ 自动审单完成")
         print("━" * 60)
 
     # ------------------------------------------------------------
-    #  🔁 自动监控模式（自适应间隔轮询）
+    #  开始推单
     # ------------------------------------------------------------
-    def _toggle_monitor(self):
-        """切换自动监控开关"""
-        if self._auto_monitor:
-            self._stop_monitor()
-        else:
-            self._start_monitor()
+    def _start_push(self):
+        if self._running:
+            messagebox.showinfo("提示", "正在审单中，请等待完成...")
+            return
 
-    def _start_monitor(self):
-        """启动自动监控"""
         auth = load_auth()
         if not auth.authorization:
             messagebox.showerror("未登录", "❌ 请先点击「登录」按钮输入账号密码！")
             return
         if not auth.is_valid:
-            messagebox.showerror("Token已过期", "⚠️ Token已过期，请重新登录！")
+            ret = messagebox.askyesno(
+                "Token已过期",
+                f"⚠️ Token已过期（{auth.expires_at}），是否重新登录？"
+            )
+            if ret:
+                self._open_login()
             return
 
-        self._auto_monitor = True
-        self._monitor_stop_event.clear()
+        self._running = True
+        self.push_btn.config(state=tk.DISABLED, text="推单中...", bg="#9ca3af")
+        self.progress.start()
+        self._start_running_timer(reset=not self._monitoring)
+
+        print("\n" + "━" * 60)
+        print(f"🚀 开始自动推单 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"📅 时间范围：{get_time_range_display()}")
+        print(f"👤 当前用户：{auth.username or 'Unknown'}")
+        print("━" * 60 + "\n")
+
+        threading.Thread(target=self._run_push, daemon=True).start()
+
+    def _run_push(self):
+        try:
+            from adapters.fangguo.adapter import FangguoAdapter
+            from core.engine import AutoAuditEngine
+            from adapters.fangguo.config import (
+                PAGE_SIZE, DRY_RUN, MAX_ORDERS,
+                get_time_begin, get_time_end,
+            )
+
+            adapter = FangguoAdapter()
+            engine = AutoAuditEngine(
+                adapter=adapter,
+                dry_run=DRY_RUN,
+                max_orders=MAX_ORDERS,
+            )
+
+            engine.push_eligible_orders(
+                page_no=1, page_size=PAGE_SIZE,
+                time_begin=get_time_begin(), time_end=get_time_end(),
+            )
+        except Exception as e:
+            print(f"❌ 推单异常：{e}")
+        finally:
+            self.root.after(0, self._finish_push)
+
+    def _finish_push(self):
+        self._running = False
+        self._sync_running_timer()
+        self.push_btn.config(state=tk.NORMAL, text="开始推单", bg=COLORS["info"])
+        self.progress.stop()
+        print("\n" + "━" * 60)
+        print("✅ 自动推单完成")
+        print("━" * 60)
+
+    # ------------------------------------------------------------
+    #  自动监控模式
+    # ------------------------------------------------------------
+    def _toggle_monitor(self):
+        """三态循环切换：未监控 → 运行中 → 已暂停 → 未监控"""
+        if not self._monitoring:
+            self._start_monitor()
+        elif self._monitor_paused:
+            # 已暂停状态点击 = 彻底停止监控（回到未监控）
+            self._stop_monitor()
+        else:
+            # 运行中状态点击 = 暂停监控
+            self._pause_monitor()
+
+    def _set_monitor_btn_state(self, state):
+        """根据状态刷新 monitor_btn 的显示"""
+        # state: "idle" / "running" / "paused"
+        cfg = {
+            "idle":    ("自动监控", "#7c3aed"),
+            "running": ("暂停监控", COLORS["warning"]),
+            "paused":  ("停止监控", COLORS["danger"]),
+        }[state]
+        text, bg = cfg
+        self.monitor_btn.config(state=tk.NORMAL, text=text, bg=bg)
+
+    def _pause_monitor(self):
+        """暂停监控（不停止线程，只是暂停轮询）"""
+        if not self._monitoring or self._monitor_paused:
+            return
+        # 如果正在审单中，不允许暂停
+        if self._running:
+            messagebox.showinfo("提示", "正在审单中，审单完成后才能暂停...")
+            return
+
+        self._monitor_paused = True
+        self._sync_running_timer()
+        # 暂停时 monitor_btn 显示"停止监控"，点击即彻底停止
+        self._set_monitor_btn_state("paused")
+
+        print(f"\n⏸ 监控已暂停 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"📊 暂停前已执行审单 {self._monitor_audit_count} 轮")
+        print("💡 再次点击「停止监控」可彻底结束监控\n")
+
+    def _resume_monitor(self):
+        """继续监控"""
+        if not self._monitoring or not self._monitor_paused:
+            return
+
+        self._monitor_paused = False
+        # 恢复运行：monitor_btn 回到"暂停监控"状态
+        self._sync_running_timer()
+        self._set_monitor_btn_state("running")
+
+        print(f"\n▶ 监控已恢复 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("🔄 继续自动检测待处理订单...\n")
+
+    def _start_monitor(self):
+        """开启自动监控模式"""
+        monitor_thread = getattr(self, "_monitor_thread", None)
+        if monitor_thread is not None and monitor_thread.is_alive():
+            messagebox.showinfo("提示", "上一轮监控正在退出，请稍后再试。")
+            return
+        if self._running:
+            messagebox.showinfo("提示", "正在审单中，请等待完成后再开启监控...")
+            return
+
+        auth = load_auth()
+        if not auth.authorization:
+            messagebox.showerror("未登录", "请先点击「登录」按钮输入账号密码！")
+            return
+        if not auth.is_valid:
+            ret = messagebox.askyesno(
+                "Token已过期",
+                f"Token已过期（{auth.expires_at}），是否重新登录？"
+            )
+            if ret:
+                self._open_login()
+            return
+
+        if not messagebox.askyesno(
+            "开启自动监控",
+            "开启后将自动检测待处理订单并执行审单，\n"
+            "审单过程无需手动确认，全自动处理。\n\n"
+            "自适应轮询策略：\n"
+            f"  • 基础间隔: {self._monitor_poll_interval}秒\n"
+            f"  • 新订单等待: {int(self._adaptive_poller.new_order_wait)}秒（备注完善）\n"
+            f"  • 最短间隔: {int(self._adaptive_poller.min_interval)}秒\n\n"
+            "是否开启自动监控？"
+        ):
+            return
+
+        self._monitoring = True
+        self._monitor_paused = False
+        self._monitor_audit_count = 0
+        self._monitor_push_count = 0
+        self._monitor_skip_cache = {}
+
+        # 更新按钮状态
+        # monitor_btn 三态：未监控 → 运行中 → 已暂停 → 未监控
+        self._set_monitor_btn_state("running")
+        self.start_btn.config(state=tk.DISABLED, text="监控中...", bg="#9ca3af")
+        self.progress.start()
+        self._start_running_timer()
+
+        print("\n" + "━" * 60)
+        print(f"👁 自动监控模式已开启 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"🔄 自适应轮询策略: 基础{self._monitor_poll_interval}秒 / 新订单等待{int(self._adaptive_poller.new_order_wait)}秒 / 最短{int(self._adaptive_poller.min_interval)}秒")
+        print(f"👤 当前用户: {auth.username or 'Unknown'}")
+        print(f"📅 时间范围: {get_time_range_display()}")
+        print("💬 监控模式下审单无需确认，全自动处理")
+        print("━" * 60 + "\n")
+
+        # 启动监控线程
         self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._monitor_thread.start()
 
-        self.monitor_btn.config(text="⏸ 停止监控", bg=COLORS["danger"])
-        print("\n" + "━" * 60)
-        print(f"🔄 智能自动监控已启动 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"📌 自适应间隔：有订单时 {MONITOR_MIN_INTERVAL}秒，无订单时逐步拉长至 {MONITOR_MAX_INTERVAL}秒")
-        print(f"⏳ 智能延迟：检测到订单后等待 {MONITOR_DETECT_DELAY_BASE}~{MONITOR_DETECT_DELAY_MAX}秒让客服完善备注")
-        print(f"❄️ API冷却：每次调用间隔至少 {MONITOR_API_COOLDOWN}秒，防止方果服务器崩溃")
-        print("━" * 60)
-
     def _stop_monitor(self):
         """停止自动监控"""
-        self._auto_monitor = False
-        self._monitor_stop_event.set()
-        self.monitor_btn.config(text="🔄 自动监控", bg=COLORS["warning"])
-        print("\n🛑 自动监控已停止")
+        self._monitoring = False
+        self._monitor_paused = False
+        # 不在主线程中 join，避免 GUI 冻结
+        # 监控线程会通过 should_stop 回调检测 _monitoring 标志并自行退出
+        # 保留线程引用，上一轮查询退出前禁止再次启动监控。
+
+        # monitor_btn 回到未监控态
+        self._set_monitor_btn_state("idle")
+        self._sync_running_timer()
+        if not self._running:
+            self.start_btn.config(state=tk.NORMAL, text="开始审单", bg=COLORS["success"])
+        self.progress.stop()
+
+        print("\n" + "━" * 60)
+        print(f"⏹ 自动监控已停止 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"📊 监控期间共执行审单 {self._monitor_audit_count} 轮")
+        print("━" * 60 + "\n")
 
     def _monitor_loop(self):
-        """监控线程主循环：智能自适应间隔轮询待处理订单
+        """监控主循环：自适应轮询待处理订单，智能判断处理时机"""
+        self._adaptive_poller.reset()
         
-        核心改进：
-        1. 检测到订单后不立即处理，等待一段时间让客服完善备注
-        2. 等待期间如果有新订单加入，重新计时（避免过早处理）
-        3. 实现API调用冷却时间，防止过于频繁调用方果API
-        4. 根据订单数量动态调整延迟时间
-        """
-        interval = MONITOR_INIT_INTERVAL
-        skip_cache = {}
-        
-        # 状态追踪
-        pending_orders = set()
-        last_detect_time = 0
-        last_api_call_time = 0
-        waiting_for_process = False
+        while self._monitoring:
+            while self._monitor_paused and self._monitoring:
+                time.sleep(1)
 
-        while self._auto_monitor:
-            if self._monitor_stop_event.is_set():
+            if not self._monitoring:
                 break
 
-            auth = load_auth()
-            if not auth.authorization or not auth.is_valid:
-                print("⚠️ Token已失效，自动监控已暂停，请重新登录")
-                self.root.after(0, lambda: self._show_auto_relogin_dialog("Token已过期"))
-                self.root.after(0, self._stop_monitor)
-                return
+            try:
+                auth = load_auth()
+                if not auth.is_valid:
+                    print("⚠️ Token已过期，自动监控暂停，请重新登录")
+                    self.root.after(0, self._stop_monitor)
+                    return
 
-            with self._running_lock:
-                _is_running = self._running
-            if _is_running:
-                self._monitor_stop_event.wait(timeout=3)
-                continue
+                from adapters.fangguo import FangguoAdapter
+                from adapters.fangguo.config import (
+                    QUERY_STATUS, QUERY_STATUS_PENDING_PUSH, PAGE_SIZE,
+                    get_time_begin, get_time_end,
+                )
 
-            # API调用冷却检查
-            now = datetime.now().timestamp()
-            if now - last_api_call_time < MONITOR_API_COOLDOWN:
-                remaining = MONITOR_API_COOLDOWN - (now - last_api_call_time)
-                self._monitor_stop_event.wait(timeout=remaining)
-                continue
+                adapter = FangguoAdapter()
+                # 待整理订单分页获取，确保每单都参与备注等待计时，避免只处理前10单。
+                pending_audit_orders = adapter.query_all_orders(
+                    page_size=PAGE_SIZE,
+                    query_status=QUERY_STATUS,
+                    time_begin=get_time_begin(), time_end=get_time_end(),
+                )
+                # 待推送仅探测是否存在，实际推单时再分页获取完整列表。
+                pending_push_orders = adapter.query_orders(
+                    page_no=1, page_size=10,
+                    query_status=QUERY_STATUS_PENDING_PUSH,
+                    time_begin=get_time_begin(), time_end=get_time_end(),
+                )
 
-            # 查询待处理订单（轻量级检查）
-            order_count = self._quick_check_orders()
-            last_api_call_time = now
+                # 待整理订单用于自适应轮询器
+                order_ids = {order.tid or order.trade_id for order in pending_audit_orders}
+                self._adaptive_poller.record_poll_result(order_ids)
 
-            if order_count > 0:
-                current_orders = set(range(order_count))
-                new_orders_detected = current_orders - pending_orders
-                pending_orders = current_orders
+                status_summary = self._adaptive_poller.get_order_status_summary()
+                # 扩展状态摘要，包含待推送订单数
+                if pending_push_orders:
+                    status_summary = f"{status_summary}，待推送 {len(pending_push_orders)} 个"
+                wait_interval = self._adaptive_poller.get_wait_interval()
 
-                if new_orders_detected:
-                    last_detect_time = now
-                    waiting_for_process = True
-                    delay = self._calculate_delay(order_count)
-                    now_str = datetime.now().strftime('%H:%M:%S')
-                    print(f"🔍 [{now_str}] 检测到 {order_count} 个待处理订单（新增 {len(new_orders_detected)} 个）")
-                    print(f"⏳ [{now_str}] 等待 {delay}秒让客服完善备注...")
+                has_audit_orders = bool(pending_audit_orders)
+                has_push_orders = bool(pending_push_orders)
 
-                # 检查是否到达处理时间
-                time_since_detect = now - last_detect_time
-                delay = self._calculate_delay(order_count)
-                
-                if waiting_for_process and time_since_detect >= delay:
-                    processed = self._execute_audit_cycle(skip_cache)
-                    waiting_for_process = False
-                    pending_orders = set()
-                    last_detect_time = 0
-                    
-                    if processed > 0:
-                        interval = MONITOR_MIN_INTERVAL
+                if has_audit_orders or has_push_orders:
+                    if self._adaptive_poller.should_process_now() or (has_push_orders and not has_audit_orders):
+                        if self._running:
+                            print(f"⏳ [{datetime.now().strftime('%H:%M:%S')}] 上一轮处理仍在进行中，跳过本轮")
+                        else:
+                            if has_audit_orders:
+                                # 有待整理订单：启动审单+推单线程
+                                order_count = len(pending_audit_orders)
+                                ready_ids = self._adaptive_poller.get_ready_order_ids()
+                                print(f"🔍 [{datetime.now().strftime('%H:%M:%S')}] {status_summary}，开始自动审单...")
+                                self._monitor_audit_count += 1
+
+                                self._running = True
+                                self._batch_confirm_decision = None
+                                self.root.after(0, lambda: self.start_btn.config(
+                                    state=tk.DISABLED, text="审单中...", bg="#9ca3af"
+                                ))
+                                # 子线程执行审单，不阻塞监控循环，停止信号可在订单边界即时生效
+                                audit_thread = threading.Thread(
+                                    target=self._run_monitor_audit,
+                                    args=(ready_ids,),
+                                    daemon=True,
+                                )
+                                audit_thread.start()
+                                self._sleep_monitor(10)
+                            else:
+                                # 仅有待推送订单：启动推单线程
+                                print(f"📤 [{datetime.now().strftime('%H:%M:%S')}] {status_summary}，开始自动推单...")
+                                self._monitor_push_count += 1
+
+                                self._running = True
+                                self.root.after(0, lambda: self.start_btn.config(
+                                    state=tk.DISABLED, text="推单中...", bg="#9ca3af"
+                                ))
+                                push_thread = threading.Thread(
+                                    target=self._run_monitor_push_only,
+                                    daemon=True,
+                                )
+                                push_thread.start()
+                                self._sleep_monitor(10)
                     else:
-                        interval = MONITOR_INIT_INTERVAL
+                        print(f"⏳ [{datetime.now().strftime('%H:%M:%S')}] {status_summary}，{int(wait_interval)}秒后再次检查")
                 else:
-                    remaining_wait = max(0, delay - time_since_detect)
-                    sleep_time = min(remaining_wait, 5)
-                    self._monitor_stop_event.wait(timeout=sleep_time)
-                    continue
-            else:
-                pending_orders = set()
-                waiting_for_process = False
-                last_detect_time = 0
-                
-                interval = min(int(interval * MONITOR_STEP_FACTOR), MONITOR_MAX_INTERVAL)
-                now_str = datetime.now().strftime('%H:%M:%S')
-                print(f"😴 [{now_str}] 无待处理订单，{interval}秒后再次检查...")
+                    print(f"💤 [{datetime.now().strftime('%H:%M:%S')}] 暂无待处理订单，{int(wait_interval)}秒后再次检查")
 
-            self.root.after(0, lambda i=interval: self._update_monitor_btn(i, 0))
-            self._monitor_stop_event.wait(timeout=interval)
+            except Exception as e:
+                self._adaptive_poller.record_error()
+                wait_interval = self._adaptive_poller.get_wait_interval()
+                print(f"❌ [{datetime.now().strftime('%H:%M:%S')}] 监控循环异常: {e}")
+                import traceback
+                print(traceback.format_exc())
+                print(f"🔄 {int(wait_interval)}秒后重试...")
 
-        print("🛑 自动监控线程已退出")
+            self._sleep_monitor(wait_interval)
 
-    def _quick_check_orders(self) -> int:
-        """快速检查待处理订单数量（轻量级，只查询数量）"""
+    def _sleep_monitor(self, seconds):
+        """监控模式下的可中断睡眠，支持随时停止"""
+        for _ in range(int(seconds)):
+            if not self._monitoring:
+                return
+            time.sleep(1)
+
+    def _run_monitor_audit(self, ready_order_ids: set[str] | None = None):
+        """监控模式下的审单子线程：执行审单并处理后续清理。
+        不阻塞监控循环，停止信号可在订单边界即时生效。"""
         try:
-            from adapters.fangguo import FangguoAdapter
-            from adapters.fangguo.config import QUERY_STATUS, TIME_BEGIN, TIME_END
-            
-            adapter = FangguoAdapter()
-            orders = adapter.query_orders(
-                page_no=1, page_size=1,
-                query_status=QUERY_STATUS,
-                time_begin=TIME_BEGIN, time_end=TIME_END,
-            )
-            return len(orders) if orders else 0
-        except Exception as e:
-            print(f"❌ 快速检查订单失败: {e}")
-            return 0
+            self._run_audit(monitor_mode=True, allowed_order_ids=ready_order_ids)
+        finally:
+            self._running = False
+            self._batch_confirm_decision = None
+            self._adaptive_poller.reset()
+            self.root.after(0, self._sync_running_timer)
+            if self._monitoring:
+                self.root.after(0, lambda: self.start_btn.config(
+                    state=tk.DISABLED, text="监控中...", bg="#9ca3af"
+                ))
 
-    def _calculate_delay(self, order_count: int) -> int:
-        """根据订单数量动态计算延迟时间
-        
-        逻辑：订单越多，延迟越短（客服可能正在集中处理）
-             订单越少，延迟越长（给客服足够时间完善备注）
-        """
-        if order_count >= 20:
-            delay = MONITOR_DETECT_DELAY_MIN
-        elif order_count >= 10:
-            delay = int(MONITOR_DETECT_DELAY_BASE * 0.7)
-        elif order_count >= 5:
-            delay = MONITOR_DETECT_DELAY_BASE
-        elif order_count >= 2:
-            delay = int(MONITOR_DETECT_DELAY_BASE * 1.3)
-        else:
-            delay = MONITOR_DETECT_DELAY_MAX
-        
-        return delay
-
-    def _execute_audit_cycle(self, skip_cache: dict) -> int:
-        """执行一次完整的审单周期"""
-        with self._running_lock:
-            self._running = True
-        self._batch_confirm_decision = None
-        processed = 0
-
+    def _run_monitor_push_only(self):
+        """监控模式下的推单子线程：仅执行推单，不审单。
+        用于仅有待推送订单但无待整理订单的场景。"""
         try:
             from core import AutoAuditEngine
             from adapters.fangguo import FangguoAdapter
             from adapters.fangguo.config import (
-                QUERY_STATUS, PAGE_SIZE, TIME_BEGIN, TIME_END,
+                PAGE_SIZE, get_time_begin, get_time_end, DRY_RUN,
+            )
+
+            adapter = FangguoAdapter()
+            engine = AutoAuditEngine(
+                adapter=adapter, dry_run=DRY_RUN,
+                max_orders=0, interval=0.5,
+                confirm_callback=None,
+                should_stop=lambda: not self._monitoring,
+            )
+
+            print("\n" + "━" * 60)
+            print(" 开始推单（仅推单模式）...")
+            print("━" * 60)
+            try:
+                engine.push_eligible_orders(
+                    page_no=1, page_size=PAGE_SIZE,
+                    time_begin=get_time_begin(), time_end=get_time_end(),
+                )
+            except Exception as e:
+                print(f"❌ 推单异常：{e}")
+        finally:
+            self._running = False
+            self._adaptive_poller.reset()
+            self.root.after(0, self._sync_running_timer)
+            if self._monitoring:
+                self.root.after(0, lambda: self.start_btn.config(
+                    state=tk.DISABLED, text="监控中...", bg="#9ca3af"
+                ))
+
+    def _run_audit(self, monitor_mode=False, allowed_order_ids: set[str] | None = None):
+        """执行审单。monitor_mode=True 时 confirm_callback=None，无需确认弹窗。"""
+        try:
+            from core import AutoAuditEngine
+            from adapters.fangguo import FangguoAdapter
+            from adapters.fangguo.config import (
+                QUERY_STATUS, PAGE_SIZE,
+                get_time_begin, get_time_end,
                 DRY_RUN, MAX_ORDERS,
             )
 
             adapter = FangguoAdapter()
-            confirm_cb = None
+
+            # 监控模式下 confirm_callback=None，不弹确认框，直接自动处理
+            # 非监控模式下，非 DRY_RUN 时才传入确认回调
+            if monitor_mode:
+                confirm_cb = None
+            else:
+                confirm_cb = self._confirm_update if not DRY_RUN else None
+
+            # 监控模式下加超时上限，避免单轮审单长时间阻塞监控循环
+            import time as _time
+            _audit_start = _time.time()
+            _MAX_AUDIT_SECONDS = 600  # 单轮审单上限 10 分钟
+
+            def _should_stop():
+                if not self._monitoring:
+                    return True
+                if _time.time() - _audit_start > _MAX_AUDIT_SECONDS:
+                    print(f"⚠️ 审单超时（{_MAX_AUDIT_SECONDS}秒），自动终止本轮")
+                    return True
+                return False
+
             engine = AutoAuditEngine(
                 adapter=adapter, dry_run=DRY_RUN,
                 max_orders=MAX_ORDERS, interval=0.5,
                 confirm_callback=confirm_cb,
-                skip_cache=skip_cache,
+                should_stop=_should_stop if monitor_mode else None,
+                skip_cache=getattr(self, "_monitor_skip_cache", None) if monitor_mode else None,
             )
-            processed = engine.run_monitor_cycle(
+            # 时间范围动态计算：避免长时间运行后跨天导致漏单
+            engine.run(
                 page_no=1, page_size=PAGE_SIZE,
                 query_status=QUERY_STATUS,
-                time_begin=TIME_BEGIN, time_end=TIME_END,
+                time_begin=get_time_begin(), time_end=get_time_end(),
+                allowed_order_ids=allowed_order_ids,
             )
+
+            # 监控模式下，审单完成后自动执行推单
+            if monitor_mode:
+                if not self._monitoring:
+                    print("⏹️  监控已停止，取消后续推单")
+                    return
+                # 推单仅响应停止监控，保留十分钟上限只作用于审单的原有行为。
+                engine.should_stop = lambda: not self._monitoring
+                print("\n" + "━" * 60)
+                print(" 审单完成，开始推单...")
+                print("━" * 60)
+                try:
+                    engine.push_eligible_orders(
+                        page_no=1, page_size=PAGE_SIZE,
+                        time_begin=get_time_begin(), time_end=get_time_end(),
+                    )
+                except Exception as e:
+                    print(f"❌ 推单异常：{e}")
         except Exception as e:
-            print(f"❌ 监控异常: {e}")
+            print(f"\n❌ 审单异常: {e}")
             import traceback
             print(traceback.format_exc())
         finally:
-            with self._running_lock:
-                self._running = False
-            self._batch_confirm_decision = None
-
-        return processed
-
-    def _update_monitor_btn(self, next_interval, processed):
-        """更新监控按钮显示倒计时"""
-        if not self._auto_monitor:
-            return
-        self.monitor_btn.config(text=f"⏸ 监控中({next_interval}s)", bg=COLORS["danger"])
-
-    def _open_express_config(self):
-        """打开快递配置对话框"""
-        ExpressConfigDialog(self.root)
+            if not monitor_mode:
+                self.root.after(0, self._finish_audit)
 
     def _on_close(self):
-        # 先停止Token检查线程
-        if self._token_check_running:
-            self._token_check_running = False
-            self._token_check_stop_event.set()
-
-        # 先停止监控线程
-        if self._auto_monitor:
-            self._auto_monitor = False
-            self._monitor_stop_event.set()
-
-        if self._running:
-            if not messagebox.askyesno("确认退出", "审单正在运行，确定退出吗？"):
+        if self._running or self._monitoring:
+            if not messagebox.askyesno("确认退出", "审单/监控正在运行，确定退出吗？"):
                 return
+        # 停止监控：先保存线程引用，再设标志，最后短暂等待
+        if self._monitoring:
+            monitor_thread = self._monitor_thread
+            self._stop_monitor()
+            if monitor_thread and monitor_thread.is_alive():
+                monitor_thread.join(timeout=2)
+        # 停止Token检测
+        self._stop_token_check()
+        # 停止运行时间计时器
+        self._stop_running_timer()
+        # 停止日志队列消费定时器
+        if self._log_drain_job is not None:
+            try:
+                self.root.after_cancel(self._log_drain_job)
+            except tk.TclError:
+                pass
+            self._log_drain_job = None
+        # 清理回调注册
         try:
             unregister_auth_callback(self._on_auth_changed)
         except Exception:
             pass
         sys.stdout = sys.__stdout__
         self.root.destroy()
-
-
-class ExpressConfigDialog:
-    """快递配置对话框"""
-
-    def __init__(self, parent):
-        self.parent = parent
-        self.dialog = tk.Toplevel(parent)
-        self.dialog.title("快递配置")
-        self.dialog.geometry("680x600")
-        self.dialog.configure(bg=COLORS["card_bg"])
-        self.dialog.transient(parent)
-        self.dialog.grab_set()
-        self.dialog.resizable(True, True)
-
-        self._center()
-        self._build_ui()
-
-    def _center(self):
-        self.dialog.update_idletasks()
-        pw = self.parent.winfo_width()
-        ph = self.parent.winfo_height()
-        px = self.parent.winfo_x()
-        py = self.parent.winfo_y()
-        w, h = 680, 600
-        x = px + (pw - w) // 2
-        y = py + (ph - h) // 2
-        self.dialog.geometry(f"{w}x{h}+{x}+{y}")
-
-    def _build_ui(self):
-        import express_config as ec
-
-        container = tk.Frame(self.dialog, bg=COLORS["card_bg"], padx=20, pady=16)
-        container.pack(fill=tk.BOTH, expand=True)
-
-        # 标题
-        tk.Label(
-            container, text="🚚 快递配置",
-            font=(FONT, 16, "bold"),
-            bg=COLORS["card_bg"], fg=COLORS["header_fg"],
-        ).pack(anchor="w", pady=(0, 12))
-
-        # 说明文字
-        tk.Label(
-            container,
-            text="• 备注关键词优先级高于省份规则\n• 下方可修改各省份默认快递，也可添加新的快递公司",
-            font=(FONT, 9),
-            bg=COLORS["card_bg"], fg=COLORS["label_fg"],
-            justify=tk.LEFT,
-        ).pack(anchor="w", pady=(0, 10))
-
-        # 使用Notebook分两个标签页
-        notebook = ttk.Notebook(container)
-        notebook.pack(fill=tk.BOTH, expand=True, pady=(0, 12))
-
-        # ========== 标签页1：省份规则 ==========
-        tab1 = tk.Frame(notebook, bg=COLORS["card_bg"])
-        notebook.add(tab1, text="省份规则")
-
-        self._build_province_tab(tab1, ec)
-
-        # ========== 标签页2：快递类型 ==========
-        tab2 = tk.Frame(notebook, bg=COLORS["card_bg"])
-        notebook.add(tab2, text="快递类型")
-
-        self._build_express_tab(tab2, ec)
-
-        # 底部按钮
-        btn_frame = tk.Frame(container, bg=COLORS["card_bg"])
-        btn_frame.pack(fill=tk.X, pady=(4, 0))
-
-        tk.Button(
-            btn_frame, text="💾 保存配置", font=(FONT, 11, "bold"),
-            bg=COLORS["success"], fg="#ffffff",
-            padx=20, pady=6, relief=tk.FLAT, bd=0,
-            cursor="hand2", command=self._save_config,
-        ).pack(side=tk.RIGHT)
-
-        tk.Button(
-            btn_frame, text="🔄 恢复默认", font=(FONT, 11),
-            bg=COLORS["warning_bg"], fg=COLORS["warning"],
-            padx=16, pady=6, relief=tk.FLAT, bd=0,
-            cursor="hand2", command=self._reset_default,
-        ).pack(side=tk.RIGHT, padx=(0, 10))
-
-        tk.Button(
-            btn_frame, text="关闭", font=(FONT, 11),
-            bg=COLORS["card_bg"], fg=COLORS["label_fg"],
-            padx=16, pady=6, relief=tk.FLAT, bd=0,
-            cursor="hand2", command=self.dialog.destroy,
-        ).pack(side=tk.RIGHT, padx=(0, 10))
-
-    def _build_province_tab(self, parent, ec):
-        """构建省份规则标签页"""
-        # 表头
-        header = tk.Frame(parent, bg=COLORS["card_bg"])
-        header.pack(fill=tk.X, pady=(8, 4))
-
-        tk.Label(header, text="省份", font=(FONT, 10, "bold"),
-                 bg=COLORS["card_bg"], fg=COLORS["header_fg"], width=12).pack(side=tk.LEFT)
-        tk.Label(header, text="默认快递", font=(FONT, 10, "bold"),
-                 bg=COLORS["card_bg"], fg=COLORS["header_fg"]).pack(side=tk.LEFT, padx=(20, 0))
-
-        # 滚动区域
-        canvas_frame = tk.Frame(parent, bg=COLORS["card_bg"])
-        canvas_frame.pack(fill=tk.BOTH, expand=True)
-
-        canvas = tk.Canvas(canvas_frame, bg=COLORS["card_bg"], highlightthickness=0)
-        scrollbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=canvas.yview)
-        scroll_frame = tk.Frame(canvas, bg=COLORS["card_bg"])
-
-        scroll_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # 加载当前配置
-        self.province_vars = {}
-        rules = ec.get_all_province_rules()
-        express_names = ec.get_all_express_names()
-
-        row = 0
-        for province in sorted(rules.keys(), key=lambda x: (len(x), x)):
-            frame = tk.Frame(scroll_frame, bg=COLORS["card_bg"])
-            frame.pack(fill=tk.X, pady=2)
-
-            tk.Label(frame, text=province, font=(FONT, 10),
-                     bg=COLORS["card_bg"], fg=COLORS["text_fg"], width=12, anchor="w").pack(side=tk.LEFT)
-
-            var = tk.StringVar(value=rules.get(province, ""))
-            self.province_vars[province] = var
-
-            cb = ttk.Combobox(frame, textvariable=var, values=express_names,
-                              state="readonly", width=14, font=(FONT, 10))
-            cb.pack(side=tk.LEFT, padx=(20, 0))
-
-            row += 1
-
-    def _build_express_tab(self, parent, ec):
-        """构建快递类型标签页"""
-        # 当前列表
-        list_frame = tk.Frame(parent, bg=COLORS["card_bg"])
-        list_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 8))
-
-        tk.Label(list_frame, text="当前快递类型", font=(FONT, 11, "bold"),
-                 bg=COLORS["card_bg"], fg=COLORS["header_fg"]).pack(anchor="w")
-
-        self.express_tree = ttk.Treeview(list_frame, columns=("name", "code"), show="headings", height=10)
-        self.express_tree.heading("name", text="快递公司")
-        self.express_tree.heading("code", text="ERP编码")
-        self.express_tree.column("name", width=160, anchor="w")
-        self.express_tree.column("code", width=160, anchor="w")
-        self.express_tree.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
-
-        self._refresh_express_list(ec)
-
-        # 添加区域
-        add_frame = tk.Frame(parent, bg=COLORS["card_bg"], pady=10)
-        add_frame.pack(fill=tk.X)
-
-        tk.Label(add_frame, text="添加快递:", font=(FONT, 10),
-                 bg=COLORS["card_bg"], fg=COLORS["text_fg"]).pack(side=tk.LEFT)
-
-        self.new_name_var = tk.StringVar()
-        tk.Entry(add_frame, textvariable=self.new_name_var, font=(FONT, 10),
-                 width=12, relief=tk.SOLID, bd=1).pack(side=tk.LEFT, padx=(6, 0))
-
-        tk.Label(add_frame, text="编码:", font=(FONT, 10),
-                 bg=COLORS["card_bg"], fg=COLORS["text_fg"]).pack(side=tk.LEFT, padx=(10, 0))
-
-        self.new_code_var = tk.StringVar()
-        tk.Entry(add_frame, textvariable=self.new_code_var, font=(FONT, 10),
-                 width=12, relief=tk.SOLID, bd=1).pack(side=tk.LEFT, padx=(6, 0))
-
-        tk.Button(
-            add_frame, text="➕ 添加", font=(FONT, 10),
-            bg=COLORS["accent"], fg="#ffffff",
-            padx=12, pady=3, relief=tk.FLAT, bd=0,
-            cursor="hand2", command=self._add_express_type,
-        ).pack(side=tk.LEFT, padx=(10, 0))
-
-        tk.Button(
-            add_frame, text="🗑 删除选中", font=(FONT, 10),
-            bg=COLORS["danger_bg"], fg=COLORS["danger"],
-            padx=12, pady=3, relief=tk.FLAT, bd=0,
-            cursor="hand2", command=self._remove_selected_express,
-        ).pack(side=tk.LEFT, padx=(8, 0))
-
-    def _refresh_express_list(self, ec):
-        """刷新快递类型列表"""
-        for item in self.express_tree.get_children():
-            self.express_tree.delete(item)
-        config = ec.load_config()
-        for name, code in config.get("express_codes", {}).items():
-            self.express_tree.insert("", tk.END, values=(name, code))
-
-    def _add_express_type(self):
-        import express_config as ec
-        name = self.new_name_var.get().strip()
-        code = self.new_code_var.get().strip()
-        if not name or not code:
-            messagebox.showwarning("输入不完整", "请填写快递公司名称和编码", parent=self.dialog)
-            return
-        ec.add_express_type(name, code)
-        self._refresh_express_list(ec)
-        self.new_name_var.set("")
-        self.new_code_var.set("")
-        messagebox.showinfo("添加成功", f"已添加 {name} ({code})", parent=self.dialog)
-
-    def _remove_selected_express(self):
-        import express_config as ec
-        selected = self.express_tree.selection()
-        if not selected:
-            messagebox.showwarning("未选择", "请先选中要删除的快递类型", parent=self.dialog)
-            return
-        item = selected[0]
-        values = self.express_tree.item(item, "values")
-        name = values[0]
-        if messagebox.askyesno("确认删除", f"确定删除快递类型 '{name}' 吗？\n（使用该快递的省份规则也会被清除）", parent=self.dialog):
-            ec.remove_express_type(name)
-            self._refresh_express_list(ec)
-            # 刷新省份页的下拉框需要重建，简单处理是提示用户重新打开
-            messagebox.showinfo("已删除", "快递类型已删除，请关闭窗口重新打开以刷新省份下拉框", parent=self.dialog)
-
-    def _save_config(self):
-        import express_config as ec
-        # 保存省份规则
-        for province, var in self.province_vars.items():
-            ec.update_province_rule(province, var.get())
-        messagebox.showinfo("保存成功", "快递配置已保存", parent=self.dialog)
-
-    def _reset_default(self):
-        import express_config as ec
-        if messagebox.askyesno("确认恢复", "确定恢复为默认配置吗？所有自定义修改将丢失。", parent=self.dialog):
-            ec.reset_to_default()
-            messagebox.showinfo("已恢复", "已恢复默认配置，请关闭窗口重新打开", parent=self.dialog)
-            self.dialog.destroy()
 
 
 def main():
