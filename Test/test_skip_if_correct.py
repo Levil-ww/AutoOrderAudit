@@ -1,15 +1,33 @@
+import re
 import sys
 sys.path.insert(0, 'd:\\AutoOrderAudit')
 
 from io import StringIO
 import unittest.mock
+import pytest
 
 from core.parser import parse_remark, extract_multiple_remarks
 from core.adapter_base import Order, OrderItem
 from adapters.fangguo.adapter import FangguoAdapter
 
 
-def test_skip_if_already_correct():
+
+@pytest.fixture(autouse=True)
+def offline_save_product(monkeypatch):
+    """仅 mock 商品保存接口；断言其他请求，禁止测试访问真实 ERP。"""
+    from adapters.fangguo.config import API_SAVE_PRODUCT
+    response = unittest.mock.Mock()
+    response.json.return_value = {"code": 0, "data": True}
+
+    def save(url, **kwargs):
+        assert url == API_SAVE_PRODUCT
+        return response
+
+    post = unittest.mock.Mock(side_effect=save)
+    monkeypatch.setattr("requests.sessions.Session.post", post)
+    return post
+
+def test_skip_if_already_correct(offline_save_product):
     """测试：当商品编码已正确时，程序跳过修改"""
     print('=' * 80)
     print('测试：编码已正确时跳过修改')
@@ -61,15 +79,12 @@ def test_skip_if_already_correct():
     print(f'\n输出内容:')
     print(output)
     
-    if ok == True and '编码已正确，跳过修改' in output:
-        print('\n✅ 测试通过：编码已正确时，程序跳过修改')
-        assert True
-    else:
-        print('\n❌ 测试失败：编码已正确但未跳过修改')
-        assert False, '编码已正确但未跳过修改'
+    assert ok is True
+    assert '编码已正确，跳过修改' in output
+    offline_save_product.assert_not_called()
 
 
-def test_modify_if_incorrect():
+def test_modify_if_incorrect(offline_save_product):
     """测试：当商品编码不正确时，程序执行修改"""
     print('\n' + '=' * 80)
     print('测试：编码不正确时执行修改')
@@ -121,21 +136,15 @@ def test_modify_if_incorrect():
     print(f'\n输出内容:')
     print(output)
     
-    if ok != True or '编码已正确，跳过修改' not in output:
-        print('\n✅ 测试通过：编码不正确时，程序执行修改')
-        assert True
-    else:
-        print('\n❌ 测试失败：编码不正确但被跳过')
-        assert False, '编码不正确但被跳过'
+    assert ok is True
+    offline_save_product.assert_called_once()
+    payload = offline_save_product.call_args.kwargs["json"]
+    active = [item for item in payload["orderItems"] if not item.get("cancelStatus") and not item.get("discardStatus")]
+    assert len(active) == 1
+    assert active[0]["id"] == "item1"
+    assert re.sub(r'<[^>]+>', '', active[0]["shopMappingSku"]) == expected_sku
+    assert active[0]["num"] == 1
 
 
 if __name__ == '__main__':
-    result1 = test_skip_if_already_correct()
-    result2 = test_modify_if_incorrect()
-    
-    print('\n' + '=' * 80)
-    if result1 and result2:
-        print('🎉 所有测试通过！')
-    else:
-        print('❌ 部分测试失败')
-    print('=' * 80)
+    raise SystemExit(pytest.main([__file__]))
