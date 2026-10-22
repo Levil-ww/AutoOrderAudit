@@ -124,7 +124,7 @@ _RE_QTY_SUMMARY_VALUE = re.compile(rf"共(?:计)?\s*({_CHINESE_NUMBERS})\s*[张�
 _RE_CHINESE_QTY = re.compile(rf"(?<![xX×*\d])({_CHINESE_NUMBERS})\s*(?:[张件套米长]|个(?!角))(?=$|[，,；;\s\-])")
 
 # 到货返信息匹配（如"到货返22"、"到货返50元"、"确认收货返差价0.3元"、“返现10 /0.2元”）
-_RE_ARRIVAL_REFUND = re.compile(r"(到货返|到货返差价|到货退差价|确认收货返差价|返差价|返现)\d+(?:\.\d+)?[元]?")
+_RE_ARRIVAL_REFUND = re.compile(r"(到货[返反](?:差价|差)?|到货退(?:[返反])?(?:差价|差)?|确认收货[返反](?:差价|差)?|到货后[返反]|收货后[返反]|到货[返反]|[返反](?:差价|差)?|[返反]现)\d+(?:\.\d+)?[元]?")
 
 # 无关词语匹配（如"桌垫"、"地垫"等，作为后缀时应过滤）
 _RE_IRRELEVANT_SUFFIX = re.compile(r"(桌垫|地垫|沙发扶手垫|床头柜垫|餐边柜)[，,；;]?")
@@ -1571,7 +1571,7 @@ def _clean_pattern_name(pattern_name: str) -> str:
     for word in ["桌垫", "地垫"]:
         result = result.replace(word, "").strip().strip("-;,、")
     
-    result = result.strip().strip("-;,、")
+    result = result.replace("-", "").strip().strip(";,、")
     
     return result
 

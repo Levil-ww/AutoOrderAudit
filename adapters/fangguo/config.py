@@ -34,7 +34,7 @@ BASE_URL = "https://fangguo.com"
 API_QUERY_ORDER  = f"{BASE_URL}/fgapp/order/shop/trade/queryForPageForTrade"
 API_SAVE_PRODUCT = f"{BASE_URL}/fgapp/order/shop/trade/order/saveProduct"
 API_ORDER_DETAIL = f"{BASE_URL}/fgapp/order/shop/trade/getDetailsByPage"
-API_MATERIAL_LIST = f"{BASE_URL}/fgapp/order/shop/trade/order/materialColorsNew"
+API_MATERIAL_LIST = f"{BASE_URL}/fgapp/warehouse/shop/encode/combobox/materialColorsNew"
 API_UPDATE_LOGISTICS = f"{BASE_URL}/fgapp/order/shop/trade/logistics/update"
 API_DELETE_ORDER = f"{BASE_URL}/fgapp/order/shop/trade/order/deleteTradeOrder"
 
@@ -65,7 +65,8 @@ MATERIAL_MAP = {
     "镜面革": "镜面皮革",
     "镜面": "镜面皮革",
     "镜面皮革卷材": "镜面皮革卷材",
-    "高回弹": "镜面皮革卷材",
+    "高回弹": "镜面皮革",
+    "高回弹皮革": "镜面皮革",
     "泡泡绒兔毛": "泡泡绒兔毛",
     "防滑兔绒": "泡泡绒兔毛",
     "软玻璃" : "软玻璃",
@@ -75,6 +76,7 @@ MATERIAL_MAP = {
     "真有机硅": "有机硅",
     "浴室吸水科技布": "浴室吸水科技布",
     "科技布": "浴室吸水科技布",
+    "浴室垫": "浴室吸水科技布",
     "浴室吸水植绒": "浴室吸水植绒",
     "吸水植绒": "浴室吸水植绒",
     "珍珠纱": "珍珠纱",
@@ -119,4 +121,4 @@ def get_time_end() -> str:
     return datetime.now().strftime("%Y-%m-%d 23:59:59")
 
 # 参考项目的自动推单材质限制，不影响原有审单。
-PUSH_BLOCKED_MATERIALS = {"防辣椒油", "丝圈", "泡泡绒兔毛"}
+PUSH_BLOCKED_MATERIALS = {"防辣椒油", "丝圈", "泡泡绒兔毛", "浴室吸水科技布"}
