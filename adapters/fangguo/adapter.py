@@ -9,7 +9,7 @@ import json
 import uuid as _uuid
 from collections import defaultdict
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from gift_manager import get_manager as get_gift_manager, split_shop_sku
 
@@ -20,7 +20,7 @@ from urllib3.util.retry import Retry
 from core import ErpAdapter, Order, OrderItem, ParsedRemark, parse_remark
 from core.parser import extract_multiple_remarks
 from . import config as fg_config
-from .material_source import get_material_source
+from .material_source import FangguoMaterialSource, get_material_source
 
 
 class FangguoAdapter(ErpAdapter):
@@ -179,6 +179,27 @@ class FangguoAdapter(ErpAdapter):
             return d.get("list") or d.get("rows") or d.get("records") or []
         return []
 
+    @staticmethod
+    def _merged_child_tids(order: Order) -> set[str]:
+        """仅从完整合并号取得可验证的子订单号。"""
+        for value in (order.tid, order.trade_id):
+            if "&" in value:
+                return {tid.strip() for tid in value.split("&") if tid.strip()}
+        return set()
+
+    def _item_child_tid(self, item: OrderItem, order: Order) -> str:
+        """匹配和清理使用同一归属，内部商品行号不能作为子订单号。"""
+        candidates = [item.original_tid, item.order_id, item.oid]
+        candidates.extend(str((item.raw or {}).get(key) or "") for key in (
+            "tid", "originTradeId", "subTid", "subOrderId", "sysOid", "oid",
+            "tradeId", "parentTid", "orderId",
+        ))
+        child_tids = self._merged_child_tids(order)
+        if child_tids:
+            return next((tid for tid in candidates if tid in child_tids), "")
+        return next((tid for tid in candidates if tid and "&" not in tid
+                     and not tid.startswith("__idx__")), "")
+
     def _to_order(self, raw: dict) -> Order:
         """将方果原始订单数据转为通用 Order 对象，自动适配多种字段名"""
         shop_remark = self._extract_field(raw, [
@@ -266,6 +287,12 @@ class FangguoAdapter(ErpAdapter):
                 original_tid = sys_oid_val
             else:
                 original_tid = tid_val or oid_val or sys_oid_val
+            child_tids = self._merged_child_tids(order)
+            if child_tids:
+                original_tid = next((str(it.get(key)) for key in (
+                    "tid", "originTradeId", "subTid", "subOrderId", "sysOid", "oid",
+                    "tradeId", "parentTid", "orderId",
+                ) if str(it.get(key) or "") in child_tids), "")
             
             item = OrderItem(
                 id=str(it.get("id") or ""),
@@ -377,6 +404,12 @@ class FangguoAdapter(ErpAdapter):
                     original_tid = sys_oid_val
                 else:
                     original_tid = tid_val or oid_val or sys_oid_val
+                child_tids = self._merged_child_tids(order)
+                if child_tids:
+                    original_tid = next((str(it.get(key)) for key in (
+                        "tid", "originTradeId", "subTid", "subOrderId", "sysOid", "oid",
+                        "tradeId", "parentTid", "orderId",
+                    ) if str(it.get(key) or "") in child_tids), "")
                 
                 order.items.append(OrderItem(
                     id=str(it.get("id") or ""),
@@ -430,7 +463,7 @@ class FangguoAdapter(ErpAdapter):
                           若提供则与 parsed_list 中的赠品合并后按 tid 分组去重。
         """
         # 检测是否为合并订单（解析结果带有 original_tid，或 gift_no_ship_tids 不为空）
-        is_merged_order = any(p.original_tid for p in (parsed_list or [])) or (gift_no_ship_tids and len(gift_no_ship_tids) > 0)
+        is_merged_order = bool(self._merged_child_tids(order)) or any(p.original_tid for p in (parsed_list or [])) or (gift_no_ship_tids and len(gift_no_ship_tids) > 0)
         
         # 合并订单跳过 _split_parsed_by_sizes，因为解析结果已经按分组处理过了
         if keep_main_code:
@@ -489,6 +522,17 @@ class FangguoAdapter(ErpAdapter):
             print(f"  ⏭️  跳过：所有非赠品商品行已作废或已退款")
             return None
         
+        child_tids = self._merged_child_tids(order)
+        sku_owners = defaultdict(set)
+        if is_merged_order and child_tids:
+            for p in product_parsed_list:
+                if p.original_tid in child_tids:
+                    sku_owners[_clean_sku(p.shop_mapping_sku)].add(p.original_tid)
+            for item in valid_items:
+                if not self._item_child_tid(item, order) and len(sku_owners.get(_clean_sku(item.shop_mapping_sku), set())) > 1:
+                    print("  ⏭️ 合并订单同SKU复制行归属不明确，需人工确认")
+                    return None
+
         # 检查当前订单是否已经完全正确
         # 合并订单需要验证每个商品行的 original_tid 和 SKU 是否都匹配
         is_already_correct = False
@@ -673,6 +717,21 @@ class FangguoAdapter(ErpAdapter):
                     if duplicate_found:
                         is_already_correct = False
         
+        if is_already_correct and is_merged_order and child_tids:
+            # 集合相等不能核对逐行需求与子订单归属，避免缺行、多行被提前跳过。
+            remaining_items = list(valid_items)
+            for p in product_parsed_list:
+                matched = next((item for item in remaining_items
+                                if _clean_sku(item.shop_mapping_sku) == _clean_sku(p.shop_mapping_sku)
+                                and item.num == p.num
+                                and self._item_child_tid(item, order) == p.original_tid), None)
+                if matched is None:
+                    is_already_correct = False
+                    break
+                remaining_items.remove(matched)
+            if not is_set_order and any(_clean_sku(item.shop_mapping_sku) in sku_owners for item in remaining_items):
+                is_already_correct = False
+
         if is_already_correct:
             # 检查补差价商品行是否也已经正确
             price_diff_already_correct = True
@@ -812,12 +871,32 @@ class FangguoAdapter(ErpAdapter):
                 matched_item_idx = None
                 match_method = "unknown"
 
-                # 如果解析结果有 original_tid，按 original_tid 匹配商品行
-                if p.original_tid:
+                # 优先复用同子订单同规格行，再复用归属被 ERP 改写的同规格行。
+                if is_merged_order and child_tids and p.original_tid in child_tids:
+                    for idx in valid_indices:
+                        item = order.items[idx]
+                        if (idx not in used_item_indices
+                                and self._item_child_tid(item, order) == p.original_tid
+                                and _clean_sku(item.shop_mapping_sku) == _clean_sku(p.shop_mapping_sku)):
+                            matched_item_idx = idx
+                            match_method = "child_sku"
+                            break
+                    if matched_item_idx is None:
+                        for idx in valid_indices:
+                            item = order.items[idx]
+                            if (idx not in used_item_indices
+                                    and not self._item_child_tid(item, order)
+                                    and _clean_sku(item.shop_mapping_sku) == _clean_sku(p.shop_mapping_sku)):
+                                matched_item_idx = idx
+                                match_method = "merged_sku_fallback"
+                                break
+
+                # 同规格未命中时，仍沿用原有按子订单匹配和顺序更新逻辑。
+                if matched_item_idx is None and p.original_tid:
                     for idx in valid_indices:
                         if idx not in used_item_indices:
                             item = order.items[idx]
-                            if item.original_tid == p.original_tid:
+                            if self._item_child_tid(item, order) == p.original_tid:
                                 matched_item_idx = idx
                                 match_method = "original_tid"
                                 break
@@ -836,6 +915,8 @@ class FangguoAdapter(ErpAdapter):
                         if idx in used_item_indices:
                             continue
                         item = order.items[idx]
+                        if child_tids and p.original_tid and self._item_child_tid(item, order) not in {"", p.original_tid}:
+                            continue
                         if item.num != p.num:
                             continue
                         clean_item_sku = _clean_sku(item.shop_mapping_sku)
@@ -863,6 +944,8 @@ class FangguoAdapter(ErpAdapter):
                 if matched_item_idx is None:
                     for idx in valid_indices:
                         if idx not in used_item_indices:
+                            if child_tids and p.original_tid and self._item_child_tid(order.items[idx], order) not in {"", p.original_tid}:
+                                continue
                             matched_item_idx = idx
                             match_method = "sequential"
                             break
@@ -879,6 +962,10 @@ class FangguoAdapter(ErpAdapter):
                             _normalize_sku_for_duplicate(clean_matched_sku) == _normalize_sku_for_duplicate(clean_parsed_sku)):
                         new_item['shopMappingSku'] = clean_matched_sku
                         print(f"    ℹ️ 保留已有等价编码: {clean_matched_sku}")
+                    if child_tids and p.original_tid in child_tids:
+                        new_item["tid"] = p.original_tid
+                        new_item["orderId"] = p.original_tid
+                        new_item["originTradeId"] = p.original_tid
                     # 确保普通商品行不是赠品
                     new_item['filmGiftCode'] = ''
                     new_item['giftCodeName'] = None
@@ -894,6 +981,8 @@ class FangguoAdapter(ErpAdapter):
                     is_dup_global = False
                     for idx in valid_indices:
                         item = order.items[idx]
+                        if child_tids and p.original_tid and self._item_child_tid(item, order) not in {"", p.original_tid}:
+                            continue
                         if item.num != p.num:
                             continue
                         # 关键修复：跳过不同子订单号的商品行（不同子订单的相同SKU不是重复）
@@ -1120,7 +1209,6 @@ class FangguoAdapter(ErpAdapter):
                         should_no_ship = True
                     if should_no_ship:
                         new_item = self._build_price_diff_no_ship_item(item, order)
-                        new_item['num'] = item.num
                         order_items.append(new_item)
                         used_item_indices.add(idx)
                     else:
@@ -1155,7 +1243,6 @@ class FangguoAdapter(ErpAdapter):
                     
                     if should_no_ship:
                         new_item = self._build_price_diff_no_ship_item(item, order)
-                        new_item['num'] = item.num
                         order_items.append(new_item)
                         used_item_indices.add(idx)
                     else:
@@ -1259,9 +1346,14 @@ class FangguoAdapter(ErpAdapter):
         existing_base_sku_nums = set()
         existing_normalized_sku_nums = set()
         for it in order_items:
+            if it.get('cancelStatus') or it.get('discardStatus'):
+                continue
             sku = _clean_sku(it.get('shopMappingSku', ''))
             num = it.get('num', 1)
             item_oid = it.get('oid', '') or ''
+            if child_tids:
+                item_oid = next((str(it.get(key)) for key in ('tid', 'oid', 'orderId')
+                                 if str(it.get(key) or '') in child_tids), '')
             if sku:
                 existing_sku_nums.add((sku, num))
                 # 记录每个 (sku, num) 对应的子订单号集合
@@ -1297,7 +1389,7 @@ class FangguoAdapter(ErpAdapter):
                     is_duplicate = False
                     item_sku = _clean_sku(item.shop_mapping_sku)
                     item_num = item.num
-                    item_tid = item.original_tid or item.oid or ''
+                    item_tid = self._item_child_tid(item, order) if child_tids else (item.original_tid or item.oid or '')
                     
                     # 辅助函数：检查指定 (sku, num) 是否存在且属于同一子订单
                     def _is_same_tid_dup(sku_val, num_val, item_tid_val):
@@ -1342,6 +1434,11 @@ class FangguoAdapter(ErpAdapter):
                                     else:
                                         print(f"    ⚠️ 检测到重复商品行(标准化SKU,同子订单): {item_sku} x {item_num}")
                                         is_duplicate = True
+
+                    if child_tids and not item_tid and item_sku and not is_set_order:
+                        normalized_sku = _normalize_sku_for_duplicate(item_sku)
+                        if any(_normalize_sku_for_duplicate(sku) == normalized_sku for sku, _ in existing_sku_nums):
+                            is_duplicate = True
 
                     if is_duplicate:
                         # 将重复行标记为作废（cancelStatus: true）后提交
@@ -1568,7 +1665,7 @@ class FangguoAdapter(ErpAdapter):
         multi_parsed = extract_multiple_remarks(
             remark,
             material_map=self.material_map,
-            material_matcher=self.get_material_matcher(),
+            material_matcher=self.get_material_matcher_for_order(order),
         )
 
         if len(multi_parsed) > 1:
@@ -2249,7 +2346,23 @@ class FangguoAdapter(ErpAdapter):
 
     def get_material_matcher(self):
         """返回材质自动匹配回调"""
-        return self._material_source.auto_match if hasattr(self._material_source, 'auto_match') else None
+        return self._material_source.matcher_callback if hasattr(self._material_source, 'matcher_callback') else None
+
+    def get_material_matcher_for_order(self, order: Order) -> Optional[Callable]:
+        """按订单工厂与账号隔离材质字典，缺少工厂时使用本地规则。"""
+        if self.get_material_matcher() is None:
+            return None
+        factory_id = int((order.raw or {}).get("factoryTenantId") or order.factory_id or 0)
+        if factory_id <= 0:
+            return None
+        shop_tenant_id = str((order.raw or {}).get("shopTenantId") or "")
+        key = (str(fg_config.TENANT_ID), factory_id, shop_tenant_id)
+        if not hasattr(self, "_material_sources"):
+            self._material_sources = {}
+        if key not in self._material_sources:
+            self._material_sources[key] = FangguoMaterialSource(factory_id, shop_tenant_id)
+        return self._material_sources[key].matcher_callback
+
 
     def update_price_difference_order(self, order: Order, items: list = None, ship: bool = True) -> bool:
         """

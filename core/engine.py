@@ -339,8 +339,7 @@ class AutoAuditEngine:
         if remark.strip():
             print(f"  📝 混合订单备注含信息，解析备注并按补差价逻辑处理补差价行")
             # 解析备注，判断是否有剩余解析结果可分配给补差价行
-            material_map = getattr(self.adapter, 'material_map', None)
-            material_matcher = getattr(self.adapter, 'get_material_matcher', lambda: None)()
+            material_map, material_matcher = self._get_material_context(order)
             parsed_list = extract_multiple_remarks(
                 remark, material_map=material_map, material_matcher=material_matcher,
             )
@@ -503,8 +502,7 @@ class AutoAuditEngine:
         if parsed_list_override is not None:
             parsed_list = parsed_list_override
         else:
-            material_map = getattr(self.adapter, 'material_map', None)
-            material_matcher = getattr(self.adapter, 'get_material_matcher', lambda: None)()
+            material_map, material_matcher = self._get_material_context(order)
             parsed_list = extract_multiple_remarks(
                 remark,
                 material_map=material_map,
@@ -798,8 +796,7 @@ class AutoAuditEngine:
         remark = order.shop_remark or ""
         print(f"  卖家备注: {remark[:60]}..." if len(remark) > 60 else f"  卖家备注: {remark}")
 
-        material_map = getattr(self.adapter, 'material_map', None)
-        material_matcher = getattr(self.adapter, 'get_material_matcher', lambda: None)()
+        material_map, material_matcher = self._get_material_context(order)
 
         # ===== 检测合并订单 =====
         # 合并订单特征：订单号包含 &，或商品行有不同的 original_tid
@@ -938,6 +935,15 @@ class AutoAuditEngine:
             
             is_gift_item = self.adapter._is_gift_item(item)
             
+            # 归属未确认的复制行只交给适配器复用/清理，不解析综合备注。
+            child_resolver = getattr(type(self.adapter), "_item_child_tid", None)
+            merged_tids = set((order.tid if "&" in order.tid else order.trade_id).split("&"))
+            if callable(child_resolver) and len(merged_tids) > 1 and not is_gift_item:
+                child_tid = self.adapter._item_child_tid(item, order)
+                if not child_tid:
+                    continue
+                item.original_tid = child_tid
+
             # 优先使用不包含&的子订单号
             if item.original_tid and "&" not in item.original_tid:
                 tid = item.original_tid
@@ -1018,14 +1024,17 @@ class AutoAuditEngine:
             is_gift_item = self.adapter._is_gift_item(item)
             # 检查是否为 ERP 合并订单自动创建的商品行（其备注是订单级备注，不可信）
             erp_tid = item._erp_original_tid
+            raw_tid = str((item.raw or {}).get('tid') or '')
             is_erp_created = (
+                '&' in raw_tid or
                 (erp_tid and "&" in erp_tid) or
                 (item.oid and "&" in item.oid)
             )
             if item.shop_remark and not is_manual_item and not is_gift_item and not is_erp_created:
                 if self._is_price_difference_item(item):
-                    groups[tid]['price_diff_remark'] = item.shop_remark
-                else:
+                    if not groups[tid]['price_diff_remark']:
+                        groups[tid]['price_diff_remark'] = item.shop_remark
+                elif not groups[tid]['regular_remark']:
                     groups[tid]['regular_remark'] = item.shop_remark
             # 检测是否为补差价分组
             if self._is_price_difference_item(item):
@@ -1284,6 +1293,10 @@ class AutoAuditEngine:
         for item in order.items:
             if item.is_void or self.adapter._is_gift_item(item) or self._is_price_difference_item(item):
                 continue
+            child_resolver = getattr(type(self.adapter), "_item_child_tid", None)
+            if (callable(child_resolver) and ("&" in order.tid or "&" in order.trade_id)
+                    and not self.adapter._item_child_tid(item, order)):
+                continue
             norm_sku = _normalize_sku_for_dup(item.shop_mapping_sku or '')
             if norm_sku:
                 key = (norm_sku, item.num)
@@ -1521,7 +1534,7 @@ class AutoAuditEngine:
                     engine_gifts=all_gifts,
                 )
                 if ok is None:
-                    print(f"  ⏭️  跳过：订单所有商品行已作废")
+                    print("  ⏭️  跳过：适配器未提交修改，详见上方原因")
                     self.stats["skipped"] += 1
                 elif ok:
                     if all_parsed_list:
