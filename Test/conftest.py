@@ -46,6 +46,7 @@ import gift_manager
 _patch.setattr(express_manager, "_CONFIG_FILE", Path(_runtime.name) / "express_config.json")
 _patch.setattr(gift_manager, "_CONFIG_FILE", Path(_runtime.name) / "gift_config.json")
 from adapters.fangguo.material_source import FangguoMaterialSource
+_material_fetch = FangguoMaterialSource.fetch
 _patch.setattr(FangguoMaterialSource, "fetch", lambda self, *args, **kwargs: [])
 
 def _automated(path):
@@ -85,3 +86,9 @@ def _isolated_managers(monkeypatch, tmp_path):
 def pytest_configure(config):
     if config.option.basetemp is None:
         config.option.basetemp = str(Path(_runtime.name) / "pytest")
+
+
+@pytest.fixture
+def real_material_fetch(monkeypatch):
+    """材质专用测试恢复实际实现；请求仍须在用例中 mock。"""
+    monkeypatch.setattr(FangguoMaterialSource, "fetch", _material_fetch)
